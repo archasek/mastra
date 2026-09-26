@@ -1,5 +1,21 @@
 # @mastra/nestjs
 
+## 0.2.31-alpha.4
+
+### Patch Changes
+
+- Fixed `MastraAuthGuard` failing to resolve when used on your own controllers. `MastraModule.register()` and `registerAsync()` now export `AuthService`, so you can protect app routes with Mastra's auth: ([#25233](https://github.com/mastra-ai/mastra/pull/25233))
+
+  ```ts
+  @Controller('api/things')
+  @UseGuards(MastraAuthGuard)
+  export class ThingsController {}
+  ```
+
+- Updated dependencies [[`9773cb2`](https://github.com/mastra-ai/mastra/commit/9773cb2f22f307c8017f887af4a6728c4cb875c9)]:
+  - @mastra/core@1.72.0-alpha.4
+  - @mastra/server@1.72.0-alpha.4
+
 ## 0.2.31-alpha.3
 
 ### Patch Changes

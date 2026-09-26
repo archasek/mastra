@@ -1,5 +1,14 @@
 # @mastra/inngest
 
+## 1.10.1-alpha.2
+
+### Patch Changes
+
+- Fixed stopping an Inngest agent by thread or run id. Calling `abortThreadStream()` or `abortRunStream()` (including `POST /api/agents/:agentId/threads/abort` and the Studio stop button) now stops the run on the Inngest worker, and the stream ends with `finishReason: 'abort'`. Previously the call reported success while the run and its tools kept going. Fixes [#25156](https://github.com/mastra-ai/mastra/issues/25156). ([#25192](https://github.com/mastra-ai/mastra/pull/25192))
+
+- Updated dependencies [[`9773cb2`](https://github.com/mastra-ai/mastra/commit/9773cb2f22f307c8017f887af4a6728c4cb875c9)]:
+  - @mastra/core@1.72.0-alpha.4
+
 ## 1.10.1-alpha.1
 
 ### Patch Changes
