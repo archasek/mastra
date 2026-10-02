@@ -320,18 +320,24 @@ async function handleToolSuspended(
       return;
     }
 
-    const answerSchema: ElicitationPropertySchema = payload.options.length
+    // ask_user resumes with labels, not option IDs. Equal labels are the same
+    // native answer and must not create overlapping oneOf branches.
+    const answerOptions = [...new Set(payload.options.map(option => option.label))].map(label => ({
+      const: label,
+      title: label,
+    }));
+    const answerSchema: ElicitationPropertySchema = answerOptions.length
       ? payload.selectionMode === 'multi_select'
         ? {
             type: 'array',
             title: 'Your answer',
-            items: { anyOf: payload.options.map(option => ({ const: option.label, title: option.label })) },
+            items: { anyOf: answerOptions },
             minItems: 1,
           }
         : {
             type: 'string',
             title: 'Your answer',
-            oneOf: payload.options.map(option => ({ const: option.label, title: option.label })),
+            oneOf: answerOptions,
           }
       : { type: 'string', title: 'Your answer' };
 

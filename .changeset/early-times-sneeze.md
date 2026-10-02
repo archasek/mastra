@@ -2,4 +2,4 @@
 '@mastra/code-sdk': patch
 ---
 
-Fixed image history replay and removal of released thread lock markers.
+Fixed image history replay, removal of released thread lock markers, and duplicate choices in client questions.

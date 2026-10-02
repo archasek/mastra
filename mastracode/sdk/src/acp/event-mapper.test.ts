@@ -501,6 +501,39 @@ describe('ACP Event Mapper', () => {
       expect(mockSession.abort).not.toHaveBeenCalled();
     });
 
+    it.each(['single_select', 'multi_select'])('deduplicates native labels for %s', async selectionMode => {
+      const state = createPromptState('session-1');
+      state.supportsElicitation = true;
+      const answer = selectionMode === 'multi_select' ? ['Blue'] : 'Blue';
+      elicitationSpy.mockResolvedValueOnce({ action: 'accept', content: { answer } });
+      handleAgentControllerEvent(
+        {
+          type: 'tool_suspended',
+          toolCallId: 'duplicate-labels',
+          toolName: 'ask_user',
+          args: {},
+          suspendPayload: {
+            question: 'Choose a color',
+            selectionMode,
+            options: [{ label: 'Blue' }, { label: 'Blue' }, { label: 'Green' }],
+          },
+        },
+        state,
+        mockConnection,
+        mockSession,
+      );
+      await vi.waitFor(() => expect(mockSession.respondToToolSuspension).toHaveBeenCalledOnce());
+      const schema = elicitationSpy.mock.calls[0]![0].requestedSchema.properties.answer;
+      expect(selectionMode === 'multi_select' ? schema.items.anyOf : schema.oneOf).toEqual([
+        { const: 'Blue', title: 'Blue' },
+        { const: 'Green', title: 'Green' },
+      ]);
+      expect(mockSession.respondToToolSuspension).toHaveBeenCalledWith({
+        toolCallId: 'duplicate-labels',
+        resumeData: answer,
+      });
+    });
+
     it('aborts instead of inventing an answer when the user dismisses ask_user', async () => {
       const state = createPromptState('session-1');
       state.supportsElicitation = true;
