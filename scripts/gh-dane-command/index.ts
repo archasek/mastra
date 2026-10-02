@@ -103,7 +103,7 @@ async function main(): Promise<never> {
   const { controller, session, mcpManager, authStorage } = result;
 
   // Inject the Anthropic API key into auth storage
-  authStorage.set('anthropic', { type: 'api_key', key: apiKey });
+  await authStorage.set('anthropic', { type: 'api_key', key: apiKey });
 
   if (mcpManager?.hasServers()) {
     await mcpManager.init();

@@ -430,30 +430,41 @@ describe('reclaimLibSQLDisk vector-index safety (#23439)', () => {
    */
   function seedVectorDb(dbFile: string) {
     const db = new Database(dbFile);
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT, embedding F32_BLOB(384))');
-    db.exec('CREATE INDEX t_vector_idx ON t (libsql_vector_idx(embedding))');
-    const vec = (seed: number) =>
-      `vector32('[${Array.from({ length: 384 }, (_, i) => ((seed + i) % 97) / 97).join(',')}]')`;
-    for (let i = 0; i < 400; i++) {
-      db.exec(`INSERT INTO t (body, embedding) VALUES ('${'y'.repeat(512)}', ${vec(i)})`);
+    try {
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT, embedding F32_BLOB(384))');
+      db.exec('CREATE INDEX t_vector_idx ON t (libsql_vector_idx(embedding))');
+      const vec = (seed: number) =>
+        `vector32('[${Array.from({ length: 384 }, (_, i) => ((seed + i) % 97) / 97).join(',')}]')`;
+      // Fixture setup must not pay one durable WAL commit per row.
+      db.exec('BEGIN');
+      for (let i = 0; i < 400; i++) {
+        db.exec(`INSERT INTO t (body, embedding) VALUES ('${'y'.repeat(512)}', ${vec(i)})`);
+      }
+      db.exec('DELETE FROM t WHERE id > 300');
+      db.exec('COMMIT');
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      db.exec('PRAGMA journal_mode = DELETE');
+    } finally {
+      db.close();
     }
-    db.exec('DELETE FROM t WHERE id > 300');
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    db.exec('PRAGMA journal_mode = DELETE');
-    db.close();
   }
 
   function seedPlainDb(dbFile: string, opts?: { leaveInWal?: boolean }) {
     const db = new Database(dbFile);
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('CREATE TABLE blobs (id INTEGER PRIMARY KEY, data TEXT)');
-    db.exec('CREATE INDEX blobs_data_idx ON blobs (data)');
-    for (let i = 0; i < 400; i++) db.exec(`INSERT INTO blobs (data) VALUES ('${'x'.repeat(2048)}')`);
-    db.exec('DELETE FROM blobs WHERE id > 50');
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    if (!opts?.leaveInWal) db.exec('PRAGMA journal_mode = DELETE');
-    db.close();
+    try {
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('CREATE TABLE blobs (id INTEGER PRIMARY KEY, data TEXT)');
+      db.exec('CREATE INDEX blobs_data_idx ON blobs (data)');
+      db.exec('BEGIN');
+      for (let i = 0; i < 400; i++) db.exec(`INSERT INTO blobs (data) VALUES ('${'x'.repeat(2048)}')`);
+      db.exec('DELETE FROM blobs WHERE id > 50');
+      db.exec('COMMIT');
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      if (!opts?.leaveInWal) db.exec('PRAGMA journal_mode = DELETE');
+    } finally {
+      db.close();
+    }
   }
 
   function inspect(dbFile: string) {

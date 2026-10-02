@@ -1,150 +1,191 @@
 /**
  * Thread lock — ensures only one process writes to a thread at a time.
  *
- * Uses filesystem lock files: <appDataDir>/locks/<threadId>.lock
- * Each lock file contains the PID of the owning process.
- * Stale locks (from crashed processes) are detected and reclaimed.
+ * Uses proper-lockfile's atomic directory creation and heartbeat lease under
+ * <appDataDir>/locks. The target file stores the owning PID for diagnostics;
+ * the lock itself is the sibling `<target>.lock` directory.
  */
 import * as fs from 'node:fs';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { getAppDataDir } from './project.js';
+
+type ProperLockfile = {
+  lock: (targetPath: string, options: Record<string, unknown>) => Promise<() => Promise<void>>;
+};
+
+const require = createRequire(import.meta.url);
+const properLockfile = require('proper-lockfile') as ProperLockfile;
+const ownedLocks = new Map<string, { threadId: string; release: () => Promise<void> }>();
 
 export class ThreadLockError extends Error {
   constructor(
     public readonly threadId: string,
-    public readonly ownerPid: number,
+    public readonly ownerPid: number | null,
+    public readonly legacyLock = false,
   ) {
-    super(`Thread ${threadId} is locked by another process (PID ${ownerPid})`);
+    super(
+      legacyLock
+        ? `Thread ${threadId} has a legacy lock file that requires safe recovery`
+        : ownerPid === null
+          ? `Thread ${threadId} is locked by another process`
+          : `Thread ${threadId} is locked by another process (PID ${ownerPid})`,
+    );
     this.name = 'ThreadLockError';
   }
 }
 
-function getLocksDir(): string {
-  const dir = path.join(getAppDataDir(), 'locks');
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+function getLocksDir(create: boolean): string {
+  const appDataDir = getAppDataDir({ create });
+  const dir = path.join(appDataDir, 'locks');
+  if (create && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }
 
-function getLockPath(threadId: string): string {
-  // Sanitize thread ID for filesystem safety
+function getLockTargetPath(threadId: string, create = false): string {
+  // Sanitize thread ID for filesystem safety.
   const safeId = threadId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return path.join(getLocksDir(), `${safeId}.lock`);
+  return path.join(getLocksDir(create), safeId);
+}
+
+function getLockDirectoryPath(targetPath: string): string {
+  return `${targetPath}.lock`;
 }
 
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 
-/**
- * Attempt to acquire a lock for the given thread.
- * Throws ThreadLockError if another live process holds the lock.
- * Reclaims stale locks from dead processes.
- */
-export function acquireThreadLock(threadId: string): void {
-  const lockPath = getLockPath(threadId);
-  const myPid = process.pid;
-
-  // Check for existing lock
-  if (fs.existsSync(lockPath)) {
-    try {
-      const content = fs.readFileSync(lockPath, 'utf-8').trim();
-      const ownerPid = parseInt(content, 10);
-
-      if (!isNaN(ownerPid) && ownerPid !== myPid && isProcessAlive(ownerPid)) {
-        throw new ThreadLockError(threadId, ownerPid);
-      }
-      // Stale lock (dead process) or our own lock — reclaim it
-    } catch (error) {
-      if (error instanceof ThreadLockError) throw error;
-      // File read error — try to overwrite
-    }
-  }
-
-  // Write our PID to the lock file
-  fs.writeFileSync(lockPath, String(myPid), { mode: 0o644 });
-}
-
-/**
- * Release the lock for the given thread (only if we own it).
- */
-export function releaseThreadLock(threadId: string): void {
-  const lockPath = getLockPath(threadId);
-  const myPid = process.pid;
-
+function readOwnerPid(targetPath: string): number | null {
   try {
-    if (!fs.existsSync(lockPath)) return;
-
-    const content = fs.readFileSync(lockPath, 'utf-8').trim();
-    const ownerPid = parseInt(content, 10);
-
-    // Only remove if we own it
-    if (ownerPid === myPid) {
-      fs.unlinkSync(lockPath);
-    }
-  } catch {
-    // Best-effort cleanup — ignore errors
-  }
-}
-
-/**
- * Check if a thread is locked by another process.
- * Returns the PID of the owner if locked, null otherwise.
- */
-export function getThreadLockOwner(threadId: string): number | null {
-  const lockPath = getLockPath(threadId);
-
-  try {
-    if (!fs.existsSync(lockPath)) return null;
-
-    const content = fs.readFileSync(lockPath, 'utf-8').trim();
-    const ownerPid = parseInt(content, 10);
-
-    if (isNaN(ownerPid)) return null;
-    if (ownerPid === process.pid) return null; // Our own lock
-    if (!isProcessAlive(ownerPid)) {
-      // Stale lock — clean it up
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {}
-      return null;
-    }
-
-    return ownerPid;
+    const stat = fs.lstatSync(targetPath);
+    if (!stat.isFile()) return null;
+    const pid = Number.parseInt(fs.readFileSync(targetPath, 'utf-8').trim(), 10);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
   }
 }
 
-/**
- * Release all thread locks owned by this process.
- * Call this on process exit.
- */
-export function releaseAllThreadLocks(): void {
+/** Open and replace the diagnostic PID without following a hostile symlink. */
+function writeOwnerPid(targetPath: string): void {
+  let existing: fs.Stats | undefined;
   try {
-    const locksDir = getLocksDir();
-    const files = fs.readdirSync(locksDir);
-    const myPid = String(process.pid);
+    existing = fs.lstatSync(targetPath);
+    if (!existing.isFile()) throw new Error('Thread lock PID target is not a regular file');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 
-    for (const file of files) {
-      if (!file.endsWith('.lock')) continue;
-      const lockPath = path.join(locksDir, file);
-      try {
-        const content = fs.readFileSync(lockPath, 'utf-8').trim();
-        if (content === myPid) {
-          fs.unlinkSync(lockPath);
-        }
-      } catch {
-        // Best-effort
-      }
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const flags = fs.constants.O_WRONLY | noFollow | (existing ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL);
+  const fd = fs.openSync(targetPath, flags, 0o600);
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || (existing && (opened.dev !== existing.dev || opened.ino !== existing.ino))) {
+      throw new Error('Thread lock PID target changed during acquisition');
     }
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, String(process.pid), 0, 'utf-8');
+    fs.fchmodSync(fd, 0o600);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Fail closed on a v1 lock file left by an older runtime. The v1 protocol
+ * overwrites and unlinks a shared path without an atomic lease, so checking a
+ * PID and then deleting that path can race a live v1 acquisition/release.
+ * Preserve the file for operator recovery rather than risk two writers.
+ */
+function clearStaleLegacyLock(lockPath: string, threadId: string): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (stat.isDirectory()) return;
+  const ownerPid = stat.isFile() ? readOwnerPid(lockPath) : null;
+  throw new ThreadLockError(threadId, ownerPid, true);
+}
+
+/**
+ * Attempt to acquire a process-safe lock for the given thread. Acquisition is
+ * asynchronous because directory creation is the atomic cross-process claim.
+ * Stale leases are reclaimed by proper-lockfile after their heartbeat expires.
+ */
+export async function acquireThreadLock(threadId: string): Promise<void> {
+  const targetPath = getLockTargetPath(threadId, true);
+  const lockPath = getLockDirectoryPath(targetPath);
+  clearStaleLegacyLock(lockPath, threadId);
+
+  let release: () => Promise<void>;
+  try {
+    release = await properLockfile.lock(targetPath, {
+      realpath: false,
+      stale: 120_000,
+      update: 30_000,
+      retries: 0,
+    });
   } catch {
-    // Best-effort
+    throw new ThreadLockError(threadId, readOwnerPid(targetPath));
+  }
+
+  try {
+    writeOwnerPid(targetPath);
+    ownedLocks.set(targetPath, {
+      threadId,
+      release: async () => {
+        // Remove our diagnostic target before releasing the atomic lease so a
+        // new holder cannot have its PID file deleted by this cleanup.
+        if (readOwnerPid(targetPath) === process.pid) fs.unlinkSync(targetPath);
+        await release();
+      },
+    });
+  } catch (error) {
+    await release();
+    throw error;
+  }
+}
+
+/** Release the lock for the given thread, but only when acquired by this process. */
+export async function releaseThreadLock(threadId: string): Promise<void> {
+  const targetPath = getLockTargetPath(threadId);
+  const owned = ownedLocks.get(targetPath);
+  if (!owned) return;
+  await owned.release();
+  if (ownedLocks.get(targetPath) === owned) ownedLocks.delete(targetPath);
+}
+
+/** Check a thread lock's owner PID; return null when unlocked or owned here. */
+export function getThreadLockOwner(threadId: string): number | null {
+  const targetPath = getLockTargetPath(threadId);
+  try {
+    if (!fs.lstatSync(getLockDirectoryPath(targetPath)).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const ownerPid = readOwnerPid(targetPath);
+  if (ownerPid === null || ownerPid === process.pid || !isProcessAlive(ownerPid)) return null;
+  return ownerPid;
+}
+
+/** Release every lock acquired by this process. Safe to call when none exist. */
+export async function releaseAllThreadLocks(): Promise<void> {
+  for (const [targetPath, owned] of [...ownedLocks]) {
+    try {
+      await owned.release();
+      if (ownedLocks.get(targetPath) === owned) ownedLocks.delete(targetPath);
+    } catch {
+      // Best-effort cleanup; a crashed holder's lease expires automatically.
+    }
   }
 }

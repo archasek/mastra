@@ -220,7 +220,7 @@ export const multiAccountLoginScenario = {
     await runtime.waitForScreenText(/\(2 accounts\)/i, terminal, 8_000);
     // A second change while the provider selector is open must also be read
     // before constructing the account manager, not just at command entry.
-    peer.removeAccount('anthropic', previousAccount.id);
+    await peer.removeAccount('anthropic', previousAccount.id);
     terminal.write('\r');
     await runtime.waitForScreenText(/Peer Account\s*✓ active/i, terminal, 8_000);
     terminal.write('\r');

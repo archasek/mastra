@@ -275,6 +275,8 @@ function addPluginToolsToModeAllowlists(
 export interface MastraCodeConfig {
   /** Working directory for project detection. Default: process.cwd() */
   cwd?: string;
+  /** Explicit resource scope for sessions. Defaults to the detected project identity. */
+  resourceId?: string;
   /** Home directory for global config discovery. Default: os.homedir() */
   homeDir?: string;
   /** Override modes (model IDs, colors, which modes exist). Default: build/plan/fast */
@@ -312,6 +314,10 @@ export interface MastraCodeConfig {
   settingsPath?: string;
   /** Initial state overrides (yolo, thinkingLevel, etc.) */
   initialState?: Partial<MastraCodeState>;
+  /** Exact initial thread to bind for a local embedded session. */
+  initialThreadId?: string;
+  /** Reject a missing initialThreadId instead of creating a thread with that id. */
+  requireExistingThread?: boolean;
   /** Create a thread during local boot when no existing thread matches. Default: true */
   createInitialThread?: boolean;
   /** Trusted host instructions resolved outside mutable session state. */
@@ -330,6 +336,10 @@ export interface MastraCodeConfig {
   configDir?: string;
   /** Programmatic MCP server configurations, merged with (and overriding) file-based configs. */
   mcpServers?: Record<string, McpServerConfig>;
+  /** Use only programmatic MCP servers instead of discovering MCP config files. Default: false */
+  disableMcpConfigDiscovery?: boolean;
+  /** Disable MCP OAuth providers and persisted MCP OAuth state. Default: false */
+  disableMcpOAuth?: boolean;
   /** Disable MCP server discovery. Default: false */
   disableMcp?: boolean;
   /** Disable hooks. Default: false */
@@ -590,7 +600,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   // Project detection
   const project = detectProject(cwd);
 
-  const resourceIdOverride = getResourceIdOverride(project.rootPath, configDir);
+  const resourceIdOverride = config?.resourceId ?? getResourceIdOverride(project.rootPath, configDir);
   if (resourceIdOverride) {
     project.resourceId = resourceIdOverride;
     project.resourceIdOverride = true;
@@ -787,7 +797,18 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   // MCP
   const mcpManager = config?.disableMcp
     ? undefined
-    : createMcpManager(project.rootPath, configDir, config?.mcpServers, globalSettings.mcp);
+    : createMcpManager(
+        project.rootPath,
+        configDir,
+        config?.mcpServers,
+        globalSettings.mcp,
+        config?.disableMcpConfigDiscovery || config?.disableMcpOAuth
+          ? {
+              ...(config.disableMcpConfigDiscovery ? { disableConfigFileDiscovery: true } : {}),
+              ...(config.disableMcpOAuth ? { disableOAuthProviders: true } : {}),
+            }
+          : undefined,
+      );
 
   // Hooks
   const hookManager = config?.disableHooks
@@ -1657,6 +1678,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     backgroundCompletionEvents,
     // Identity for the single local session (Case 3). Servers ignore these and
     // mint per-request sessions with client-supplied resourceIds instead.
+    resourceId: project.resourceId,
     sessionId,
     ownerId,
     // Surface the project root so boot/mount paths can wire workflow tools
@@ -1815,37 +1837,83 @@ export async function wireSessionConcerns(
  * work in this process runs through. The AgentController owns no session of its own.
  */
 export async function bootLocalAgentController(config?: MastraCodeConfig) {
+  if (config?.requireExistingThread && !config.initialThreadId) {
+    throw new Error('requireExistingThread needs initialThreadId.');
+  }
   const base = await createMastraCodeAgentController(config);
   const { controller, sessionId, ownerId, projectPath, codeAgent, mcpManager } = base;
+  let session: Session<MastraCodeState> | undefined;
 
-  await controller.init();
-  validateExperimentalAgent(codeAgent, controller.getMastra());
-  // Register workflow primitives (sub-agent + workspace tools + code-agent
-  // + web + notification_inbox + snapshot of MCP tools) on the controller's
-  // Mastra so the dynamic-workflow loading in startWorkers() can rehydrate
-  // saved workflows against the right tool/agent registry.
-  const mastra = controller.getMastra();
-  if (mastra) await registerWorkflowBuilderPrimitives(mastra, { projectPath, codeAgent, mcpManager });
-  await mastra?.startWorkers();
-  base.registerConfiguredProcessorsWithMastra();
-  base.startPluginSignalProviders();
-  base.startNotificationDispatch();
-  const session = await controller.createSession({
-    id: sessionId,
-    ownerId,
-    createInitialThread: config?.createInitialThread,
-  });
-  await wireSessionConcerns(base, session);
-  const knowledgeInspector = await base.createKnowledgeInspector(session);
+  try {
+    if (config?.requireExistingThread && config.initialThreadId) {
+      // Querying a thread initializes storage itself. Check before controller
+      // init so a stale ACP session cannot start workers or create replacement
+      // runtime state before it is rejected.
+      const existingThread = await controller.queryThreadById({ threadId: config.initialThreadId });
+      if (!existingThread || existingThread.resourceId !== base.resourceId) {
+        throw new Error(`Thread not found: ${config.initialThreadId}`);
+      }
+    }
 
-  return {
-    ...base,
-    session,
-    knowledgeInspector,
-    knowledgeInspectorUnavailableReason: knowledgeInspector
-      ? undefined
-      : 'Knowledge inspection requires a configured knowledge storage domain.',
-  };
+    await controller.init();
+    validateExperimentalAgent(codeAgent, controller.getMastra());
+    // Register workflow primitives (sub-agent + workspace tools + code-agent
+    // + web + notification_inbox + snapshot of MCP tools) on the controller's
+    // Mastra so the dynamic-workflow loading in startWorkers() can rehydrate
+    // saved workflows against the right tool/agent registry.
+    const mastra = controller.getMastra();
+    if (mastra) await registerWorkflowBuilderPrimitives(mastra, { projectPath, codeAgent, mcpManager });
+    await mastra?.startWorkers();
+    base.registerConfiguredProcessorsWithMastra();
+    base.startPluginSignalProviders();
+    base.startNotificationDispatch();
+    session = await controller.createSession({
+      id: sessionId,
+      ownerId,
+      createInitialThread: config?.createInitialThread,
+      ...(config?.initialThreadId ? { threadId: config.initialThreadId } : {}),
+      ...(config?.requireExistingThread ? { requireExistingThread: true } : {}),
+    });
+    await wireSessionConcerns(base, session);
+    const knowledgeInspector = await base.createKnowledgeInspector(session);
+
+    return {
+      ...base,
+      session,
+      knowledgeInspector,
+      knowledgeInspectorUnavailableReason: knowledgeInspector
+        ? undefined
+        : 'Knowledge inspection requires a configured knowledge storage domain.',
+    };
+  } catch (error) {
+    if (session) {
+      await Promise.resolve()
+        .then(async () => {
+          await session!.thread.detachFromCurrent();
+          await session!.thread.clearAndReleaseLock();
+        })
+        .catch(() => {
+          // Preserve the boot failure after best-effort session cleanup.
+        });
+    }
+    try {
+      base.stopPluginSignalProviders();
+    } catch {
+      // Preserve the boot failure after best-effort plugin cleanup.
+    }
+    const closeSignalsPubSub = (base.signalsPubSub as { close?: () => Promise<void> | void } | undefined)?.close;
+    await Promise.allSettled([Promise.resolve().then(() => base.stopNotificationDispatch())]);
+    // Drain suspended/background work before closing its workers and transports.
+    await Promise.allSettled([Promise.resolve().then(() => controller.getMastra()?.shutdown())]);
+    await Promise.allSettled([
+      Promise.resolve().then(() => mcpManager?.disconnect()),
+      Promise.resolve().then(() => controller.getMastra()?.stopWorkers()),
+      Promise.resolve().then(() => controller.stopIntervals()),
+      Promise.resolve().then(() => closeSignalsPubSub?.()),
+    ]);
+    await Promise.allSettled([Promise.resolve().then(() => base.storageMaintenance.closeStorage?.())]);
+    throw error;
+  }
 }
 
 /** Result of {@link mountAgentControllerOnMastra}: shared handles plus the owning Mastra. */

@@ -6,7 +6,7 @@ import type { TUIState } from './state.js';
 
 export type StartupResumeIssue =
   | { kind: 'missing'; threadId: string }
-  | { kind: 'locked'; threadId: string; title: string; ownerPid: number };
+  | { kind: 'locked'; threadId: string; title: string; ownerPid: number | null };
 
 /**
  * Selects the thread to open at startup. A requested thread that is missing or
