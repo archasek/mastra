@@ -6,6 +6,7 @@ import type { MastraTUIOptions } from '../../src/tui/index.js';
 export type ScenarioName =
   | 'startup'
   | 'abort-followup'
+  | 'startup-interrupted'
   | 'account-rotation'
   | 'account-routing-targeted'
   | 'branch-context-long-name'
@@ -61,11 +62,15 @@ export type ScenarioName =
   | 'ctrlf-queued-custom-slash'
   | 'ctrlf-queued-image-followup'
   | 'debug-logging'
+  | 'experimental-agent-durable'
+  | 'experimental-agent-evented'
+  | 'experimental-agent-settings'
   | 'file-attachment-blocked-retry'
   | 'file-attachment-history-reload'
   | 'file-autocomplete'
   | 'first-run-onboarding'
   | 'github-signals-command'
+  | 'schedules-command'
   | 'github-signals-multi-subscribe'
   | 'github-signals-legacy-upgrade'
   | 'github-signals-tool-multi-subscribe'
@@ -78,8 +83,11 @@ export type ScenarioName =
   | 'goal-fresh-thread-persistence'
   | 'goal-judge-om-model-isolation'
   | 'goal-judge-single-render'
+  | 'goal-judge-esc-loaded'
+  | 'goal-judge-esc-unloaded'
   | 'goal-max-runs-ends-goal'
   | 'goal-resume-single-render'
+  | 'goal-survives-new-thread'
   | 'controller-api-config'
   | 'headless-mcp-tool-availability'
   | 'initial-prompt'
@@ -88,6 +96,7 @@ export type ScenarioName =
   | 'tui-prompt-resume'
   | 'openai-strict-schema'
   | 'plan-approval-goal-handoff'
+  | 'plan-approval-goal-replaces-active'
   | 'plan-approval-handoff'
   | 'plan-approval-request-changes'
   | 'permission-request-hook'
@@ -192,6 +201,8 @@ export type ScenarioName =
   | 'task-progress-events'
   | 'terminal-resize-reflow'
   | 'task-prompt-context-next-turn'
+  | 'resume-locked-thread'
+  | 'resume-missing-thread'
   | 'thread-history'
   | 'tool-history-reload'
   | 'plugins-streaming-tool-output'
@@ -261,7 +272,13 @@ export type McE2eStartMastraCodeAppOptions = {
   tui?: Partial<
     Pick<
       MastraTUIOptions,
-      'appName' | 'initialMessage' | 'resumeSkipNotice' | 'inlineQuestions' | 'processMemoryDiagnostics' | 'verbose'
+      | 'appName'
+      | 'initialMessage'
+      | 'resumeSkipNotice'
+      | 'inlineQuestions'
+      | 'processMemoryDiagnostics'
+      | 'resumeThreadId'
+      | 'verbose'
     >
   >;
 };
