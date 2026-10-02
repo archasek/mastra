@@ -141,7 +141,15 @@ export async function acquireThreadLock(threadId: string): Promise<void> {
 
   try {
     writeOwnerPid(targetPath);
-    ownedLocks.set(targetPath, { threadId, release });
+    ownedLocks.set(targetPath, {
+      threadId,
+      release: async () => {
+        // Remove our diagnostic target before releasing the atomic lease so a
+        // new holder cannot have its PID file deleted by this cleanup.
+        if (readOwnerPid(targetPath) === process.pid) fs.unlinkSync(targetPath);
+        await release();
+      },
+    });
   } catch (error) {
     await release();
     throw error;

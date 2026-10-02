@@ -40,11 +40,13 @@ it('atomically admits one owner and releases only locks held by this process', a
 
   await releaseAllThreadLocks();
   expect(existsSync(join(locksDir, 'shared-thread.lock'))).toBe(false);
+  expect(existsSync(join(locksDir, 'shared-thread'))).toBe(false);
   expect(readFileSync(foreignLock, 'utf-8')).toBe(String(process.pid));
 
   await acquireThreadLock('shared-thread');
   await releaseThreadLock('shared-thread');
   expect(existsSync(join(locksDir, 'shared-thread.lock'))).toBe(false);
+  expect(existsSync(join(locksDir, 'shared-thread'))).toBe(false);
 });
 
 it('fails closed on stale and live legacy lock files without deleting either', async () => {

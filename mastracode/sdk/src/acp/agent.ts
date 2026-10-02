@@ -648,7 +648,10 @@ function getReplayParts(message: MastraDBMessage): ReplayPart[] {
       ) {
         replayParts.push({
           kind: 'content',
-          content: { type: 'image', data: stripDataUrl(value.data), mimeType: value.mediaType },
+          content:
+            /^https?:\/\//i.test(value.data) && URL.canParse(value.data)
+              ? { type: 'resource_link', uri: value.data, name: 'Stored image', mimeType: value.mediaType }
+              : { type: 'image', data: stripDataUrl(value.data), mimeType: value.mediaType },
         });
       } else if (value.type === 'file') {
         replayParts.push({

@@ -20,6 +20,22 @@ afterEach(() => {
 });
 
 describe('mastracode auth machine commands', () => {
+  it.each([
+    { args: ['login', '--provider', 'openai-codex', '--device', '--jsonl'], code: 'LOGIN_FAILED' },
+    { args: ['logout', '--provider', 'openai-codex', '--json'], code: 'LOGOUT_FAILED' },
+  ])('maps storage construction failures to $code', async ({ args, code }) => {
+    const output: string[] = [];
+    const exitCode = await runAuthCli(args, {
+      appDataDir: makeAppDataPath(),
+      createAuthStorage: () => {
+        throw new Error('unreadable store with secret-bearing diagnostic');
+      },
+      writeStdout: line => output.push(line),
+    });
+    expect(exitCode).toBe(1);
+    expect(output.map(line => JSON.parse(line))).toEqual([{ type: 'error', code }]);
+  });
+
   it('reports unauthenticated status without creating the app-data directory', async () => {
     const appDataDir = makeAppDataPath();
     const output: string[] = [];

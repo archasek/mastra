@@ -322,6 +322,43 @@ describe('ACP Agent - Sessions and turns', () => {
     );
   });
 
+  it('replays remote images as resource links and inline images as base64', async () => {
+    const harness = setup([
+      {
+        role: 'user',
+        content: {
+          parts: [
+            { type: 'file', data: 'https://example.test/image.png', mediaType: 'image/png' },
+            { type: 'file', data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+          ],
+        },
+      },
+    ]);
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'image-thread' });
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'image-thread',
+        update: {
+          sessionUpdate: 'user_message_chunk',
+          content: {
+            type: 'resource_link',
+            uri: 'https://example.test/image.png',
+            name: 'Stored image',
+            mimeType: 'image/png',
+          },
+        },
+      }),
+    );
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: {
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+        },
+      }),
+    );
+  });
+
   it('replays stored terminal errors and failed tool output', async () => {
     const priorMessages = [
       {

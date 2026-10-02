@@ -43,9 +43,8 @@ export async function runAuthCli(args: string[], options: AuthCliOptions = {}): 
     return 2;
   }
 
-  const path = authPath(options, parsed.command !== 'status');
   if (parsed.command === 'status') {
-    const status = readOAuthStatusFile(path, CODEX_PROVIDER);
+    const status = readOAuthStatusFile(authPath(options, false), CODEX_PROVIDER);
     if (status.status === 'unknown') {
       emit(options, { type: 'error', code: 'AUTH_STORE_UNREADABLE' });
       return 1;
@@ -54,9 +53,10 @@ export async function runAuthCli(args: string[], options: AuthCliOptions = {}): 
     return 0;
   }
 
-  const storage = (options.createAuthStorage ?? (authPath => new AuthStorage(authPath)))(path);
+  const createStorage = options.createAuthStorage ?? (path => new AuthStorage(path));
   if (parsed.command === 'logout') {
     try {
+      const storage = createStorage(authPath(options, true));
       await storage.logout(CODEX_PROVIDER);
     } catch {
       emit(options, { type: 'error', code: 'LOGOUT_FAILED' });
@@ -67,6 +67,7 @@ export async function runAuthCli(args: string[], options: AuthCliOptions = {}): 
   }
 
   try {
+    const storage = createStorage(authPath(options, true));
     const account = await storage.login(CODEX_PROVIDER, {
       authMode: 'device',
       signal: options.signal,
