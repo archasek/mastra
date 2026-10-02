@@ -274,10 +274,14 @@ describe('OpenAI Codex device OAuth', () => {
       accountId: 'acct-device',
     });
 
-    expect(onAuth).toHaveBeenCalledWith({
-      url: 'https://auth.openai.com/codex/device',
-      instructions: 'Enter code: ABCD-EFGH',
-    });
+    expect(onAuth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'https://auth.openai.com/codex/device',
+        instructions: 'Enter code: ABCD-EFGH',
+        userCode: 'ABCD-EFGH',
+        expiresAt: expect.any(String),
+      }),
+    );
     expect(sleep).toHaveBeenNthCalledWith(1, 1000);
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
@@ -385,10 +389,14 @@ describe('OpenAI Codex device OAuth', () => {
       sleep: async () => {},
     });
 
-    expect(onAuth).toHaveBeenCalledWith({
-      url: 'https://auth.openai.com/codex/device',
-      instructions: 'Enter code: ABCD-EFGH',
-    });
+    expect(onAuth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'https://auth.openai.com/codex/device',
+        instructions: 'Enter code: ABCD-EFGH',
+        userCode: 'ABCD-EFGH',
+        expiresAt: expect.any(String),
+      }),
+    );
   });
 
   it('polls while device authorization is pending', async () => {
@@ -399,7 +407,7 @@ describe('OpenAI Codex device OAuth', () => {
           JSON.stringify({
             device_auth_id: 'device-123',
             user_code: 'ABCD-EFGH',
-            interval: '1',
+            interval: '3600',
           }),
           { status: 200 },
         ),
@@ -433,7 +441,25 @@ describe('OpenAI Codex device OAuth', () => {
       sleep,
     });
 
-    expect(sleep).toHaveBeenCalledWith(1000);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep.mock.calls.every(([delayMs]) => delayMs > 0 && delayMs <= 15 * 60 * 1000)).toBe(true);
+  });
+
+  it('aborts a device polling delay immediately and clears its timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const { __testing } = await import('./openai-codex.js');
+      const controller = new AbortController();
+      const wait = __testing.sleepWithSignal(60_000, controller.signal);
+
+      expect(vi.getTimerCount()).toBe(1);
+      controller.abort();
+
+      await expect(wait).rejects.toThrow('Login cancelled');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -536,6 +562,38 @@ describe('Codex device login step primitives', () => {
     });
   });
 
+  it('cancels a successful-looking device poll before exchanging its authorization code', async () => {
+    const controller = new AbortController();
+    let releasePoll!: () => void;
+    const pollWait = new Promise<void>(resolve => {
+      releasePoll = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementationOnce(async () => {
+      await pollWait;
+      return new Response(JSON.stringify({ authorization_code: 'auth-code', code_verifier: 'verifier' }), {
+        status: 200,
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { pollCodexDeviceLogin } = await import('./openai-codex.js');
+    const pending = pollCodexDeviceLogin(
+      {
+        deviceAuthId: 'device-123',
+        userCode: 'ABCD-EFGH',
+        url: 'https://auth.openai.com/codex/device',
+        instructions: 'Enter code: ABCD-EFGH',
+        intervalMs: 5000,
+        deadlineAt: Date.now() + 900_000,
+      },
+      { signal: controller.signal },
+    );
+
+    controller.abort();
+    releasePoll();
+    await expect(pending).rejects.toThrow('Login cancelled');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('pollCodexDeviceLogin fails past the deadline without polling upstream', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -630,10 +688,14 @@ describe('openaiCodexOAuthProvider auth modes', () => {
       }),
     ).resolves.toMatchObject({ accountId: 'acct-device', refresh: 'refresh-device' });
 
-    expect(onAuth).toHaveBeenCalledWith({
-      url: 'https://auth.openai.com/codex/device',
-      instructions: 'Enter code: ABCD-EFGH',
-    });
+    expect(onAuth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'https://auth.openai.com/codex/device',
+        instructions: 'Enter code: ABCD-EFGH',
+        userCode: 'ABCD-EFGH',
+        expiresAt: expect.any(String),
+      }),
+    );
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       'https://auth.openai.com/api/accounts/deviceauth/usercode',

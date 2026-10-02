@@ -5,7 +5,8 @@
 
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
+import { dirname, join, resolve } from 'node:path';
 import { getAppDataDir } from '../utils/project.js';
 import { anthropicOAuthProvider } from './providers/anthropic.js';
 import { githubCopilotOAuthProvider } from './providers/github-copilot.js';
@@ -23,6 +24,48 @@ import type {
   OAuthProviderId,
   OAuthProviderInterface,
 } from './types.js';
+
+type ProperLockfile = {
+  lock: (path: string, options: Record<string, unknown>) => Promise<() => Promise<void>>;
+};
+
+interface OAuthRefreshResult {
+  credentials: OAuthCredentials;
+  accountInstanceId?: string;
+}
+
+const require = createRequire(import.meta.url);
+const properLockfile = require('proper-lockfile') as ProperLockfile;
+const authFileQueues = new Map<string, Promise<void>>();
+
+/** Serialize same-process callers, then hold an OS-visible lock across refresh and save. */
+async function withAuthFileLock<T>(authPath: string, action: () => T | Promise<T>): Promise<T> {
+  const lockKey = resolve(authPath);
+  const previous = authFileQueues.get(lockKey) ?? Promise.resolve();
+  let releaseQueue!: () => void;
+  const queued = new Promise<void>(resolveQueue => {
+    releaseQueue = resolveQueue;
+  });
+  authFileQueues.set(lockKey, queued);
+  await previous;
+  try {
+    mkdirSync(dirname(lockKey), { recursive: true, mode: 0o700 });
+    const releaseFileLock = await properLockfile.lock(lockKey, {
+      realpath: false,
+      stale: 120_000,
+      update: 30_000,
+      retries: { retries: 200, factor: 1, minTimeout: 50, maxTimeout: 250, randomize: true },
+    });
+    try {
+      return await action();
+    } finally {
+      await releaseFileLock();
+    }
+  } finally {
+    releaseQueue();
+    if (authFileQueues.get(lockKey) === queued) authFileQueues.delete(lockKey);
+  }
+}
 
 /**
  * Best/default models for each OAuth provider.
@@ -63,14 +106,13 @@ export function getOAuthProviders(): OAuthProviderInterface[] {
 }
 
 /**
- * Mint an account instance id: `${providerId}:${randomUUID()}`.
+ * Mint an opaque account instance id for a newly registered account.
  *
- * Assigned once, when the account is created, and never derived from
- * credentials. Deriving it from the refresh token (the pre-A13 scheme) looked
- * stable but was not: `persistRefreshedCredential` keeps an entry's key while
- * writing rotated tokens onto it, so every refresh left the id describing a
- * credential the account no longer had — and re-adding that same subscription
- * then failed to match its own entry and registered a second one for it.
+ * Legacy-only files have no persisted account ID, so `adoptSlot` uses a
+ * deterministic migration ID until that entry is first written. Ordinary
+ * account creation uses a random ID and keeps it across refreshes. The old
+ * pre-A13 refresh-hash scheme was different: re-authorization could derive a
+ * second ID for the same subscription and register a duplicate account.
  */
 function mintAccountId(providerId: string): string {
   return `${providerId}:${globalThis.crypto.randomUUID()}`;
@@ -85,6 +127,10 @@ function mintAccountId(providerId: string): string {
  */
 function legacyAccountIdFor(providerId: string, refreshToken: string): string {
   return `${providerId}:${createHash('sha256').update(refreshToken).digest('hex').slice(0, 8)}`;
+}
+
+function sameOAuthCredentials(left: OAuthCredentials, right: OAuthCredentials): boolean {
+  return left.refresh === right.refresh && left.access === right.access && left.expires === right.expires;
 }
 
 /**
@@ -113,9 +159,20 @@ function isOAuthAccountRecord(value: unknown): value is OAuthAccountRecord {
     typeof v.label === 'string' &&
     typeof v.addedAt === 'string' &&
     typeof v.active === 'boolean' &&
-    typeof v.refresh === 'string' &&
-    typeof v.access === 'string' &&
-    typeof v.expires === 'number'
+    hasOAuthCredentialFields(value)
+  );
+}
+
+function hasOAuthCredentialFields(value: unknown): value is OAuthCredentials {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const credentials = value as Partial<OAuthCredentials>;
+  return (
+    typeof credentials.refresh === 'string' &&
+    credentials.refresh.trim().length > 0 &&
+    typeof credentials.access === 'string' &&
+    credentials.access.trim().length > 0 &&
+    typeof credentials.expires === 'number' &&
+    Number.isFinite(credentials.expires)
   );
 }
 
@@ -133,12 +190,63 @@ function credentialFieldsOf(record: OAuthAccountRecord): OAuthCredentials {
   return creds;
 }
 
+export interface ReadonlyOAuthStatus {
+  provider: string;
+  status: 'authenticated' | 'unauthenticated' | 'unknown';
+  account?: { id: string; label: string };
+}
+
+/**
+ * Read only the safe status fields for one OAuth provider without migrating,
+ * refreshing, or rewriting auth.json. Used by machine-readable info/status
+ * commands that must not mutate app data.
+ */
+export function readOAuthStatusFile(authPath: string, providerId: string): ReadonlyOAuthStatus {
+  if (!existsSync(authPath)) return { provider: providerId, status: 'unauthenticated' };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(authPath, 'utf-8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { provider: providerId, status: 'unauthenticated' };
+    }
+    return { provider: providerId, status: 'unknown' };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { provider: providerId, status: 'unknown' };
+  }
+
+  const data = parsed as Record<string, unknown>;
+  const providerAccountEntries = Object.entries(data).filter(([key]) => key.startsWith(`accounts:${providerId}:`));
+  const activeAccount = providerAccountEntries
+    .map(([, value]) => value)
+    .find((value): value is OAuthAccountRecord => isOAuthAccountRecord(value) && value.active);
+  const hasMalformedAccountRecord = providerAccountEntries.some(([, value]) => !isOAuthAccountRecord(value));
+  const legacySlot = data[providerId];
+  const hasLegacyOAuthRecord =
+    !!legacySlot && typeof legacySlot === 'object' && (legacySlot as { type?: unknown }).type === 'oauth';
+  const hasOAuthSlot = hasLegacyOAuthRecord && hasOAuthCredentialFields(legacySlot);
+
+  if (!hasOAuthSlot && !activeAccount) {
+    return {
+      provider: providerId,
+      status: hasMalformedAccountRecord || hasLegacyOAuthRecord ? 'unknown' : 'unauthenticated',
+    };
+  }
+  return {
+    provider: providerId,
+    status: 'authenticated',
+    ...(activeAccount ? { account: { id: activeAccount.id, label: activeAccount.label } } : {}),
+  };
+}
+
 /**
  * Credential storage backed by a JSON file.
  */
 export class AuthStorage {
   private data: AuthStorageData = {};
-  private refreshPromises = new Map<string, Promise<OAuthCredentials | undefined>>();
+  private refreshPromises = new Map<string, Promise<OAuthRefreshResult | undefined>>();
 
   constructor(private authPath: string = join(getAppDataDir(), 'auth.json')) {
     this.reload();
@@ -148,15 +256,15 @@ export class AuthStorage {
    * Reload credentials from disk.
    */
   reload(): void {
-    if (!existsSync(this.authPath)) {
+    let serialized: string;
+    try {
+      serialized = readFileSync(this.authPath, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       this.data = {};
       return;
     }
-    try {
-      this.data = JSON.parse(readFileSync(this.authPath, 'utf-8'));
-    } catch {
-      this.data = {};
-    }
+    this.data = JSON.parse(serialized) as AuthStorageData;
     this.migrate();
   }
 
@@ -177,7 +285,7 @@ export class AuthStorage {
    *    `listAccounts()`. `remove()`/`logout()` clear the registry with the
    *    slot, so they never leave the shape this heals.
    */
-  private migrate(): void {
+  private migrate(): boolean {
     let changed = false;
     for (const key of Object.keys(this.data)) {
       const slot = this.data[key];
@@ -197,23 +305,52 @@ export class AuthStorage {
       }
       if (active.refresh !== slot.refresh) {
         // An external writer (older build, another worktree) owns the slot.
-        // If its tokens belong to a different registered account, that
-        // account is now the active one — re-point activation to it instead
-        // of cloning the refresh token onto the current active entry.
-        const matching = entries.find(entry => entry.id !== active.id && entry.refresh === slot.refresh);
+        // Reconcile it only when a stable provider identity or the unchanged
+        // refresh token proves which registered account owns those tokens.
+        // Never copy an unknown/different account's credentials onto `active`:
+        // requests pinned to active.id would then silently cross accounts.
+        const provider = getOAuthProvider(providerId as OAuthProviderId);
+        const slotIdentity = providerIdentity(provider, slot);
+        const identityOf = (entry: OAuthAccountRecord) =>
+          entry.identity ?? providerIdentity(provider, credentialFieldsOf(entry));
+        const activeIdentityMatchesSlot = Boolean(slotIdentity && identityOf(active) === slotIdentity);
+        const matching = activeIdentityMatchesSlot
+          ? undefined
+          : ((slotIdentity
+              ? entries.find(entry => entry.id !== active.id && identityOf(entry) === slotIdentity)
+              : undefined) ??
+            entries.find(entry => {
+              if (entry.id === active.id || entry.refresh !== slot.refresh) return false;
+              const entryIdentity = identityOf(entry);
+              return !slotIdentity || !entryIdentity || entryIdentity === slotIdentity;
+            }));
         if (matching) {
           const { type: _t, ...slotCreds } = slot;
           this.data[this.accountKeyFor(matching.id)] = {
             ...matching,
             ...slotCreds,
             type: 'oauth-account',
+            ...(slotIdentity ? { identity: slotIdentity } : {}),
             active: true,
           };
           this.data[this.accountKeyFor(active.id)] = { ...active, active: false };
           changed = true;
-        } else {
+        } else if (activeIdentityMatchesSlot) {
+          // A known, stable identity proves this is the same account even if
+          // an older writer rotated its refresh token.
           const { type: _type, ...slotCreds } = slot;
-          this.data[this.accountKeyFor(active.id)] = { ...active, ...slotCreds, type: 'oauth-account' };
+          this.data[this.accountKeyFor(active.id)] = {
+            ...active,
+            ...slotCreds,
+            type: 'oauth-account',
+            identity: slotIdentity,
+          };
+          changed = true;
+        } else {
+          // The old slot may now belong to an unregistered account, or this
+          // provider may not expose enough identity to prove continuity. Keep
+          // the registry's selected account authoritative and fail closed.
+          this.data[providerId] = { type: 'oauth', ...credentialFieldsOf(active) };
           changed = true;
         }
       }
@@ -260,7 +397,10 @@ export class AuthStorage {
       }
     }
 
-    if (changed) this.save();
+    // Migration is in-memory only here. Persisting from reload() would let a
+    // constructor/read race with another process's locked credential update.
+    // The next serialized mutation writes the migrated snapshot atomically.
+    return changed;
   }
 
   /**
@@ -297,10 +437,12 @@ export class AuthStorage {
   /**
    * Set credential for a provider.
    */
-  set(provider: string, credential: AuthCredential): void {
-    this.reload();
-    this.data[provider] = credential;
-    this.save();
+  async set(provider: string, credential: AuthCredential): Promise<void> {
+    await withAuthFileLock(this.authPath, async () => {
+      this.reload();
+      this.data[provider] = credential;
+      this.save();
+    });
   }
 
   /**
@@ -309,14 +451,16 @@ export class AuthStorage {
    * load's migration would heal the slot back from it — resurrecting the
    * provider the caller just signed out.
    */
-  remove(provider: string): void {
-    this.reload();
-    delete this.data[provider];
-    const prefix = this.accountPrefixFor(provider);
-    for (const key of Object.keys(this.data)) {
-      if (key.startsWith(prefix)) delete this.data[key];
-    }
-    this.save();
+  async remove(provider: string): Promise<void> {
+    await withAuthFileLock(this.authPath, async () => {
+      this.reload();
+      delete this.data[provider];
+      const prefix = this.accountPrefixFor(provider);
+      for (const key of Object.keys(this.data)) {
+        if (key.startsWith(prefix)) delete this.data[key];
+      }
+      this.save();
+    });
   }
 
   /**
@@ -362,8 +506,8 @@ export class AuthStorage {
    * Store an API key for a provider.
    * Also sets the corresponding environment variable so model resolution can find it.
    */
-  setStoredApiKey(provider: string, key: string, envVar?: string): void {
-    this.set(`apikey:${provider}`, { type: 'api_key', key });
+  async setStoredApiKey(provider: string, key: string, envVar?: string): Promise<void> {
+    await this.set(`apikey:${provider}`, { type: 'api_key', key });
     if (envVar) {
       process.env[envVar] = key;
     }
@@ -402,17 +546,20 @@ export class AuthStorage {
     }
 
     const credentials = await provider.login(callbacks);
+    if (callbacks.signal?.aborted) {
+      throw new Error('Login cancelled');
+    }
     // Route through the account registry: the new account is appended (or
     // updated in place — by id collision or an explicit replaceAccountId for
     // re-authentication) and becomes the active account unless activate:false.
-    return this.addAccount(providerId, credentials, opts);
+    return this.addAccount(providerId, credentials, { ...opts, signal: callbacks.signal });
   }
 
   /**
    * Logout from a provider: remove the legacy slot and every registered account.
    */
-  logout(provider: string): void {
-    this.remove(provider);
+  async logout(provider: string): Promise<void> {
+    await this.remove(provider);
   }
 
   // ---------------------------------------------------------------------------
@@ -439,9 +586,15 @@ export class AuthStorage {
 
   /** Adopt a legacy slot credential as the registry's first active entry. */
   private adoptSlot(providerId: string, slot: OAuthCredential): OAuthAccountRecord {
-    const id = mintAccountId(providerId);
     const provider = getOAuthProvider(providerId);
     const identity = providerIdentity(provider, slot);
+    // Until the first locked write persists the adopted entry, independent
+    // AuthStorage instances must derive the same provisional ID from the same
+    // legacy slot. Prefer provider identity (stable across refreshes); use the
+    // refresh token only for providers that expose no stable identity. Once
+    // written, the ID remains a normal opaque, persistent registry ID.
+    const adoptionKey = identity ? `identity:${identity}` : `refresh:${slot.refresh}`;
+    const id = `${providerId}:${createHash('sha256').update(adoptionKey).digest('hex')}`;
     const record: OAuthAccountRecord = {
       ...slot,
       type: 'oauth-account',
@@ -492,158 +645,158 @@ export class AuthStorage {
   async addAccount(
     providerId: string,
     creds: OAuthCredentials,
-    opts?: { label?: string; replaceAccountId?: string; activate?: boolean },
+    opts?: { label?: string; replaceAccountId?: string; activate?: boolean; signal?: AbortSignal },
   ): Promise<OAuthAccountRecord> {
-    this.reload();
-    const entries = this.accountEntries(providerId);
-
-    if (opts?.replaceAccountId) {
-      const target = entries.find(entry => entry.id === opts.replaceAccountId);
-      if (!target) {
-        throw new Error(`No account ${opts.replaceAccountId} for provider ${providerId}`);
-      }
-      const provider = getOAuthProvider(providerId);
-      const identity = providerIdentity(provider, creds) ?? target.identity;
-      // Re-authentication updates the account in place and **keeps its id**:
-      // ids are minted once and never derived from credentials (A13), so the
-      // entry's insertion position, the settings routing preference and any
-      // thread routing state that name this id all stay valid.
-      //
-      // A stale entry for the *same* subscription is dropped in favor of the
-      // picked account. Same-subscription is a matching stable identity, or —
-      // for a registry written before A13, whose ids were the refresh-token
-      // hash — the credentials' own legacy id, or an entry already holding
-      // exactly these credentials (a re-authorization that returns the same
-      // tokens, the only signal an identity-less provider gives). The survivor
-      // inherits the collided entry's active state, so re-authenticating an
-      // inactive account onto the active account's credentials cannot leave the
-      // registry with no active entry.
-      const legacyId = legacyAccountIdFor(providerId, creds.refresh);
-      const collided = entries.find(
-        entry =>
-          entry.id !== target.id &&
-          ((identity !== undefined && entry.identity === identity) ||
-            entry.id === legacyId ||
-            entry.refresh === creds.refresh),
-      );
-      // Credential metadata (device id, enterprise URL, …) follows the tokens:
-      // when the fresh response omits a field, the collided entry's value is the
-      // coherent fallback, not the target's — pairing fresh tokens with another
-      // subscription's stale endpoint would misroute requests. Fresh `creds`
-      // win last; only the target's registry metadata (id, label, addedAt)
-      // carries over.
-      const replacement: OAuthAccountRecord = {
-        ...target,
-        ...(collided ? credentialFieldsOf(collided) : {}),
-        ...creds,
-        type: 'oauth-account',
-        ...(identity ? { identity } : {}),
-        label: opts.label ?? target.label,
-      };
-      const rebuilt: AuthStorageData = {};
-      for (const [key, value] of Object.entries(this.data)) {
-        if (key === this.accountKeyFor(target.id)) {
-          rebuilt[key] = collided?.active ? { ...replacement, active: true } : replacement;
-        } else if (collided && key === this.accountKeyFor(collided.id)) {
-          continue;
-        } else {
-          rebuilt[key] = value;
-        }
-      }
-      this.data = rebuilt;
-      // Re-authentication preserves the account's active state: fixing a
-      // secondary account's tokens must not hijack the active slot. The target
-      // is activated when it was already active, when the entry it collided
-      // with was active, or when the provider has no active account at all
-      // (first account, or a self-healed gap).
-      const wasActive =
-        target.active === true ||
-        collided?.active === true ||
-        entries.some(entry => entry.active && entry.id !== target.id) === false;
-      if (wasActive) {
-        const activated = this.activateInMemory(providerId, target.id);
-        if (!activated) {
-          throw new Error(`Failed to activate account ${target.id} for provider ${providerId}`);
-        }
-        this.save();
-        return activated;
-      }
-      // Inactive target: tokens stay on the registry entry, the legacy slot
-      // keeps the currently active account's credential untouched.
-      const replacementEntry = this.accountEntries(providerId).find(entry => entry.id === target.id);
-      if (!replacementEntry) {
-        throw new Error(`Failed to store account ${target.id} for provider ${providerId}`);
-      }
-      this.save();
-      return replacementEntry;
-    }
-
-    // Resolve the label before the final reload+save: the provider hook may
-    // hit the network, and a concurrent write during that await must not be
-    // clobbered by a stale snapshot.
     const provider = getOAuthProvider(providerId);
     const identity = providerIdentity(provider, creds);
-    const label = opts?.label ?? (await provider?.getAccountLabel?.(creds)) ?? null;
-    this.reload();
-    const freshEntries = this.accountEntries(providerId);
+    // Keep provider/network work outside the auth-file lock. The critical
+    // section reloads the latest file before applying this login transaction.
+    const label = opts?.label ?? (opts?.replaceAccountId ? null : await provider?.getAccountLabel?.(creds)) ?? null;
+    return withAuthFileLock(this.authPath, async () => {
+      if (opts?.signal?.aborted) throw new Error('Login cancelled');
+      this.reload();
+      const entries = this.accountEntries(providerId);
 
-    // Is this a subscription we already hold? Match the provider's stable
-    // account identity where it exposes one, then the pre-A13 id (the
-    // refresh-token hash) so a pre-A13 registry still updates its entry rather
-    // than gaining a second one for the same subscription, and finally an
-    // entry already holding these exact credentials (a re-add of the same
-    // account as returned, which is the only signal an identity-less provider
-    // such as Anthropic gives us — a provider that cannot name its accounts
-    // cannot say "this is the same subscription, re-authorized").
-    //
-    // Crucially this must not re-derive the id of a *minted* entry: after a
-    // refresh such an entry's id no longer hashes its current token, and
-    // treating that miss as "new account" is exactly how re-adding a
-    // subscription used to create a duplicate entry for it.
-    const legacyId = legacyAccountIdFor(providerId, creds.refresh);
-    const existing =
-      (identity ? freshEntries.find(entry => entry.identity === identity) : undefined) ??
-      freshEntries.find(entry => entry.id === legacyId) ??
-      freshEntries.find(entry => entry.refresh === creds.refresh);
-    const id = existing?.id ?? mintAccountId(providerId);
-    if (existing) {
-      this.data[this.accountKeyFor(id)] = {
-        ...existing,
-        ...creds,
-        type: 'oauth-account',
-        id,
-        ...(identity ? { identity } : {}),
-        active: existing.active,
-      };
-    } else {
-      const resolvedLabel = label ?? `${provider?.name ?? providerId} account ${freshEntries.length + 1}`;
-      this.data[this.accountKeyFor(id)] = {
-        type: 'oauth-account',
-        id,
-        ...(identity ? { identity } : {}),
-        label: resolvedLabel,
-        addedAt: new Date().toISOString(),
-        active: false,
-        ...creds,
-      };
-    }
+      if (opts?.replaceAccountId) {
+        const target = entries.find(entry => entry.id === opts.replaceAccountId);
+        if (!target) {
+          throw new Error(`No account ${opts.replaceAccountId} for provider ${providerId}`);
+        }
+        const accountIdentity = identity ?? target.identity;
+        // Re-authentication updates the account in place and **keeps its id**:
+        // ids are minted once and never derived from credentials (A13), so the
+        // entry's insertion position, the settings routing preference and any
+        // thread routing state that name this id all stay valid.
+        //
+        // A stale entry for the *same* subscription is dropped in favor of the
+        // picked account. Same-subscription is a matching stable identity, or —
+        // for a registry written before A13, whose ids were the refresh-token
+        // hash — the credentials' own legacy id, or an entry already holding
+        // exactly these credentials (a re-authorization that returns the same
+        // tokens, the only signal an identity-less provider gives). The survivor
+        // inherits the collided entry's active state, so re-authenticating an
+        // inactive account onto the active account's credentials cannot leave the
+        // registry with no active entry.
+        const legacyId = legacyAccountIdFor(providerId, creds.refresh);
+        const collided = entries.find(
+          entry =>
+            entry.id !== target.id &&
+            ((accountIdentity !== undefined && entry.identity === accountIdentity) ||
+              entry.id === legacyId ||
+              entry.refresh === creds.refresh),
+        );
+        // Credential metadata (device id, enterprise URL, …) follows the tokens:
+        // when the fresh response omits a field, the collided entry's value is the
+        // coherent fallback, not the target's — pairing fresh tokens with another
+        // subscription's stale endpoint would misroute requests. Fresh `creds`
+        // win last; only the target's registry metadata (id, label, addedAt)
+        // carries over.
+        const replacement: OAuthAccountRecord = {
+          ...target,
+          ...(collided ? credentialFieldsOf(collided) : {}),
+          ...creds,
+          type: 'oauth-account',
+          ...(accountIdentity ? { identity: accountIdentity } : {}),
+          label: opts.label ?? target.label,
+        };
+        const rebuilt: AuthStorageData = {};
+        for (const [key, value] of Object.entries(this.data)) {
+          if (key === this.accountKeyFor(target.id)) {
+            rebuilt[key] = collided?.active ? { ...replacement, active: true } : replacement;
+          } else if (collided && key === this.accountKeyFor(collided.id)) {
+            continue;
+          } else {
+            rebuilt[key] = value;
+          }
+        }
+        this.data = rebuilt;
+        // Re-authentication preserves the account's active state: fixing a
+        // secondary account's tokens must not hijack the active slot. The target
+        // is activated when it was already active, when the entry it collided
+        // with was active, or when the provider has no active account at all
+        // (first account, or a self-healed gap).
+        const wasActive =
+          target.active === true ||
+          collided?.active === true ||
+          entries.some(entry => entry.active && entry.id !== target.id) === false;
+        if (wasActive) {
+          const activated = this.activateInMemory(providerId, target.id);
+          if (!activated) {
+            throw new Error(`Failed to activate account ${target.id} for provider ${providerId}`);
+          }
+          this.save();
+          return activated;
+        }
+        // Inactive target: tokens stay on the registry entry, the legacy slot
+        // keeps the currently active account's credential untouched.
+        const replacementEntry = this.accountEntries(providerId).find(entry => entry.id === target.id);
+        if (!replacementEntry) {
+          throw new Error(`Failed to store account ${target.id} for provider ${providerId}`);
+        }
+        this.save();
+        return replacementEntry;
+      }
 
-    // activate:false (add-another): keep the current active account. The
-    // first account of a provider always activates — a non-empty registry
-    // must have an active entry. An id collision with the already-active
-    // entry also falls through to activateInMemory so its fresh tokens move
-    // into the legacy slot (tokens are single-homed).
-    if (opts?.activate === false && freshEntries.length > 0 && !existing?.active) {
+      const freshEntries = this.accountEntries(providerId);
+
+      // Is this a subscription we already hold? Match the provider's stable
+      // account identity where it exposes one, then the pre-A13 id (the
+      // refresh-token hash) so a pre-A13 registry still updates its entry rather
+      // than gaining a second one for the same subscription, and finally an
+      // entry already holding these exact credentials (a re-add of the same
+      // account as returned, which is the only signal an identity-less provider
+      // such as Anthropic gives us — a provider that cannot name its accounts
+      // cannot say "this is the same subscription, re-authorized").
+      //
+      // Crucially this must not re-derive the id of a *minted* entry: after a
+      // refresh such an entry's id no longer hashes its current token, and
+      // treating that miss as "new account" is exactly how re-adding a
+      // subscription used to create a duplicate entry for it.
+      const legacyId = legacyAccountIdFor(providerId, creds.refresh);
+      const existing =
+        (identity ? freshEntries.find(entry => entry.identity === identity) : undefined) ??
+        freshEntries.find(entry => entry.id === legacyId) ??
+        freshEntries.find(entry => entry.refresh === creds.refresh);
+      const id = existing?.id ?? mintAccountId(providerId);
+      if (existing) {
+        this.data[this.accountKeyFor(id)] = {
+          ...existing,
+          ...creds,
+          type: 'oauth-account',
+          id,
+          ...(identity ? { identity } : {}),
+          active: existing.active,
+        };
+      } else {
+        const resolvedLabel = label ?? `${provider?.name ?? providerId} account ${freshEntries.length + 1}`;
+        this.data[this.accountKeyFor(id)] = {
+          type: 'oauth-account',
+          id,
+          ...(identity ? { identity } : {}),
+          label: resolvedLabel,
+          addedAt: new Date().toISOString(),
+          active: false,
+          ...creds,
+        };
+      }
+
+      // activate:false (add-another): keep the current active account. The
+      // first account of a provider always activates — a non-empty registry
+      // must have an active entry. An id collision with the already-active
+      // entry also falls through to activateInMemory so its fresh tokens move
+      // into the legacy slot (tokens are single-homed).
+      if (opts?.activate === false && freshEntries.length > 0 && !existing?.active) {
+        this.save();
+        return { ...(this.data[this.accountKeyFor(id)] as OAuthAccountRecord) };
+      }
+
+      const activated = this.activateInMemory(providerId, id);
+      if (!activated) {
+        throw new Error(`Failed to activate account ${id} for provider ${providerId}`);
+      }
       this.save();
-      return { ...(this.data[this.accountKeyFor(id)] as OAuthAccountRecord) };
-    }
-
-    const activated = this.activateInMemory(providerId, id);
-    if (!activated) {
-      throw new Error(`Failed to activate account ${id} for provider ${providerId}`);
-    }
-    this.save();
-    return activated;
+      return activated;
+    });
   }
 
   /**
@@ -653,11 +806,13 @@ export class AuthStorage {
    * the next entry in insertion order, wrapping once to the front; returns
    * undefined when there is no other entry to rotate to.
    */
-  activateAccount(providerId: string, instanceId?: string): OAuthAccountRecord | undefined {
-    this.reload();
-    const activated = this.activateInMemory(providerId, instanceId);
-    if (activated) this.save();
-    return activated;
+  async activateAccount(providerId: string, instanceId?: string): Promise<OAuthAccountRecord | undefined> {
+    return withAuthFileLock(this.authPath, async () => {
+      this.reload();
+      const activated = this.activateInMemory(providerId, instanceId);
+      if (activated) this.save();
+      return activated;
+    });
   }
 
   /**
@@ -720,46 +875,50 @@ export class AuthStorage {
    * insertion order is activated; when it was the last one, the legacy slot
    * is removed too (full sign-out for that provider).
    */
-  removeAccount(providerId: string, instanceId: string): void {
-    this.reload();
-    const entries = this.accountEntries(providerId);
-    const target = entries.find(entry => entry.id === instanceId);
-    if (!target) return;
+  async removeAccount(providerId: string, instanceId: string): Promise<void> {
+    await withAuthFileLock(this.authPath, async () => {
+      this.reload();
+      const entries = this.accountEntries(providerId);
+      const target = entries.find(entry => entry.id === instanceId);
+      if (!target) return;
 
-    const wasActive = target.active;
-    delete this.data[this.accountKeyFor(instanceId)];
+      const wasActive = target.active;
+      delete this.data[this.accountKeyFor(instanceId)];
 
-    if (wasActive) {
-      const idx = entries.indexOf(target);
-      const next = entries[idx + 1] ?? entries.find(entry => entry.id !== instanceId);
-      if (next) {
-        // The removed account's tokens die with it — only move tokens in.
-        this.data[providerId] = { type: 'oauth', ...credentialFieldsOf(next) };
-        this.data[this.accountKeyFor(next.id)] = { ...next, active: true };
-        for (const entry of entries) {
-          if (entry.id === next.id || entry.id === instanceId) continue;
-          if (entry.active) {
-            this.data[this.accountKeyFor(entry.id)] = { ...entry, active: false };
+      if (wasActive) {
+        const idx = entries.indexOf(target);
+        const next = entries[idx + 1] ?? entries.find(entry => entry.id !== instanceId);
+        if (next) {
+          // The removed account's tokens die with it — only move tokens in.
+          this.data[providerId] = { type: 'oauth', ...credentialFieldsOf(next) };
+          this.data[this.accountKeyFor(next.id)] = { ...next, active: true };
+          for (const entry of entries) {
+            if (entry.id === next.id || entry.id === instanceId) continue;
+            if (entry.active) {
+              this.data[this.accountKeyFor(entry.id)] = { ...entry, active: false };
+            }
           }
+        } else {
+          delete this.data[providerId];
         }
-      } else {
-        delete this.data[providerId];
       }
-    }
 
-    this.save();
+      this.save();
+    });
   }
 
   /**
    * Rename an account's label.
    */
-  renameAccount(providerId: string, instanceId: string, label: string): void {
-    this.reload();
-    const key = this.accountKeyFor(instanceId);
-    const entry = this.data[key];
-    if (!isOAuthAccountRecord(entry)) return;
-    this.data[key] = { ...entry, label };
-    this.save();
+  async renameAccount(providerId: string, instanceId: string, label: string): Promise<void> {
+    await withAuthFileLock(this.authPath, async () => {
+      this.reload();
+      const key = this.accountKeyFor(instanceId);
+      const entry = this.data[key];
+      if (!isOAuthAccountRecord(entry)) return;
+      this.data[key] = { ...entry, label };
+      this.save();
+    });
   }
 
   /**
@@ -773,7 +932,9 @@ export class AuthStorage {
     instanceId: string | undefined,
     creds: OAuthCredentials,
   ): void {
-    this.reload();
+    // Every caller reloads the latest snapshot after acquiring withAuthFileLock.
+    // Do not reload again here: writing must use the exact account selected
+    // from that locked snapshot, not a newly migrated in-memory snapshot.
     if (instanceId) {
       const key = this.accountKeyFor(instanceId);
       const entry = this.data[key];
@@ -792,6 +953,62 @@ export class AuthStorage {
     this.save();
   }
 
+  /** Read the selected account without substituting the current active account. */
+  private selectedCredential(providerId: string, instanceId?: string): OAuthRefreshResult | undefined {
+    const entry = instanceId
+      ? this.accountEntries(providerId).find(account => account.id === instanceId)
+      : this.getActiveAccount(providerId);
+    const slot = this.get(providerId);
+    if (!entry) {
+      if (instanceId || slot?.type !== 'oauth') return undefined;
+      const { type: _type, ...credentials } = slot;
+      return { credentials };
+    }
+    let credentials = credentialFieldsOf(entry);
+    if (entry.active && slot?.type === 'oauth' && slot.refresh === entry.refresh) {
+      const { type: _type, ...slotCredentials } = slot;
+      credentials = { ...credentials, ...slotCredentials };
+    }
+    return { credentials, accountInstanceId: entry.id };
+  }
+
+  /** Hold per-account refresh exclusion across network I/O, not the auth-file write lock. */
+  private async refreshCredential(
+    providerId: string,
+    instanceId?: string,
+    forceBaseline?: OAuthCredentials,
+  ): Promise<OAuthRefreshResult | undefined> {
+    const provider = getOAuthProvider(providerId);
+    if (!provider) return undefined;
+    const lockId = createHash('sha256')
+      .update(JSON.stringify([providerId, instanceId ?? null]))
+      .digest('hex');
+    return withAuthFileLock(`${this.authPath}.refresh-${lockId}`, async () => {
+      const selected = await withAuthFileLock(this.authPath, () => {
+        this.reload();
+        return this.selectedCredential(providerId, instanceId);
+      });
+      if (!selected) return undefined;
+      if (
+        forceBaseline
+          ? !sameOAuthCredentials(selected.credentials, forceBaseline)
+          : Date.now() < selected.credentials.expires
+      )
+        return selected;
+
+      const fresh = await provider.refreshToken(selected.credentials);
+      return withAuthFileLock(this.authPath, () => {
+        // Activation, removal or reauthorization can complete during network I/O.
+        this.reload();
+        const current = this.selectedCredential(providerId, selected.accountInstanceId);
+        if (!current) return undefined;
+        if (!sameOAuthCredentials(current.credentials, selected.credentials)) return current;
+        this.persistRefreshedCredential(providerId, selected.accountInstanceId, fresh);
+        return { credentials: fresh, accountInstanceId: selected.accountInstanceId };
+      });
+    });
+  }
+
   /**
    * Refresh one account instance through the per-instance dedupe map. Used
    * for sibling refreshes during the rotation walk, so a concurrent
@@ -799,11 +1016,7 @@ export class AuthStorage {
    * activated but before its refresh resolves) joins the same refresh
    * instead of double-spending a single-use refresh token.
    */
-  private async refreshInstance(
-    providerId: string,
-    instanceId: string,
-    creds: OAuthCredentials,
-  ): Promise<OAuthCredentials | undefined> {
+  private async refreshInstance(providerId: string, instanceId: string): Promise<OAuthRefreshResult | undefined> {
     const provider = getOAuthProvider(providerId);
     if (!provider) return undefined;
     const refreshKey = `${providerId}:${instanceId}`;
@@ -811,9 +1024,7 @@ export class AuthStorage {
     if (pending) return pending;
     const refresh = (async () => {
       try {
-        const fresh = await provider.refreshToken(creds);
-        this.persistRefreshedCredential(providerId, instanceId, fresh);
-        return fresh;
+        return await this.refreshCredential(providerId, instanceId);
       } catch {
         return undefined;
       }
@@ -871,27 +1082,28 @@ export class AuthStorage {
     const provider = getOAuthProvider(providerId);
     if (!provider) return undefined;
     const selectedInstanceId = selectedEntry?.id;
-    const toSnapshot = (credentials: OAuthCredentials): OAuthCredentialSnapshot => ({
+    const toSnapshot = (
+      credentials: OAuthCredentials,
+      instanceId: string | undefined = selectedInstanceId,
+    ): OAuthCredentialSnapshot => ({
       type: 'oauth',
       ...credentials,
-      accountInstanceId: selectedInstanceId,
+      accountInstanceId: instanceId,
     });
 
     if (Date.now() < credential.expires) return toSnapshot(credential);
 
     if (selectedInstanceId) {
-      const refreshed = await this.refreshInstance(providerId, selectedInstanceId, credential);
-      return refreshed ? toSnapshot(refreshed) : undefined;
+      const refreshed = await this.refreshInstance(providerId, selectedInstanceId);
+      return refreshed ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId) : undefined;
     }
 
     const pendingRefresh = this.refreshPromises.get(providerId);
     const refresh =
       pendingRefresh ??
-      (async (): Promise<OAuthCredentials | undefined> => {
+      (async (): Promise<OAuthRefreshResult | undefined> => {
         try {
-          const fresh = await provider.refreshToken(credential);
-          this.persistRefreshedCredential(providerId, undefined, fresh);
-          return fresh;
+          return await this.refreshCredential(providerId);
         } catch {
           return undefined;
         }
@@ -899,7 +1111,9 @@ export class AuthStorage {
     if (!pendingRefresh) this.refreshPromises.set(providerId, refresh);
     try {
       const refreshed = await refresh;
-      return refreshed ? toSnapshot(refreshed) : undefined;
+      return refreshed
+        ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId ?? selectedInstanceId)
+        : undefined;
     } finally {
       if (!pendingRefresh) this.refreshPromises.delete(providerId);
     }
@@ -946,6 +1160,13 @@ export class AuthStorage {
         ...accountCredential
       } = selectedEntry;
       cred = accountCredential;
+      // Match getOAuthCredential: a legacy writer can refresh the active slot
+      // without rotating its refresh token, so the slot is the newest snapshot
+      // for this same registered account.
+      if (selectedEntry.active && slot?.type === 'oauth' && slot.refresh === selectedEntry.refresh) {
+        const { type: _slotType, ...slotCredential } = slot;
+        cred = { ...cred, ...slotCredential };
+      }
     } else if (!accountInstanceId && slot?.type === 'oauth') {
       cred = slot;
     }
@@ -957,19 +1178,17 @@ export class AuthStorage {
     const pending = this.refreshPromises.get(refreshKey);
     const refresh =
       pending ??
-      (async (): Promise<OAuthCredentials | undefined> => {
+      (async (): Promise<OAuthRefreshResult | undefined> => {
         try {
-          const fresh = await provider.refreshToken(cred);
-          this.persistRefreshedCredential(providerId, selectedEntry?.id, fresh);
-          return fresh;
+          return await this.refreshCredential(providerId, accountInstanceId ?? selectedEntry?.id, cred);
         } catch {
           return undefined;
         }
       })();
     if (!pending) this.refreshPromises.set(refreshKey, refresh);
     try {
-      const creds = await refresh;
-      return creds ? provider.getApiKey(creds) : undefined;
+      const result = await refresh;
+      return result ? provider.getApiKey(result.credentials) : undefined;
     } finally {
       if (!pending) this.refreshPromises.delete(refreshKey);
     }

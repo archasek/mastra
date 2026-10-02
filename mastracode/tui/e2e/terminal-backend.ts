@@ -497,7 +497,7 @@ export async function runTerminalScenario(
       return 0;
     } finally {
       await stopApp?.();
-      releaseAllThreadLocks();
+      await releaseAllThreadLocks();
     }
   });
 }

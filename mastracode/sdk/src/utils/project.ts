@@ -5,7 +5,7 @@
  * Handles git worktrees by finding the main repository.
  */
 
-import { execFile, execSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,9 +33,9 @@ export interface ProjectInfo {
 /**
  * Run a git command and return stdout, or undefined if it fails
  */
-function git(args: string, cwd: string): string | undefined {
+function git(args: string[], cwd: string): string | undefined {
   try {
-    return execSync(`git ${args}`, {
+    return execFileSync('git', args, {
       cwd,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -83,7 +83,7 @@ export function detectProject(projectPath: string): ProjectInfo {
   const absolutePath = path.resolve(projectPath);
 
   // Check if this is a git repo
-  const gitDir = git('rev-parse --git-dir', absolutePath);
+  const gitDir = git(['rev-parse', '--git-dir'], absolutePath);
   const isGitRepo = gitDir !== undefined;
 
   let rootPath = absolutePath;
@@ -94,10 +94,10 @@ export function detectProject(projectPath: string): ProjectInfo {
 
   if (isGitRepo) {
     // Get the repo root (handles being in a subdirectory)
-    rootPath = git('rev-parse --show-toplevel', absolutePath) || absolutePath;
+    rootPath = git(['rev-parse', '--show-toplevel'], absolutePath) || absolutePath;
 
     // Check for worktree - git-common-dir differs from git-dir in worktrees
-    const commonDir = git('rev-parse --git-common-dir', absolutePath);
+    const commonDir = git(['rev-parse', '--git-common-dir'], absolutePath);
     if (commonDir && commonDir !== '.git' && commonDir !== gitDir) {
       isWorktree = true;
       // The common dir is inside the main repo's .git folder
@@ -105,19 +105,19 @@ export function detectProject(projectPath: string): ProjectInfo {
     }
 
     // Get remote URL (prefer origin, fall back to first remote)
-    gitUrl = git('remote get-url origin', absolutePath);
+    gitUrl = git(['remote', 'get-url', '--', 'origin'], absolutePath);
     if (!gitUrl) {
-      const remotes = git('remote', absolutePath);
+      const remotes = git(['remote'], absolutePath);
       if (remotes) {
         const firstRemote = remotes.split('\n')[0];
         if (firstRemote) {
-          gitUrl = git(`remote get-url ${firstRemote}`, absolutePath);
+          gitUrl = git(['remote', 'get-url', '--', firstRemote], absolutePath);
         }
       }
     }
 
     // Get current branch
-    gitBranch = git('rev-parse --abbrev-ref HEAD', absolutePath);
+    gitBranch = git(['rev-parse', '--abbrev-ref', 'HEAD'], absolutePath);
   }
 
   // Generate resource ID
@@ -158,12 +158,12 @@ export function detectProject(projectPath: string): ProjectInfo {
  * Lightweight alternative to detectProject() for refreshing just the branch.
  */
 export function getCurrentGitBranch(cwd: string): string | undefined {
-  return git('rev-parse --abbrev-ref HEAD', cwd);
+  return git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd);
 }
 
 /**
  * Async version of getCurrentGitBranch — avoids blocking the event loop
- * with execSync.  Falls back to undefined on any failure.
+ * with synchronous Git process execution. Falls back to undefined on failure.
  */
 export function getCurrentGitBranchAsync(cwd: string): Promise<string | undefined> {
   return new Promise(resolve => {
@@ -184,9 +184,10 @@ export function getCurrentGitBranchAsync(cwd: string): Promise<string | undefine
  * - Linux: ~/.local/share/mastracode
  * - Windows: %APPDATA%/mastracode
  */
-export function getAppDataDir(): string {
+export function getAppDataDir(options: { create?: boolean } = {}): string {
+  const shouldCreate = options.create !== false;
   if (process.env.MASTRA_APP_DATA_DIR) {
-    fs.mkdirSync(process.env.MASTRA_APP_DATA_DIR, { recursive: true });
+    if (shouldCreate) fs.mkdirSync(process.env.MASTRA_APP_DATA_DIR, { recursive: true });
     return process.env.MASTRA_APP_DATA_DIR;
   }
 
@@ -205,7 +206,7 @@ export function getAppDataDir(): string {
   const appDir = path.join(baseDir, 'mastracode');
 
   // Ensure directory exists
-  if (!fs.existsSync(appDir)) {
+  if (shouldCreate && !fs.existsSync(appDir)) {
     fs.mkdirSync(appDir, { recursive: true });
   }
 
@@ -213,7 +214,7 @@ export function getAppDataDir(): string {
 }
 /**
  * Get the database path for mastracode
- * Can be overridden with the MASTRA_DB_PATH environment variable for debugging.
+ * Can be overridden with the MASTRA_DB_PATH environment variable.
  */
 export function getDatabasePath(): string {
   if (process.env.MASTRA_DB_PATH) {
@@ -227,6 +228,9 @@ export function getDatabasePath(): string {
  * Separate from the main DB to avoid bloating it with embedding data.
  */
 export function getVectorDatabasePath(): string {
+  if (process.env.MASTRA_VECTOR_DB_PATH) {
+    return process.env.MASTRA_VECTOR_DB_PATH;
+  }
   return path.join(getAppDataDir(), 'mastra-vectors.db');
 }
 
@@ -433,7 +437,7 @@ export function getUserId(projectDir?: string): string {
 
   // 2. git user.email
   const cwd = projectDir || process.cwd();
-  const email = git('config user.email', cwd);
+  const email = git(['config', 'user.email'], cwd);
   if (email) {
     return email;
   }
@@ -451,7 +455,7 @@ export function getUserId(projectDir?: string): string {
  */
 export function getUserName(projectDir?: string): string {
   const cwd = projectDir || process.cwd();
-  const name = git('config user.name', cwd);
+  const name = git(['config', 'user.name'], cwd);
   if (name) {
     return name;
   }

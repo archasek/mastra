@@ -181,6 +181,7 @@ const mastraStub = {
   getStorage: vi.fn(() => undefined),
   startWorkers: vi.fn(async () => {}),
   stopWorkers: vi.fn(async () => {}),
+  shutdown: vi.fn(async () => {}),
   addProcessor: vi.fn((processor: { id: string; __registerMastra?: (mastra: unknown) => void }) => {
     processor.__registerMastra?.(mastraStub);
   }),
@@ -486,6 +487,10 @@ vi.mock('../utils/thread-lock.js', () => ({
   releaseThreadLock: vi.fn(),
 }));
 
+// Compile the dependency graph during file setup, not inside the first test's
+// runtime deadline. beforeEach still resets module state for every case.
+await import('../index.js');
+
 describe('createMastraCode', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -598,6 +603,47 @@ describe('createMastraCode', () => {
 
     expect(createEventedAgentMock).toHaveBeenCalledOnce();
     expect(createDurableAgentMock).not.toHaveBeenCalled();
+  });
+
+  it('drains Mastra shutdown before stopping workers after a failed local boot', async () => {
+    const dispatch = await import('../utils/notification-dispatch.js');
+    const startDispatch = vi.fn();
+    const stopDispatch = vi.fn(async () => {});
+    const dispatcher = vi.spyOn(dispatch, 'createResourceNotificationDispatcher').mockReturnValueOnce({
+      running: false,
+      start: startDispatch,
+      stop: stopDispatch,
+      tick: async () => {},
+    });
+    const { AgentController } = await import('@mastra/core/agent-controller');
+    const createSession = vi
+      .spyOn(AgentController.prototype, 'createSession')
+      .mockRejectedValueOnce(new Error('Session startup failed'));
+    const { createMastraCode } = await import('../index.js');
+    let release!: () => void;
+    const drain = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    mastraStub.stopWorkers.mockClear();
+    mastraStub.shutdown.mockClear();
+    mastraStub.shutdown.mockImplementationOnce(async () => {
+      await drain;
+    });
+    const boot = createMastraCode();
+    const rejection = expect(boot).rejects.toThrow('Session startup failed');
+    try {
+      await vi.waitFor(() => expect(mastraStub.shutdown).toHaveBeenCalledOnce());
+      expect(mastraStub.stopWorkers).not.toHaveBeenCalled();
+      expect(startDispatch).toHaveBeenCalledOnce();
+      expect(stopDispatch).toHaveBeenCalledOnce();
+      expect(stopDispatch.mock.invocationCallOrder[0]).toBeLessThan(mastraStub.shutdown.mock.invocationCallOrder[0]!);
+    } finally {
+      release();
+      dispatcher.mockRestore();
+      createSession.mockRestore();
+    }
+    await rejection;
+    expect(mastraStub.stopWorkers).toHaveBeenCalledOnce();
   });
 
   it('omits background task infrastructure unless background tools are enabled', async () => {
@@ -910,10 +956,16 @@ describe('createMastraCode', () => {
     expect(agentControllerConfig?.initialState?.configDir).toBe('.acme-code');
     expect(getDynamicMemoryMock).not.toHaveBeenCalled();
     expect(getStorageConfigMock).toHaveBeenCalledWith(projectPath, expect.anything(), '.acme-code');
-    expect(createMcpManagerMock).toHaveBeenCalledWith(projectPath, '.acme-code', undefined, {
-      claudeCodeGlobal: false,
-      codexGlobal: false,
-    });
+    expect(createMcpManagerMock).toHaveBeenCalledWith(
+      projectPath,
+      '.acme-code',
+      undefined,
+      {
+        claudeCodeGlobal: false,
+        codexGlobal: false,
+      },
+      undefined,
+    );
     expect(hookManagerConstructorMock).toHaveBeenCalledWith(
       projectPath,
       'session-init',
@@ -1186,10 +1238,16 @@ describe('createMastraCode', () => {
 
     expect(getResourceIdOverrideMock).toHaveBeenCalledWith(projectPath, '.acme-code');
     expect(getStorageConfigMock).toHaveBeenCalledWith(projectPath, expect.anything(), '.acme-code');
-    expect(createMcpManagerMock).toHaveBeenCalledWith(projectPath, '.acme-code', undefined, {
-      claudeCodeGlobal: false,
-      codexGlobal: false,
-    });
+    expect(createMcpManagerMock).toHaveBeenCalledWith(
+      projectPath,
+      '.acme-code',
+      undefined,
+      {
+        claudeCodeGlobal: false,
+        codexGlobal: false,
+      },
+      undefined,
+    );
     expect(hookManagerConstructorMock).toHaveBeenCalledWith(
       projectPath,
       'session-init',
@@ -1226,12 +1284,18 @@ describe('createMastraCode', () => {
     });
     const { createMastraCode } = await import('../index.js');
 
-    await createMastraCode({ cwd, configDir: '.acme-code', mcpServers });
+    await createMastraCode({ cwd, configDir: '.acme-code', mcpServers, disableMcpConfigDiscovery: true });
 
-    expect(createMcpManagerMock).toHaveBeenCalledWith(projectPath, '.acme-code', mcpServers, {
-      claudeCodeGlobal: false,
-      codexGlobal: false,
-    });
+    expect(createMcpManagerMock).toHaveBeenCalledWith(
+      projectPath,
+      '.acme-code',
+      mcpServers,
+      {
+        claudeCodeGlobal: false,
+        codexGlobal: false,
+      },
+      { disableConfigFileDiscovery: true },
+    );
   });
 
   it('passes persisted external MCP discovery opt-ins into the startup manager', async () => {
@@ -1243,10 +1307,16 @@ describe('createMastraCode', () => {
 
     await createMastraCode();
 
-    expect(createMcpManagerMock).toHaveBeenCalledWith(expect.any(String), '.mastracode', undefined, {
-      claudeCodeGlobal: true,
-      codexGlobal: true,
-    });
+    expect(createMcpManagerMock).toHaveBeenCalledWith(
+      expect.any(String),
+      '.mastracode',
+      undefined,
+      {
+        claudeCodeGlobal: true,
+        codexGlobal: true,
+      },
+      undefined,
+    );
   });
 
   it('rejects cross-process PubSub mode without a PubSub instance', async () => {

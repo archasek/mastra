@@ -2,10 +2,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Agent } from '../agent';
 import { InMemoryStore } from '../storage/mock';
 import { AgentController } from './agent-controller';
-import type { Session } from './session';
+import { SessionThread, type Session } from './session';
 import { createMockWorkspace } from './test-utils';
 
-function createController(threadLock?: { acquire: (id: string) => void; release: (id: string) => void }) {
+function createController(
+  threadLock?: { acquire: (id: string) => void; release: (id: string) => void },
+  storage = new InMemoryStore(),
+) {
   const agent = new Agent({
     name: 'test-agent',
     instructions: 'You are a test agent.',
@@ -15,7 +18,7 @@ function createController(threadLock?: { acquire: (id: string) => void; release:
   return new AgentController({
     workspace: createMockWorkspace(),
     id: 'test-controller',
-    storage: new InMemoryStore(),
+    storage,
     modes: [{ id: 'default', name: 'Default', default: true, agent }],
     threadLock,
   });
@@ -263,6 +266,45 @@ describe('AgentController thread locking', () => {
       acquire.mockClear();
       const newSession = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
       expect(acquire).toHaveBeenCalledWith(newSession.thread.getId());
+    });
+
+    it('releases the requested-thread lock when subscription setup fails and allows retry', async () => {
+      const store = new InMemoryStore();
+      const ownerController = createController(undefined, store);
+      await ownerController.init();
+      const owner = await ownerController.createSession({ resourceId: 'resource-a' });
+      const threadId = owner.thread.requireId();
+
+      const acquire = vi.fn();
+      const release = vi.fn();
+      const targetController = createController({ acquire, release }, store);
+      await targetController.init();
+      const subscriptionSetup = vi
+        .spyOn(SessionThread.prototype, 'ensureCurrentSubscription')
+        .mockRejectedValueOnce(new Error('subscription setup failed'));
+
+      try {
+        await expect(
+          targetController.createSession({
+            resourceId: 'resource-a',
+            threadId,
+            requireExistingThread: true,
+          }),
+        ).rejects.toThrow('subscription setup failed');
+      } finally {
+        subscriptionSetup.mockRestore();
+      }
+
+      expect(acquire).toHaveBeenCalledWith(threadId);
+      expect(release).toHaveBeenCalledWith(threadId);
+
+      const retry = await targetController.createSession({
+        resourceId: 'resource-a',
+        threadId,
+        requireExistingThread: true,
+      });
+      expect(retry.thread.getId()).toBe(threadId);
+      expect(acquire).toHaveBeenCalledTimes(2);
     });
 
     it('scopes initial thread selection to tags so worktrees stay isolated', async () => {

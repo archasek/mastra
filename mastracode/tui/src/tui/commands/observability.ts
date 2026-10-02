@@ -85,7 +85,7 @@ async function handleConnect(ctx: SlashCommandContext): Promise<void> {
   };
   saveSettings(settings);
 
-  ctx.authStorage.setStoredApiKey(`${OBSERVABILITY_AUTH_PREFIX}${resourceId}`, token);
+  await ctx.authStorage.setStoredApiKey(`${OBSERVABILITY_AUTH_PREFIX}${resourceId}`, token);
 
   ctx.showInfo(
     `${theme.fg('success', '✓')} Cloud observability configured.\n` +
@@ -133,7 +133,7 @@ function handleLocal(ctx: SlashCommandContext, args: string[]): void {
   }
 }
 
-function handleDisconnect(ctx: SlashCommandContext): void {
+async function handleDisconnect(ctx: SlashCommandContext): Promise<void> {
   const resourceId = ctx.state.session.identity.getResourceId();
   const settings = loadSettings();
 
@@ -149,7 +149,7 @@ function handleDisconnect(ctx: SlashCommandContext): void {
   saveSettings(settings);
 
   if (ctx.authStorage) {
-    ctx.authStorage.remove(`apikey:${OBSERVABILITY_AUTH_PREFIX}${resourceId}`);
+    await ctx.authStorage.remove(`apikey:${OBSERVABILITY_AUTH_PREFIX}${resourceId}`);
   }
 
   ctx.showInfo(

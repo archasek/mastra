@@ -17,7 +17,7 @@ function runtime(id: string) {
       listener = callback;
       return unsubscribe;
     },
-    thread: { create: async () => ({ id }), switch: vi.fn().mockResolvedValue(undefined) },
+    thread: { create: vi.fn(async () => ({ id })), getId: () => id, switch: vi.fn().mockResolvedValue(undefined) },
     mode,
     model,
     sendMessage,
@@ -42,18 +42,33 @@ function runtime(id: string) {
 const connection = () => ({ sessionUpdate: vi.fn().mockResolvedValue(undefined) }) as unknown as AgentSideConnection;
 
 describe('ACP session isolation', () => {
-  it('preserves the creation error and its prior cause when cleanup fails', async () => {
+  it('requires the runtime to provide its single bootstrapped thread and preserves cleanup failures', async () => {
     const state = runtime('broken');
     const originalCause = new Error('database unavailable');
-    const creationError = RequestError.internalError(undefined, 'thread creation failed');
+    const creationError = RequestError.internalError(undefined, 'Mastra Code ACP runtime has no active thread');
     creationError.cause = originalCause;
-    state.session.thread.create = vi.fn().mockRejectedValueOnce(creationError);
+    state.session.thread.getId = vi.fn(() => {
+      throw creationError;
+    });
     const cleanupError = new Error('storage close failed');
     state.cleanup.mockRejectedValueOnce(cleanupError);
     const agent = new MastraCodeAcpAgent(connection(), async () => state);
     await expect(agent.newSession({ cwd: '/one', mcpServers: [] })).rejects.toBe(creationError);
+    expect(state.session.thread.create).not.toHaveBeenCalled();
     expect(creationError.cause).toMatchObject({ errors: [originalCause, cleanupError] });
     expect(creationError.toResult()).toMatchObject({ error: { code: -32603, message: creationError.message } });
+    await agent.dispose();
+  });
+
+  it('uses the runtime thread instead of creating a second ACP thread', async () => {
+    const state = runtime('bootstrapped-thread');
+    const agent = new MastraCodeAcpAgent(connection(), async () => state);
+
+    await expect(agent.newSession({ cwd: '/one', mcpServers: [] })).resolves.toMatchObject({
+      sessionId: 'bootstrapped-thread',
+    });
+    expect(state.session.thread.create).not.toHaveBeenCalled();
+    expect(state.session.thread.switch).not.toHaveBeenCalled();
     await agent.dispose();
   });
 
@@ -112,7 +127,6 @@ describe('ACP session isolation', () => {
     const rejected = expect(creating).rejects.toMatchObject({
       code: -32603,
       message: expect.stringContaining('ACP connection is closed'),
-      cause: expect.objectContaining({ errors: [failure] }),
     });
     await entered.promise;
     const disposal = agent.dispose();

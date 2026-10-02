@@ -170,7 +170,7 @@ export const accountRotationScenario: McE2eScenario = {
       { label: 'Kimi Account B' },
     );
     const firstAccountId = storage.listAccounts(PROVIDER)[0]!.id;
-    storage.activateAccount(PROVIDER, firstAccountId);
+    await storage.activateAccount(PROVIDER, firstAccountId);
   },
   env() {
     return {
@@ -316,8 +316,8 @@ export const accountRotationScenario: McE2eScenario = {
     accountARecovered = true;
     const peer = new AuthStorage(join(scenarioAppDataDir, 'auth.json'));
     const [accountA, accountB] = peer.listAccounts(PROVIDER);
-    peer.activateAccount(PROVIDER, accountA!.id);
-    peer.removeAccount(PROVIDER, accountB!.id);
+    await peer.activateAccount(PROVIDER, accountA!.id);
+    await peer.removeAccount(PROVIDER, accountB!.id);
     const requestsBeforePeerChange = outbound.length;
     terminal.submit('Continue after another instance switched and removed the previous account.');
     await runtime.waitForScreenText(new RegExp(PEER_CHANGE_RESPONSE_TEXT), terminal, 30_000);

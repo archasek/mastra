@@ -61,13 +61,16 @@ function makeRotatingStorage(
   return new AuthStorage(authPath);
 }
 
-function activateSiblingThenReactivateOriginalAfterSnapshot(storage: AuthStorage, providerId: string): void {
+async function activateSiblingThenReactivateOriginalAfterSnapshot(
+  storage: AuthStorage,
+  providerId: string,
+): Promise<void> {
   const [originalAccount, siblingAccount] = storage.listAccounts(providerId);
-  storage.activateAccount(providerId, siblingAccount!.id);
+  await storage.activateAccount(providerId, siblingAccount!.id);
   const getSnapshot = storage.getOAuthCredential.bind(storage);
   vi.spyOn(storage, 'getOAuthCredential').mockImplementation(async id => {
     const snapshot = await getSnapshot(id);
-    storage.activateAccount(providerId, originalAccount!.id);
+    await storage.activateAccount(providerId, originalAccount!.id);
     return snapshot;
   });
 }
@@ -91,7 +94,7 @@ describe('oauth fetch wrappers follow account rotation', () => {
       { refresh: 'kr1', access: 'ka1', expires: FUTURE, deviceId: device1 },
       { refresh: 'kr2', access: 'ka2', expires: FUTURE, deviceId: device2 },
     );
-    activateSiblingThenReactivateOriginalAfterSnapshot(storage, 'kimi-for-coding');
+    await activateSiblingThenReactivateOriginalAfterSnapshot(storage, 'kimi-for-coding');
 
     const { buildKimiCodingOAuthFetch } = await import('../kimi-coding.js');
     const fetchWithOAuth = buildKimiCodingOAuthFetch({ credentialStore: storage });
@@ -110,7 +113,7 @@ describe('oauth fetch wrappers follow account rotation', () => {
       { refresh: 'cr1', access: 'ca1', expires: FUTURE, accountId: 'acct-1' },
       { refresh: 'cr2', access: 'ca2', expires: FUTURE, accountId: 'acct-2' },
     );
-    activateSiblingThenReactivateOriginalAfterSnapshot(storage, 'openai-codex');
+    await activateSiblingThenReactivateOriginalAfterSnapshot(storage, 'openai-codex');
 
     const { buildOpenAICodexOAuthFetch } = await import('../openai-codex.js');
     const fetchWithOAuth = buildOpenAICodexOAuthFetch({ authStorage: storage, rewriteUrl: false });
@@ -129,7 +132,7 @@ describe('oauth fetch wrappers follow account rotation', () => {
       { refresh: 'gr1', access: 'ga1', expires: FUTURE, enterpriseUrl: 'company-a.ghe.com' },
       { refresh: 'gr2', access: 'ga2', expires: FUTURE, enterpriseUrl: 'company-b.ghe.com' },
     );
-    activateSiblingThenReactivateOriginalAfterSnapshot(storage, 'github-copilot');
+    await activateSiblingThenReactivateOriginalAfterSnapshot(storage, 'github-copilot');
 
     const { buildGitHubCopilotOAuthFetch } = await import('../github-copilot.js');
     const fetchWithOAuth = buildGitHubCopilotOAuthFetch({ authStorage: storage });

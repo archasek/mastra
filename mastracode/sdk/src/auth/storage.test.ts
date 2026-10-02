@@ -10,6 +10,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -21,7 +22,7 @@ vi.hoisted(() => {
 });
 
 import { anthropicOAuthProvider } from './providers/anthropic.js';
-import { AuthStorage } from './storage.js';
+import { AuthStorage, readOAuthStatusFile } from './storage.js';
 import type { OAuthAccountRecord, OAuthCredential, OAuthCredentials } from './types.js';
 
 const PROVIDER = 'anthropic';
@@ -65,6 +66,14 @@ function readAuthJson(authPath: string): Record<string, unknown> {
   return JSON.parse(readFileSync(authPath, 'utf-8'));
 }
 
+function makeRawAuthFile(value: unknown): string {
+  const dir = mkdtempSync(join(tmpdir(), 'auth-status-test-'));
+  tempDirs.push(dir);
+  const authPath = join(dir, 'auth.json');
+  writeFileSync(authPath, JSON.stringify(value));
+  return authPath;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   while (tempDirs.length) {
@@ -72,8 +81,94 @@ afterEach(() => {
   }
 });
 
+describe('read-only OAuth status', () => {
+  it('reports malformed legacy OAuth slots as unknown without modifying the auth file', () => {
+    const malformedSlots = [
+      { type: 'oauth' },
+      { type: 'oauth', refresh: 'refresh-token' },
+      { type: 'oauth', refresh: 'refresh-token', access: '', expires: FUTURE },
+      { type: 'oauth', refresh: '   ', access: 'access-token', expires: FUTURE },
+      { type: 'oauth', refresh: 'refresh-token', access: ' \t\n ', expires: FUTURE },
+      { type: 'oauth', refresh: 'refresh-token', access: 'access-token', expires: 'future' },
+    ];
+
+    for (const slot of malformedSlots) {
+      const authPath = makeRawAuthFile({ [CODEX]: slot });
+      const before = readFileSync(authPath, 'utf-8');
+      expect(readOAuthStatusFile(authPath, CODEX)).toEqual({ provider: CODEX, status: 'unknown' });
+      expect(readFileSync(authPath, 'utf-8')).toBe(before);
+    }
+  });
+
+  it('reports malformed provider account records as unknown', () => {
+    const authPath = makeRawAuthFile({
+      [`accounts:${CODEX}:broken`]: {
+        type: 'oauth-account',
+        id: `${CODEX}:broken`,
+        label: 'Broken',
+        active: true,
+        refresh: 'refresh-token',
+      },
+    });
+
+    expect(readOAuthStatusFile(authPath, CODEX)).toEqual({ provider: CODEX, status: 'unknown' });
+
+    const malformedAccounts = [
+      { id: 'blank-refresh', refresh: ' \t\n ', access: 'access-token' },
+      { id: 'blank-access', refresh: 'refresh-token', access: ' \t\n ' },
+    ];
+    for (const account of malformedAccounts) {
+      const accountAuthPath = makeRawAuthFile({
+        [`accounts:${CODEX}:${account.id}`]: {
+          type: 'oauth-account',
+          id: `${CODEX}:${account.id}`,
+          label: 'Malformed',
+          addedAt: '2026-01-01T00:00:00.000Z',
+          active: true,
+          refresh: account.refresh,
+          access: account.access,
+          expires: FUTURE,
+        },
+      });
+      expect(readOAuthStatusFile(accountAuthPath, CODEX)).toEqual({ provider: CODEX, status: 'unknown' });
+    }
+  });
+
+  it('accepts complete legacy credentials and a valid active account record', () => {
+    const legacyPath = makeRawAuthFile({ [CODEX]: oauthCred('refresh-token', 'access-token') });
+    expect(readOAuthStatusFile(legacyPath, CODEX).status).toBe('authenticated');
+
+    const accountPath = makeRawAuthFile({
+      [`accounts:${CODEX}:one`]: {
+        type: 'oauth-account',
+        id: `${CODEX}:one`,
+        label: 'Primary',
+        addedAt: '2026-01-01T00:00:00.000Z',
+        active: true,
+        refresh: 'refresh-token',
+        access: 'access-token',
+        expires: FUTURE,
+      },
+    });
+    expect(readOAuthStatusFile(accountPath, CODEX)).toMatchObject({
+      provider: CODEX,
+      status: 'authenticated',
+      account: { id: `${CODEX}:one`, label: 'Primary' },
+    });
+  });
+});
+
 describe('AuthStorage multi-account registry', () => {
-  it('migrates a legacy-only auth.json into a one-entry registry without touching the slot', () => {
+  it('refuses to overwrite a corrupt auth file while removing a provider', async () => {
+    const { storage, authPath } = makeStorage({ [PROVIDER]: oauthCred('r1', 'a1') });
+    const corruptContents = '{"anthropic":';
+    writeFileSync(authPath, corruptContents);
+
+    await expect(storage.remove(PROVIDER)).rejects.toThrow(SyntaxError);
+    expect(readFileSync(authPath, 'utf-8')).toBe(corruptContents);
+  });
+
+  it('migrates a legacy-only auth.json into a one-entry registry without touching the slot', async () => {
     const { storage, authPath } = makeStorage({ [PROVIDER]: oauthCred('r1', 'a1') });
 
     const accounts = storage.listAccounts(PROVIDER);
@@ -85,13 +180,93 @@ describe('AuthStorage multi-account registry', () => {
     expect(storage.get(PROVIDER)).toEqual(oauthCred('r1', 'a1'));
 
     // The registry landed under accounts:<providerId>:<hash> on disk.
+    await storage.addAccount(PROVIDER, { refresh: 'r1', access: 'a1', expires: FUTURE });
     const onDisk = readAuthJson(authPath);
     const registryKeys = Object.keys(onDisk).filter(k => k.startsWith(`accounts:${PROVIDER}:`));
     expect(registryKeys).toHaveLength(1);
     expect(onDisk[PROVIDER]).toEqual({ type: 'oauth', refresh: 'r1', access: 'a1', expires: FUTURE });
   });
 
-  it('heals a registry whose legacy slot was deleted by mirroring the active entry back into the slot', () => {
+  it('does not rebind an existing Codex account ID to an unregistered legacy-slot identity', async () => {
+    const { storage, authPath } = makeStorage();
+    const primary = await storage.addAccount(CODEX, {
+      refresh: 'codex-refresh-a',
+      access: 'codex-access-a',
+      expires: FUTURE,
+      accountId: 'account-A',
+    });
+
+    const onDisk = readAuthJson(authPath);
+    onDisk[CODEX] = {
+      type: 'oauth',
+      refresh: 'codex-refresh-unregistered',
+      access: 'codex-access-unregistered',
+      expires: FUTURE,
+      accountId: 'account-unregistered',
+    };
+    writeFileSync(authPath, JSON.stringify(onDisk), 'utf-8');
+    storage.reload();
+
+    expect(storage.getActiveAccount(CODEX)).toMatchObject({
+      id: primary.id,
+      identity: 'account-A',
+      refresh: 'codex-refresh-a',
+      active: true,
+    });
+    expect(storage.get(CODEX)).toMatchObject({ accountId: 'account-A', refresh: 'codex-refresh-a' });
+    await expect(storage.getOAuthCredential(CODEX, primary.id)).resolves.toMatchObject({
+      accountId: 'account-A',
+      accountInstanceId: primary.id,
+    });
+  });
+
+  it('reconciles an older legacy writer to a registered Codex account by stable identity', async () => {
+    const { storage, authPath } = makeStorage();
+    const primary = await storage.addAccount(CODEX, {
+      refresh: 'codex-refresh-a',
+      access: 'codex-access-a',
+      expires: FUTURE,
+      accountId: 'account-A',
+    });
+    const secondary = await storage.addAccount(
+      CODEX,
+      {
+        refresh: 'codex-refresh-b',
+        access: 'codex-access-b',
+        expires: FUTURE,
+        accountId: 'account-B',
+      },
+      { activate: false },
+    );
+
+    const onDisk = readAuthJson(authPath);
+    onDisk[CODEX] = {
+      type: 'oauth',
+      refresh: 'codex-refresh-b-rotated',
+      access: 'codex-access-b-fresh',
+      expires: FUTURE,
+      accountId: 'account-B',
+    };
+    writeFileSync(authPath, JSON.stringify(onDisk), 'utf-8');
+    storage.reload();
+
+    expect(storage.getActiveAccount(CODEX)).toMatchObject({
+      id: secondary.id,
+      identity: 'account-B',
+      refresh: 'codex-refresh-b-rotated',
+      access: 'codex-access-b-fresh',
+      active: true,
+    });
+    expect(storage.getActiveAccount(CODEX)?.id).not.toBe(primary.id);
+    expect(storage.listAccounts(CODEX).find(entry => entry.id === primary.id)?.active).toBe(false);
+    await expect(storage.getOAuthCredential(CODEX, secondary.id)).resolves.toMatchObject({
+      accountId: 'account-B',
+      refresh: 'codex-refresh-b-rotated',
+      accountInstanceId: secondary.id,
+    });
+  });
+
+  it('heals a registry whose legacy slot was deleted by mirroring the active entry back into the slot', async () => {
     const active = accountRecord('r1', 'a1', { active: true, label: 'Work' });
     const inactive = accountRecord('r2', 'a2', { label: 'Personal' });
     const { storage, authPath } = makeStorage({
@@ -106,11 +281,12 @@ describe('AuthStorage multi-account registry', () => {
     expect(storage.listAccounts(PROVIDER)).toHaveLength(2);
     expect(storage.listAccounts(PROVIDER).find(account => account.active)?.id).toBe(active.id);
 
+    await storage.addAccount(PROVIDER, { refresh: 'r1', access: 'a1', expires: FUTURE });
     const onDisk = readAuthJson(authPath);
     expect(onDisk[PROVIDER]).toEqual({ type: 'oauth', refresh: 'r1', access: 'a1', expires: FUTURE });
   });
 
-  it('remove() clears the registry so a fresh load cannot resurrect the provider', () => {
+  it('remove() clears the registry so a fresh load cannot resurrect the provider', async () => {
     const active = accountRecord('r1', 'a1', { active: true, label: 'Work' });
     const inactive = accountRecord('r2', 'a2', { label: 'Personal' });
     const { storage, authPath } = makeStorage({
@@ -119,7 +295,7 @@ describe('AuthStorage multi-account registry', () => {
       [`accounts:${inactive.id}`]: inactive,
     });
 
-    storage.remove(PROVIDER);
+    await storage.remove(PROVIDER);
 
     // The registry dies with the slot — nothing left for migration to heal from.
     const onDisk = readAuthJson(authPath);
@@ -186,30 +362,30 @@ describe('AuthStorage multi-account registry', () => {
       reader.once('error', reject);
     });
 
-    for (let i = 0; i < 500; i++) storage.renameAccount(PROVIDER, entry.id, `Work ${i}`);
+    for (let i = 0; i < 500; i++) await storage.renameAccount(PROVIDER, entry.id, `Work ${i}`);
     writeFileSync(donePath, 'done');
     await readerExit;
 
     expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toEqual({ parseFailures: 0, missingSlots: 0 });
   });
 
-  it('reloads before generic writes so stale instances preserve unrelated credentials', () => {
+  it('reloads before generic writes so stale instances preserve unrelated credentials', async () => {
     const { storage, authPath } = makeStorage();
     const staleStorage = new AuthStorage(authPath);
 
-    storage.set('apikey:anthropic', { type: 'api_key', key: 'anthropic-key' });
-    staleStorage.set('apikey:xai', { type: 'api_key', key: 'xai-key' });
+    await storage.set('apikey:anthropic', { type: 'api_key', key: 'anthropic-key' });
+    await staleStorage.set('apikey:xai', { type: 'api_key', key: 'xai-key' });
 
     expect(readAuthJson(authPath)).toMatchObject({
       'apikey:anthropic': { type: 'api_key', key: 'anthropic-key' },
       'apikey:xai': { type: 'api_key', key: 'xai-key' },
     });
 
-    storage.remove('apikey:anthropic');
+    await storage.remove('apikey:anthropic');
     expect(readAuthJson(authPath)).toEqual({ 'apikey:xai': { type: 'api_key', key: 'xai-key' } });
   });
 
-  it('treats the slot as the winner when an external writer replaced its tokens (slot-wins migration)', () => {
+  it('does not attach unknown legacy-slot tokens to an existing account without proof of identity', () => {
     const entry1 = accountRecord('old-r1', 'old-a1', { active: true, label: 'Work' });
     const entry2 = accountRecord('r2', 'a2');
     const { storage } = makeStorage({
@@ -223,8 +399,8 @@ describe('AuthStorage multi-account registry', () => {
     const active = storage.getActiveAccount(PROVIDER);
     expect(active?.id).toBe(entry1.id);
     expect(active?.label).toBe('Work'); // identity preserved
-    expect(active).toMatchObject({ refresh: 'new-r1', access: 'new-a1' }); // slot tokens adopted
-    expect(storage.get(PROVIDER)).toMatchObject({ type: 'oauth', refresh: 'new-r1', access: 'new-a1' });
+    expect(active).toMatchObject({ refresh: 'old-r1', access: 'old-a1' });
+    expect(storage.get(PROVIDER)).toMatchObject({ type: 'oauth', refresh: 'old-r1', access: 'old-a1' });
   });
 
   it('addAccount twice yields two entries, the second active, tokens single-homed', async () => {
@@ -319,18 +495,18 @@ describe('AuthStorage multi-account registry', () => {
     await storage.addAccount(PROVIDER, { refresh: 'r3', access: 'a3', expires: FUTURE });
     const [a, b, c] = storage.listAccounts(PROVIDER);
 
-    storage.activateAccount(PROVIDER, a!.id);
+    await storage.activateAccount(PROVIDER, a!.id);
     expect(storage.getActiveAccount(PROVIDER)?.id).toBe(a!.id);
     expect(storage.get(PROVIDER)).toMatchObject({ access: 'a1' });
 
-    expect(storage.activateAccount(PROVIDER)?.id).toBe(b!.id);
+    expect((await storage.activateAccount(PROVIDER))?.id).toBe(b!.id);
     expect(storage.get(PROVIDER)).toMatchObject({ access: 'a2' });
 
-    expect(storage.activateAccount(PROVIDER)?.id).toBe(c!.id);
+    expect((await storage.activateAccount(PROVIDER))?.id).toBe(c!.id);
     expect(storage.get(PROVIDER)).toMatchObject({ access: 'a3' });
 
     // Wraps back to the first entry.
-    expect(storage.activateAccount(PROVIDER)?.id).toBe(a!.id);
+    expect((await storage.activateAccount(PROVIDER))?.id).toBe(a!.id);
     expect(storage.get(PROVIDER)).toMatchObject({ access: 'a1' });
 
     // Inactive entries keep their own tokens after moves.
@@ -338,7 +514,7 @@ describe('AuthStorage multi-account registry', () => {
 
     const { storage: single } = makeStorage();
     await single.addAccount(PROVIDER, { refresh: 'solo', access: 's1', expires: FUTURE });
-    expect(single.activateAccount(PROVIDER)).toBeUndefined();
+    expect(await single.activateAccount(PROVIDER)).toBeUndefined();
   });
 
   it('removeAccount of the active entry activates the next; removing the last entry removes the slot', async () => {
@@ -347,12 +523,12 @@ describe('AuthStorage multi-account registry', () => {
     await storage.addAccount(PROVIDER, { refresh: 'r2', access: 'a2', expires: FUTURE });
     const [a, b] = storage.listAccounts(PROVIDER);
 
-    storage.removeAccount(PROVIDER, a!.id);
+    await storage.removeAccount(PROVIDER, a!.id);
     expect(storage.listAccounts(PROVIDER)).toHaveLength(1);
     expect(storage.getActiveAccount(PROVIDER)?.id).toBe(b!.id);
     expect(storage.get(PROVIDER)).toMatchObject({ refresh: 'r2', access: 'a2' });
 
-    storage.removeAccount(PROVIDER, b!.id);
+    await storage.removeAccount(PROVIDER, b!.id);
     expect(storage.listAccounts(PROVIDER)).toHaveLength(0);
     expect(storage.get(PROVIDER)).toBeUndefined();
     expect(readAuthJson(authPath)[PROVIDER]).toBeUndefined();
@@ -377,6 +553,102 @@ describe('AuthStorage multi-account registry', () => {
     expect(storage.listAccounts(PROVIDER)).toHaveLength(2);
   });
 
+  it('keeps a legacy-only account ID stable across reload and persists its expired-token refresh', async () => {
+    const { storage, authPath } = makeStorage({ [PROVIDER]: oauthCred('legacy-refresh', 'legacy-access', PAST) });
+    const initialId = storage.listAccounts(PROVIDER)[0]!.id;
+    const secondStorage = new AuthStorage(authPath);
+    expect(secondStorage.listAccounts(PROVIDER)[0]!.id).toBe(initialId);
+
+    // A serialized write from the second instance must preserve an ID already
+    // observed by the first instance, rather than invalidating its route.
+    await secondStorage.addAccount(PROVIDER, {
+      refresh: 'legacy-refresh',
+      access: 'legacy-access',
+      expires: PAST,
+    });
+    expect(readAuthJson(authPath)[`accounts:${initialId}`]).toBeDefined();
+    storage.reload();
+    expect(storage.listAccounts(PROVIDER)[0]!.id).toBe(initialId);
+
+    const refreshMock = vi.spyOn(anthropicOAuthProvider, 'refreshToken').mockResolvedValue({
+      refresh: 'legacy-refresh-rotated',
+      access: 'legacy-access-fresh',
+      expires: FUTURE,
+    });
+    const refreshed = await storage.getOAuthCredential(PROVIDER, initialId);
+
+    expect(refreshed).toMatchObject({
+      access: 'legacy-access-fresh',
+      refresh: 'legacy-refresh-rotated',
+      accountInstanceId: initialId,
+    });
+    expect(refreshMock).toHaveBeenCalledOnce();
+    expect(readAuthJson(authPath)[`accounts:${initialId}`]).toMatchObject({
+      access: 'legacy-access-fresh',
+      refresh: 'legacy-refresh-rotated',
+    });
+    await expect(storage.getOAuthCredential(PROVIDER, initialId)).resolves.toMatchObject({
+      access: 'legacy-access-fresh',
+      accountInstanceId: initialId,
+    });
+  });
+
+  it('does not refresh another account when a pinned OAuth account disappears under the file lock', async () => {
+    const selected = accountRecord('same-refresh', 'same-access', { active: true, expires: PAST });
+    const replacement = { ...selected, id: `${PROVIDER}:replacement`, label: 'Replacement', active: false };
+    const { storage, authPath } = makeStorage({
+      [PROVIDER]: oauthCred('same-refresh', 'same-access', PAST),
+      [`accounts:${selected.id}`]: selected,
+      [`accounts:${replacement.id}`]: replacement,
+    });
+    const refresh = vi.spyOn(anthropicOAuthProvider, 'refreshToken').mockResolvedValue({
+      refresh: 'same-refresh-rotated',
+      access: 'same-access-fresh',
+      expires: FUTURE,
+    });
+
+    const pending = storage.getOAuthCredential(PROVIDER, selected.id);
+    writeFileSync(
+      authPath,
+      JSON.stringify({
+        [PROVIDER]: oauthCred('same-refresh', 'same-access', PAST),
+        [`accounts:${replacement.id}`]: { ...replacement, active: true },
+      }),
+      'utf-8',
+    );
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('does not force-refresh a different account when the requested account ID disappears', async () => {
+    const selected = accountRecord('same-refresh', 'same-access', { active: true });
+    const replacement = { ...selected, id: `${PROVIDER}:replacement`, label: 'Replacement', active: false };
+    const { storage, authPath } = makeStorage({
+      [PROVIDER]: oauthCred('same-refresh', 'same-access'),
+      [`accounts:${selected.id}`]: selected,
+      [`accounts:${replacement.id}`]: replacement,
+    });
+    const refresh = vi.spyOn(anthropicOAuthProvider, 'refreshToken').mockResolvedValue({
+      refresh: 'same-refresh-rotated',
+      access: 'same-access-fresh',
+      expires: FUTURE,
+    });
+
+    const pending = storage.forceRefreshActiveAccount(PROVIDER, selected.id);
+    writeFileSync(
+      authPath,
+      JSON.stringify({
+        [PROVIDER]: oauthCred('same-refresh', 'same-access'),
+        [`accounts:${replacement.id}`]: { ...replacement, active: true },
+      }),
+      'utf-8',
+    );
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
   it('does not overwrite a newly active account when another account finishes refreshing', async () => {
     const entry1 = accountRecord('r1', 'a1', { active: true, expires: PAST });
     const entry2 = accountRecord('r2', 'a2');
@@ -395,7 +667,8 @@ describe('AuthStorage multi-account registry', () => {
     );
 
     const pendingRefresh = storage.getApiKey(PROVIDER);
-    expect(storage.activateAccount(PROVIDER, entry2.id)?.id).toBe(entry2.id);
+    await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf('function'));
+    expect((await storage.activateAccount(PROVIDER, entry2.id))?.id).toBe(entry2.id);
     resolveRefresh({ refresh: 'r1-fresh', access: 'a1-fresh', expires: FUTURE });
 
     expect(await pendingRefresh).toBe('a1-fresh');
@@ -427,7 +700,8 @@ describe('AuthStorage multi-account registry', () => {
     );
 
     const pendingRefresh = storage.forceRefreshActiveAccount(PROVIDER);
-    expect(storage.activateAccount(PROVIDER, entry2.id)?.id).toBe(entry2.id);
+    await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf('function'));
+    expect((await storage.activateAccount(PROVIDER, entry2.id))?.id).toBe(entry2.id);
     resolveRefresh({ refresh: 'r1-forced', access: 'a1-forced', expires: FUTURE });
 
     expect(await pendingRefresh).toBe('a1-forced');
@@ -439,6 +713,29 @@ describe('AuthStorage multi-account registry', () => {
       refresh: 'r1-forced',
       access: 'a1-forced',
     });
+  });
+
+  it('does not spend one refresh token twice across concurrent AuthStorage instances', async () => {
+    const { storage, authPath } = makeStorage({ [PROVIDER]: oauthCred('r1', 'a1') });
+    const secondStorage = new AuthStorage(authPath);
+    let releaseRefresh!: () => void;
+    let refreshCalls = 0;
+    const refreshGate = new Promise<void>(resolve => {
+      releaseRefresh = resolve;
+    });
+    const refreshMock = vi.spyOn(anthropicOAuthProvider, 'refreshToken').mockImplementation(async () => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) await refreshGate;
+      return { refresh: 'r1-rotated', access: 'a1-fresh', expires: FUTURE };
+    });
+
+    const first = storage.forceRefreshActiveAccount(PROVIDER);
+    await vi.waitFor(() => expect(refreshCalls).toBe(1));
+    const second = secondStorage.forceRefreshActiveAccount(PROVIDER);
+    releaseRefresh();
+
+    await expect(Promise.all([first, second])).resolves.toEqual(['a1-fresh', 'a1-fresh']);
+    expect(refreshMock).toHaveBeenCalledTimes(1);
   });
 
   it('reads and refreshes a selected account without changing the active account', async () => {
@@ -493,10 +790,35 @@ describe('AuthStorage multi-account registry', () => {
 
     const p1 = storage.getApiKey(PROVIDER);
     const p2 = storage.getApiKey(PROVIDER);
+    await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf('function'));
     resolveRefresh();
     expect(await p1).toBe('a1-fresh');
     expect(await p2).toBe('a1-fresh');
     expect(refreshMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes refreshes across independent AuthStorage instances and rereads rotated tokens', async () => {
+    const { storage: first, authPath } = makeStorage({ [PROVIDER]: oauthCred('r1', 'a1', PAST) });
+    const second = new AuthStorage(authPath);
+    let resolveRefresh!: (creds: OAuthCredentials) => void;
+    const refreshMock = vi.spyOn(anthropicOAuthProvider, 'refreshToken').mockImplementation(
+      () =>
+        new Promise<OAuthCredentials>(resolve => {
+          resolveRefresh = resolve;
+        }),
+    );
+
+    const firstRead = first.getApiKey(PROVIDER);
+    const secondRead = second.getApiKey(PROVIDER);
+    await vi.waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1));
+    resolveRefresh({ refresh: 'r1-rotated', access: 'a1-fresh', expires: FUTURE });
+
+    await expect(Promise.all([firstRead, secondRead])).resolves.toEqual(['a1-fresh', 'a1-fresh']);
+    expect(refreshMock).toHaveBeenCalledTimes(1);
+    expect(new AuthStorage(authPath).get(PROVIDER)).toMatchObject({
+      refresh: 'r1-rotated',
+      access: 'a1-fresh',
+    });
   });
 
   it('reads a pre-feature auth.json exactly as before (backward compatibility)', async () => {
@@ -728,6 +1050,60 @@ describe('AuthStorage multi-account registry', () => {
     expect(storage.get(PROVIDER)).toMatchObject({ type: 'oauth', refresh: 'r2', access: 'a2' });
   });
 
+  it('does not persist credentials when login is cancelled after the provider resolves', async () => {
+    const { storage } = makeStorage();
+    const controller = new AbortController();
+    let finishLogin!: (credentials: OAuthCredentials) => void;
+    vi.spyOn(anthropicOAuthProvider, 'login').mockImplementation(
+      () =>
+        new Promise<OAuthCredentials>(resolve => {
+          finishLogin = resolve;
+        }),
+    );
+
+    const login = storage.login(PROVIDER, {
+      onAuth: () => {},
+      onPrompt: async () => '',
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(finishLogin).toBeTypeOf('function'));
+    controller.abort();
+    finishLogin({ refresh: 'cancelled-refresh', access: 'cancelled-access', expires: FUTURE });
+
+    await expect(login).rejects.toThrow('Login cancelled');
+    expect(storage.listAccounts(PROVIDER)).toEqual([]);
+    expect(storage.get(PROVIDER)).toBeUndefined();
+  });
+
+  it('does not persist login credentials cancelled while waiting for the auth-file lock', async () => {
+    const { storage, authPath } = makeStorage({});
+    const lockfile = createRequire(import.meta.url)('proper-lockfile');
+    const release = await lockfile.lock(authPath, { realpath: false });
+    const controller = new AbortController();
+    vi.spyOn(anthropicOAuthProvider, 'login').mockResolvedValueOnce({
+      refresh: 'cancelled-refresh',
+      access: 'cancelled-access',
+      expires: FUTURE,
+    });
+    const addAccount = vi.spyOn(storage, 'addAccount');
+    const before = readFileSync(authPath, 'utf-8');
+    const login = storage.login(PROVIDER, {
+      onAuth: () => {},
+      onPrompt: async () => '',
+      signal: controller.signal,
+    });
+    const rejected = expect(login).rejects.toThrow('Login cancelled');
+    try {
+      await vi.waitFor(() => expect(addAccount).toHaveBeenCalledOnce());
+      controller.abort();
+    } finally {
+      await release();
+    }
+    await rejected;
+    expect(readFileSync(authPath, 'utf-8')).toBe(before);
+    expect(new AuthStorage(authPath).listAccounts(PROVIDER)).toEqual([]);
+  });
+
   it('addAccount labels the account from the provider hook when available', async () => {
     const { storage } = makeStorage();
     const account = await storage.addAccount('openai-codex', {
@@ -803,6 +1179,30 @@ describe('AuthStorage multi-account registry', () => {
     expect(snapshot).toMatchObject({ access: 'a1-slot-fresh', accountInstanceId: work.id });
   });
 
+  it('forced refresh reuses newer legacy-slot credentials observed under the auth-file lock', async () => {
+    const { storage, authPath } = makeStorage({
+      [PROVIDER]: oauthCred('r1', 'a1', PAST),
+      [`accounts:${accountRecord('r1', 'a1', { active: true, expires: PAST }).id}`]: accountRecord('r1', 'a1', {
+        active: true,
+        expires: PAST,
+      }),
+    });
+    const entry = storage.getActiveAccount(PROVIDER)!;
+    const refresh = vi.spyOn(anthropicOAuthProvider, 'refreshToken').mockResolvedValue({
+      refresh: 'r1-rotated-again',
+      access: 'a1-refreshed-again',
+      expires: FUTURE,
+    });
+
+    const pending = storage.forceRefreshActiveAccount(PROVIDER, entry.id);
+    const onDisk = readAuthJson(authPath);
+    onDisk[PROVIDER] = { type: 'oauth', refresh: 'r1', access: 'a1-rotated-elsewhere', expires: FUTURE };
+    writeFileSync(authPath, JSON.stringify(onDisk), 'utf-8');
+
+    await expect(pending).resolves.toBe('a1-rotated-elsewhere');
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
   it('keeps registry credentials for an inactive selected account', async () => {
     const { storage } = makeStorage();
     await storage.addAccount(PROVIDER, { refresh: 'r1', access: 'a1', expires: FUTURE }, { label: 'Work' });
@@ -825,7 +1225,7 @@ describe('AuthStorage multi-account registry', () => {
     await storage.addAccount(PROVIDER, { refresh: 'r1', access: 'a1', expires: FUTURE });
     await storage.addAccount(PROVIDER, { refresh: 'r2', access: 'a2', expires: FUTURE });
 
-    storage.logout(PROVIDER);
+    await storage.logout(PROVIDER);
 
     expect(storage.listAccounts(PROVIDER)).toHaveLength(0);
     expect(storage.get(PROVIDER)).toBeUndefined();
@@ -902,6 +1302,12 @@ describe('AuthStorage multi-account registry', () => {
     expect(entry!.id).toBe(legacyId);
     expect(entry!.identity).toBe('acct-A');
     // Backfilled durably, so it holds across a restart.
+    await storage.addAccount(CODEX, {
+      refresh: 'cr1',
+      access: 'ca1',
+      expires: FUTURE,
+      accountId: 'acct-A',
+    });
     expect(readAuthJson(authPath)[`accounts:${legacyId}`]).toMatchObject({ identity: 'acct-A' });
 
     // And the backfilled identity makes a later re-authorization update the

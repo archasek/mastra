@@ -8,6 +8,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 const tsxBin = fileURLToPath(new URL('../../../node_modules/.bin/tsx', import.meta.url));
 const childScript = fileURLToPath(new URL('./fixtures/cross-process-agent-signals-child.mts', import.meta.url));
 const activeChildren = new Set<ReturnType<typeof spawn>>();
+// Fresh tsx children can take more than 10 seconds to load the SDK under the
+// host verification lane's CPU limit, before they emit their first event.
+const CHILD_EVENT_TIMEOUT_MS = 20_000;
 
 type ChildEvent = {
   event: string;
@@ -49,7 +52,7 @@ function startChild(role: 'owner' | 'sender', resourceId: string, scenario = 're
     get stderr() {
       return stderr;
     },
-    waitFor(eventName: string, timeoutMs = 10_000) {
+    waitFor(eventName: string, timeoutMs = CHILD_EVENT_TIMEOUT_MS) {
       const existing = events.find(event => event.event === eventName);
       if (existing) return Promise.resolve(existing);
       return new Promise<ChildEvent>((resolve, reject) => {

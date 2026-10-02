@@ -120,7 +120,7 @@ export function createMockSession(opts: MockAgentControllerOptions = {}) {
       get: vi.fn(() => ({ isRunning: false })),
     },
     subscribe: vi.fn(() => () => {}),
-    emit: vi.fn(),
+    emit: vi.fn<(...args: any[]) => any>(),
 
     // Run-control surface (moved off AgentController onto Session).
     sendMessage: vi.fn(async () => {}),
@@ -132,7 +132,7 @@ export function createMockSession(opts: MockAgentControllerOptions = {}) {
     sendNotificationSignal: vi.fn(async () => ({ accepted: true, runId: 'run-1' })),
     steer: vi.fn(async () => {}),
     followUp: vi.fn(async () => {}),
-    abort: vi.fn(),
+    abort: vi.fn<(...args: any[]) => any>(),
     respondToToolSuspension: vi.fn(async () => {}),
     saveSystemReminderMessage: vi.fn(async () => null),
   };
@@ -158,9 +158,9 @@ export function createMockAgentController(opts: MockAgentControllerOptions = {})
     resolveWorkspace: vi.fn(async () => undefined),
     getResolvedWorkspace: vi.fn(async () => undefined),
     getKnownResourceIds: vi.fn(async () => []),
-    setResourceId: vi.fn(),
+    setResourceId: vi.fn<(...args: any[]) => any>(),
     // Host-level reads that now take the session as an explicit argument.
-    getCurrentAgent: vi.fn(),
+    getCurrentAgent: vi.fn<(...args: any[]) => any>(),
     getCurrentModelAuthStatus: vi.fn(async () => ({ hasAuth: true, apiKeyEnvVar: undefined })),
     loadOMProgress: vi.fn(async () => {}),
     getObservationalMemoryRecord: vi.fn(async () => null),

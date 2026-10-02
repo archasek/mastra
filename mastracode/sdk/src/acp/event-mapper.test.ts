@@ -12,16 +12,19 @@ describe('ACP Event Mapper', () => {
   let mockSession: Session;
   let sessionUpdateSpy: ReturnType<typeof vi.fn>;
   let requestPermissionSpy: ReturnType<typeof vi.fn>;
+  let elicitationSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     sessionUpdateSpy = vi.fn().mockResolvedValue(undefined);
     requestPermissionSpy = vi.fn().mockResolvedValue({
       outcome: { outcome: 'selected', optionId: 'approve' },
     });
+    elicitationSpy = vi.fn().mockResolvedValue({ action: 'accept', content: { answer: 'Blue' } });
 
     mockConnection = {
       sessionUpdate: sessionUpdateSpy,
       requestPermission: requestPermissionSpy,
+      unstable_createElicitation: elicitationSpy,
     } as unknown as AgentSideConnection;
 
     mockSession = {
@@ -464,6 +467,63 @@ describe('ACP Event Mapper', () => {
       expect(mockSession.respondToToolSuspension).not.toHaveBeenCalled();
       expect(mockSession.abort).toHaveBeenCalledTimes(1);
     });
+
+    it('uses ACP form elicitation to answer ask_user and resumes the suspended call', async () => {
+      const state = createPromptState('session-1');
+      state.supportsElicitation = true;
+      const event: Extract<AgentControllerEvent, { type: 'tool_suspended' }> = {
+        type: 'tool_suspended',
+        toolCallId: 'ask-user-call',
+        toolName: 'ask_user',
+        args: { question: 'Choose a color' },
+        suspendPayload: {
+          question: 'Choose a color',
+          options: [{ label: 'Blue' }, { label: 'Green' }],
+          selectionMode: 'single_select',
+        },
+      };
+
+      handleAgentControllerEvent(event, state, mockConnection, mockSession);
+
+      await vi.waitFor(() => expect(elicitationSpy).toHaveBeenCalledOnce());
+      expect(elicitationSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'session-1',
+          toolCallId: 'ask-user-call',
+          mode: 'form',
+          message: 'Choose a color',
+        }),
+      );
+      expect(mockSession.respondToToolSuspension).toHaveBeenCalledWith({
+        toolCallId: 'ask-user-call',
+        resumeData: 'Blue',
+      });
+      expect(mockSession.abort).not.toHaveBeenCalled();
+    });
+
+    it('aborts instead of inventing an answer when the user dismisses ask_user', async () => {
+      const state = createPromptState('session-1');
+      state.supportsElicitation = true;
+      elicitationSpy.mockResolvedValueOnce({ action: 'cancel' });
+      handleAgentControllerEvent(
+        {
+          type: 'tool_suspended',
+          toolCallId: 'ask-user-call',
+          toolName: 'ask_user',
+          args: {},
+          suspendPayload: { question: 'Choose a color', options: [] },
+        },
+        state,
+        mockConnection,
+        mockSession,
+      );
+      await vi.waitFor(() => expect(mockSession.abort).toHaveBeenCalledOnce());
+      expect(state.resolve).not.toHaveBeenCalled();
+      expect(mockSession.respondToToolSuspension).not.toHaveBeenCalled();
+      expect(mockSession.abort).toHaveBeenCalledOnce();
+      handleAgentControllerEvent({ type: 'agent_end', reason: 'aborted' }, state, mockConnection, mockSession);
+      expect(state.resolve).toHaveBeenCalledWith('aborted');
+    });
   });
 
   it('does not retry an approved suspension as a rejection when resume fails', async () => {
@@ -477,7 +537,7 @@ describe('ACP Event Mapper', () => {
     );
     await vi.waitFor(() => expect(state.resolve).toHaveBeenCalledWith('error'));
     expect(mockSession.respondToToolSuspension).toHaveBeenCalledTimes(1);
-    expect(state.error?.message).toBe('Resume failed');
+    expect(state.error?.message).toBe('ACP suspended tool could not be resumed');
   });
 
   describe('permission lifecycle', () => {

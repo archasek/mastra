@@ -35,6 +35,7 @@ async function connect(getSkills?: AcpSessionRuntime['getSkills']) {
   let emit: (event: AgentControllerEvent) => void = () => {};
   const sendMessage = vi.fn().mockResolvedValue(undefined);
   const createThread = vi.fn(async () => ({ id: 'thread-1' }));
+  const getThreadId = vi.fn(() => 'thread-1');
   const cleanup = vi.fn().mockResolvedValue(undefined);
   const resume = vi.fn().mockResolvedValue(undefined);
   const abort = vi.fn(() => emit({ type: 'agent_end', reason: 'aborted' }));
@@ -46,7 +47,7 @@ async function connect(getSkills?: AcpSessionRuntime['getSkills']) {
       emit = listener;
       return () => {};
     },
-    thread: { create: createThread, switch: async () => {} },
+    thread: { create: createThread, getId: getThreadId, switch: async () => {} },
     mode: { get: () => 'build' },
     model: { get: () => 'test-model' },
     sendMessage,
@@ -104,6 +105,7 @@ async function connect(getSkills?: AcpSessionRuntime['getSkills']) {
     updates,
     dropped,
     createThread,
+    getThreadId,
     cleanup,
   };
 }
@@ -125,9 +127,11 @@ function assistant(text: string): AgentControllerEvent[] {
 
 describe('ACP JSON-RPC conversation', () => {
   it('keeps the original creation error on the wire when cleanup also fails', async () => {
-    const { client, createThread, cleanup } = await connect();
+    const { client, getThreadId, cleanup } = await connect();
     const error = RequestError.invalidParams({ thread: 'broken' }, 'thread creation failed');
-    createThread.mockRejectedValueOnce(error);
+    getThreadId.mockImplementationOnce(() => {
+      throw error;
+    });
     cleanup.mockRejectedValueOnce(new Error('storage close failed'));
     await expect(client.newSession({ cwd: '/tmp', mcpServers: [] })).rejects.toMatchObject({
       code: error.code,
@@ -189,7 +193,7 @@ describe('ACP JSON-RPC conversation', () => {
     ]);
   });
 
-  it('returns a JSON-RPC error with the failed turn details', async () => {
+  it('returns a JSON-RPC error without leaking failed turn details', async () => {
     const { client, sessionId, emit, sendMessage } = await connect();
     sendMessage.mockImplementationOnce(async () => {
       emit({ type: 'error', error: new Error('Provider rejected the request') });
@@ -197,7 +201,8 @@ describe('ACP JSON-RPC conversation', () => {
     });
     await expect(client.prompt({ sessionId, prompt: [] })).rejects.toMatchObject({
       code: -32603,
-      message: expect.stringContaining('Provider rejected the request'),
+      message: 'Internal error: Mastra Code turn failed',
+      data: undefined,
     });
   });
 

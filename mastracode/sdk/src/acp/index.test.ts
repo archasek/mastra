@@ -7,9 +7,15 @@ vi.mock('./runtime.js', () => ({ createAcpSession: vi.fn() }));
 vi.mock('./event-mapper.js', () => ({ setAutoApprove: vi.fn() }));
 afterEach(() => vi.restoreAllMocks());
 
+it('passes the CLI release version to the ACP server', async () => {
+  vi.mocked(runAcpServer).mockResolvedValueOnce(undefined);
+  await acpMain({ version: '0.43.0' });
+  expect(runAcpServer).toHaveBeenLastCalledWith(expect.any(Function), '0.43.0');
+});
+
 it('terminates on a fatal server failure rather than waiting for stdin to close', async () => {
   const originalLog = console.log;
-  const failure = new Error('Transport setup failed');
+  const failure = new Error('Transport setup failed with Authorization: Bearer secret-token');
   const exited = new Error('process.exit');
   vi.mocked(runAcpServer).mockRejectedValueOnce(failure);
   const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
@@ -20,7 +26,8 @@ it('terminates on a fatal server failure rather than waiting for stdin to close'
   try {
     await expect(acpMain()).rejects.toBe(exited);
     expect(exit).toHaveBeenCalledWith(1);
-    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('Transport setup failed'));
+    expect(stderr).toHaveBeenCalledWith('[acp] Fatal server error.\n');
+    expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('secret-token'));
     expect(console.log).toBe(originalLog);
   } finally {
     process.exitCode = oldExitCode;

@@ -121,6 +121,13 @@ export interface McpManager {
   getServerLogs(name: string): string[];
 }
 
+export interface McpManagerOptions {
+  /** Do not read ambient MCP config or disable state; use only programmatic servers. */
+  disableConfigFileDiscovery?: boolean;
+  /** Do not attach OAuth providers or load persisted OAuth state for MCP servers. */
+  disableOAuthProviders?: boolean;
+}
+
 function getTransport(cfg: McpServerConfig): 'stdio' | 'http' {
   return 'url' in cfg ? 'http' : 'stdio';
 }
@@ -203,6 +210,7 @@ export function createMcpManager(
   configDirName = DEFAULT_CONFIG_DIR,
   extraServers?: Record<string, McpServerConfig>,
   externalDiscovery?: ExternalMcpDiscoveryOptions,
+  options?: McpManagerOptions,
 ): McpManager {
   /** Merge programmatic servers into a base config (highest priority). */
   const applyExtraServers = (base: McpConfig): McpConfig => {
@@ -210,11 +218,20 @@ export function createMcpManager(
     return { ...base, mcpServers: { ...base.mcpServers, ...extraServers } };
   };
 
-  let config = applyExtraServers(loadMcpConfig(projectDir, configDirName, externalDiscovery));
+  const loadConfig = (): McpConfig => {
+    if (options?.disableConfigFileDiscovery) {
+      return extraServers && Object.keys(extraServers).length > 0 ? { mcpServers: { ...extraServers } } : {};
+    }
+    return applyExtraServers(loadMcpConfig(projectDir, configDirName, externalDiscovery));
+  };
+
+  let config = loadConfig();
   let projectServerOverrides = new Map<string, McpProjectServerOverride>(
-    Object.entries(loadProjectServerOverrides(projectDir)),
+    options?.disableConfigFileDiscovery ? [] : Object.entries(loadProjectServerOverrides(projectDir)),
   );
-  let globalDisableState = loadGlobalDisableState();
+  let globalDisableState = options?.disableConfigFileDiscovery
+    ? { allDisabled: false, disabledServers: [] }
+    : loadGlobalDisableState();
   let globallyDisabledServers = new Set(globalDisableState.disabledServers);
 
   /** Whether a server is disabled after applying the kill switch, project override, and global default. */
@@ -307,6 +324,7 @@ export function createMcpManager(
   }
 
   function createOAuthProvider(name: string, cfg: McpHttpServerConfig) {
+    if (options?.disableOAuthProviders) return undefined;
     // Bare `url` entries get no eager provider — auth is provisioned lazily
     // when the user authenticates — unless a previous session already stored
     // OAuth state for this server, in which case the provider is needed to
@@ -667,9 +685,13 @@ export function createMcpManager(
     },
 
     async reload() {
-      config = applyExtraServers(loadMcpConfig(projectDir, configDirName, externalDiscovery));
-      projectServerOverrides = new Map(Object.entries(loadProjectServerOverrides(projectDir)));
-      globalDisableState = loadGlobalDisableState();
+      config = loadConfig();
+      projectServerOverrides = new Map(
+        options?.disableConfigFileDiscovery ? [] : Object.entries(loadProjectServerOverrides(projectDir)),
+      );
+      globalDisableState = options?.disableConfigFileDiscovery
+        ? { allDisabled: false, disabledServers: [] }
+        : loadGlobalDisableState();
       globallyDisabledServers = new Set(globalDisableState.disabledServers);
       await rebuildConnections();
     },
