@@ -37,9 +37,17 @@ beforeEach(() => {
   process.env.MASTRA_APP_DATA_DIR = dataDir;
 });
 
-afterEach(() => {
+afterEach(async () => {
   resetSessionRegistrationsForTesting();
-  for (const child of children.splice(0)) child.kill();
+  await Promise.all(
+    children.splice(0).map(child => {
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+      return new Promise<void>(resolve => {
+        child.once('exit', () => resolve());
+        child.kill();
+      });
+    }),
+  );
   if (prevDataDir === undefined) delete process.env.MASTRA_APP_DATA_DIR;
   else process.env.MASTRA_APP_DATA_DIR = prevDataDir;
   fs.rmSync(dataDir, { recursive: true, force: true });
@@ -241,6 +249,7 @@ describe('maintenance lock held by this process', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
     try {
       const child = spawnLiveProcess();
+      children.push(child);
       fs.mkdirSync(path.dirname(getMaintenanceLockPath()), { recursive: true });
       fs.writeFileSync(getMaintenanceLockPath(), String(child.pid));
       let settled = false;

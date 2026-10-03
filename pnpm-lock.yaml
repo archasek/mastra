@@ -2747,6 +2747,9 @@ importers:
       posthog-node:
         specifier: ^5.46.1
         version: 5.48.0(rxjs@7.8.2)
+      proper-lockfile:
+        specifier: ^4.1.2
+        version: 4.1.2
       smol-toml:
         specifier: 1.8.0
         version: 1.8.0
@@ -30303,6 +30306,9 @@ packages:
   prop-types@15.8.1:
     resolution: {integrity: sha512-oj87CgZICdulUohogVAR7AjlC0327U4el4L6eAvOqCeudMDVU0NThNaV+b9Df4dXgSP1gXMTnPdhfe/2qDH5cg==}
 
+  proper-lockfile@4.1.2:
+    resolution: {integrity: sha512-TjNPblN4BwAWMXU8s9AEz4JmQxnD1NNL7bNOY/AKUzyamc379FWASUhc/K1pL2noVb+XmZKLL68cjzLsiOAMaA==}
+
   property-information@5.6.0:
     resolution: {integrity: sha512-YUHSPk+A30YPv+0Qf8i9Mbfe/C0hdPXk1s1jPVToV8pk8BQtpw10ct89Eo7OWkutrwqvT0eicAxlOg3dOAu8JA==}
 
@@ -56774,6 +56780,12 @@ snapshots:
       loose-envify: 1.4.0
       object-assign: '@socketregistry/object-assign@1.0.5'
       react-is: 16.13.1
+
+  proper-lockfile@4.1.2:
+    dependencies:
+      graceful-fs: 4.2.11
+      retry: 0.12.0
+      signal-exit: 3.0.7
 
   property-information@5.6.0:
     dependencies:

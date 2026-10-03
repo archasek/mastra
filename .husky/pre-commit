@@ -4,5 +4,4 @@ corepack pnpm --version || {
 }
 
 # Formatting on staged files
-corepack pnpm lint-staged --quiet
-
+corepack pnpm lint-staged --quiet --concurrent false

@@ -1,10 +1,11 @@
 import { Readable, Writable } from 'node:stream';
+
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk';
 import { MastraCodeAcpAgent } from './agent.js';
 import type { AcpSessionFactory } from './agent.js';
 
 /** Run the ACP server over stdio and release its sessions on disconnect. */
-export async function runAcpServer(createSession: AcpSessionFactory): Promise<void> {
+export async function runAcpServer(createSession: AcpSessionFactory, version?: string): Promise<void> {
   const input = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
   const output = Writable.toWeb(process.stdout) as WritableStream<Uint8Array>;
   let agent: MastraCodeAcpAgent | undefined;
@@ -14,8 +15,8 @@ export async function runAcpServer(createSession: AcpSessionFactory): Promise<vo
   const handleSignal = () => {
     shutdownPromise ??= dispose().then(
       () => process.exit(0),
-      error => {
-        process.stderr.write(`[acp] Shutdown failed: ${error}\n`);
+      () => {
+        process.stderr.write('[acp] Shutdown failed.\n');
         process.exit(1);
       },
     );
@@ -25,7 +26,7 @@ export async function runAcpServer(createSession: AcpSessionFactory): Promise<vo
   try {
     const connection = new AgentSideConnection(
       conn => {
-        agent = new MastraCodeAcpAgent(conn, createSession);
+        agent = new MastraCodeAcpAgent(conn, createSession, version);
         return agent;
       },
       ndJsonStream(output, input),

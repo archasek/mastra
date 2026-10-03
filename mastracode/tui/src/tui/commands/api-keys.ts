@@ -147,7 +147,7 @@ export async function handleApiKeysCommand(ctx: SlashCommandContext): Promise<vo
           const info = providers.find(p => p.provider === currentSelection);
           if (info?.source === 'stored' && ctx.authStorage) {
             const storedKey = ctx.authStorage.getStoredApiKey(info.provider);
-            ctx.authStorage.remove(`apikey:${info.provider}`);
+            await ctx.authStorage.remove(`apikey:${info.provider}`);
             if (info.envVar && process.env[info.envVar] === storedKey) {
               delete process.env[info.envVar];
             }
@@ -196,10 +196,14 @@ export async function handleApiKeysCommand(ctx: SlashCommandContext): Promise<vo
         onSubmit: (key: string) => {
           ctx.state.ui.hideOverlay();
           if (ctx.authStorage) {
-            ctx.authStorage.setStoredApiKey(info.provider, key, info.envVar);
-            ctx.showInfo(`API key saved for ${info.provider}`);
-            providers = getProviderList(ctx, models);
-            rebuildList();
+            void Promise.resolve(ctx.authStorage.setStoredApiKey(info.provider, key, info.envVar)).then(
+              () => {
+                ctx.showInfo(`API key saved for ${info.provider}`);
+                providers = getProviderList(ctx, models);
+                rebuildList();
+              },
+              () => ctx.showError(`Unable to save API key for ${info.provider}`),
+            );
           } else {
             ctx.showError('Unable to save API key: storage unavailable');
           }

@@ -263,7 +263,7 @@ export async function runMCCli(
     exitCode = 1;
   } finally {
     // --- Teardown (always runs, even on a thrown error) ---
-    releaseAllThreadLocks();
+    await releaseAllThreadLocks();
     if (boot) {
       // Stop plugin-contributed signal providers (and the plugin reload listener)
       // before quiescing workers: a provider that keeps polling past this point

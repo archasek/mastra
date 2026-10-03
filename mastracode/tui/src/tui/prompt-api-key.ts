@@ -29,8 +29,10 @@ export function promptForApiKeyIfNeeded(
       onSubmit: (key: string) => {
         ui.hideOverlay();
         // Store the key and set env var so model resolution picks it up
-        authStorage.setStoredApiKey(model.provider, key, model.apiKeyEnvVar);
-        resolve('ready');
+        void Promise.resolve(authStorage.setStoredApiKey(model.provider, key, model.apiKeyEnvVar)).then(
+          () => resolve('ready'),
+          () => resolve('cancelled'),
+        );
       },
       onCancel: () => {
         ui.hideOverlay();

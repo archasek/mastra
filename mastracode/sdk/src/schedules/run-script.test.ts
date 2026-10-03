@@ -54,7 +54,8 @@ describe('runScript', () => {
   });
 
   it('reports a timeout as exit null with a note', async () => {
-    const abs = write('slow.sh', 'sleep 5\n');
+    // Replace the interpreter so timeout termination owns the sleeper itself.
+    const abs = write('slow.sh', 'exec sleep 5\n');
     const result = await runScript(abs, { cwd: dir, timeoutMs: 200 });
     expect(result.exitCode).toBeNull();
     expect(result.stderr).toMatch(/timed out after 200ms/);

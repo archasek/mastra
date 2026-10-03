@@ -33,7 +33,7 @@ function runtime(id: string, catalog: Skill[]) {
     skills,
     sent,
     session: {
-      thread: { create: async () => ({ id }), switch: async () => {} },
+      thread: { create: async () => ({ id }), getId: () => id, switch: async () => {} },
       mode: { get: () => 'build' },
       model: { get: () => '' },
       subscribe: (listener: typeof emit) => {

@@ -28,7 +28,14 @@ if (typeof process !== 'undefined' && (process.versions?.node || process.version
 
 import { parseAuthorizationInput } from '../authorization-input.js';
 import { generatePKCE } from '../pkce.js';
-import type { AuthMode, OAuthCredentials, OAuthLoginCallbacks, OAuthPrompt, OAuthProviderInterface } from '../types.js';
+import type {
+  AuthMode,
+  OAuthAuthInfo,
+  OAuthCredentials,
+  OAuthLoginCallbacks,
+  OAuthPrompt,
+  OAuthProviderInterface,
+} from '../types.js';
 
 export const OPENAI_CODEX_AUTH_MODES: ReadonlyArray<AuthMode> = [
   {
@@ -490,6 +497,7 @@ export async function pollCodexDeviceLogin(
     }),
     signal: requestSignal(options?.signal),
   });
+  if (options?.signal?.aborted) throw new Error('Login cancelled');
 
   if (pollResponse.ok) {
     const data = (await pollResponse.json()) as {
@@ -507,6 +515,7 @@ export async function pollCodexDeviceLogin(
       DEVICE_REDIRECT_URI,
       options?.signal,
     );
+    if (options?.signal?.aborted) throw new Error('Login cancelled');
     if (tokenResult.type !== 'success') {
       return { status: 'failed', error: 'Token exchange failed' };
     }
@@ -540,21 +549,51 @@ export async function pollCodexDeviceLogin(
   return { status: 'pending', nextPollMs: pending.intervalMs };
 }
 
+function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error('Login cancelled'));
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish(new Error('Login cancelled'));
+
+    timer = setTimeout(() => finish(), Math.max(0, ms));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
 async function loginOpenAICodexDevice(options: {
-  onAuth: (info: { url: string; instructions?: string }) => void;
+  onAuth: (info: OAuthAuthInfo) => void;
   onProgress?: (message: string) => void;
   signal?: AbortSignal;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<OAuthCredentials> {
   const pending = await startCodexDeviceLogin({ signal: options.signal });
-  const sleep = options.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const sleep = options.sleep ?? (ms => sleepWithSignal(ms, options.signal));
+  const waitForNextPoll = async (requestedDelayMs: number) => {
+    if (options.signal?.aborted) throw new Error('Login cancelled');
+    const remainingMs = Math.max(0, pending.deadlineAt - Date.now());
+    await sleep(Math.min(Math.max(0, requestedDelayMs), remainingMs));
+    if (options.signal?.aborted) throw new Error('Login cancelled');
+  };
 
   options.onAuth({
     url: pending.url,
     instructions: pending.instructions,
+    userCode: pending.userCode,
+    expiresAt: new Date(pending.deadlineAt).toISOString(),
   });
 
-  await sleep(pending.intervalMs);
+  await waitForNextPoll(pending.intervalMs);
 
   while (true) {
     if (options.signal?.aborted) {
@@ -562,6 +601,9 @@ async function loginOpenAICodexDevice(options: {
     }
 
     const result = await pollCodexDeviceLogin(pending, { signal: options.signal });
+    if (options.signal?.aborted) {
+      throw new Error('Login cancelled');
+    }
     if (result.status === 'complete') {
       return result.credentials;
     }
@@ -570,7 +612,7 @@ async function loginOpenAICodexDevice(options: {
     }
 
     options.onProgress?.('Waiting for OpenAI Codex device authorization...');
-    await sleep(result.nextPollMs);
+    await waitForNextPoll(result.nextPollMs);
   }
 }
 
@@ -586,7 +628,7 @@ async function loginOpenAICodexDevice(options: {
  * @param options.originator - OAuth originator parameter (defaults to "mastracode")
  */
 export async function loginOpenAICodex(options: {
-  onAuth: (info: { url: string; instructions?: string }) => void;
+  onAuth: (info: OAuthAuthInfo) => void;
   onPrompt: (prompt: OAuthPrompt) => Promise<string>;
   onProgress?: (message: string) => void;
   onManualCodeInput?: () => Promise<string>;
@@ -724,6 +766,7 @@ export const __testing = {
   extractAccountIdFromClaims,
   getAccountId,
   loginOpenAICodexDevice,
+  sleepWithSignal,
   requireAccountId,
   startLocalOAuthServer,
 };

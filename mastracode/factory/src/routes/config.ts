@@ -781,7 +781,7 @@ export class ConfigRoutes extends Route<ConfigRoutesDeps> {
             }
             if (!authStorage) return c.json({ error: 'Credential storage is not available' }, 503);
             // Local mode is single-user: scope is meaningless and ignored.
-            authStorage.setStoredApiKey(provider, key, envVar);
+            await authStorage.setStoredApiKey(provider, key, envVar);
             const providers = await listProviders({ controller, authStorage });
             return c.json({ ok: true, provider: providers.find(p => p.provider === provider) });
           } catch (error) {
@@ -812,7 +812,7 @@ export class ConfigRoutes extends Route<ConfigRoutesDeps> {
               return c.json({ ok: true, provider: providers.find(p => p.provider === provider) });
             }
             if (!authStorage) return c.json({ error: 'Credential storage is not available' }, 503);
-            authStorage.remove(`apikey:${provider}`);
+            await authStorage.remove(`apikey:${provider}`);
             const providers = await listProviders({ controller, authStorage });
             return c.json({ ok: true, provider: providers.find(p => p.provider === provider) });
           } catch (error) {

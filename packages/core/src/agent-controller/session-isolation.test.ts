@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Agent } from '../agent';
 import { InMemoryStore } from '../storage/mock';
 import { AgentController } from './agent-controller';
@@ -39,6 +39,36 @@ describe('AgentController.createSession — cross-session isolation', () => {
     expect(a.thread.getId()).toBeDefined();
     expect(b.thread.getId()).toBeDefined();
     expect(a.thread.getId()).not.toBe(b.thread.getId());
+  });
+
+  it('can require an existing thread without creating a missing or foreign thread', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+    const owner = await controller.createSession({ resourceId: 'resource-a' });
+    const foreignThreadId = owner.thread.requireId();
+
+    await expect(
+      controller.createSession({ resourceId: 'resource-b', threadId: foreignThreadId, requireExistingThread: true }),
+    ).rejects.toThrow(`Thread not found: ${foreignThreadId}`);
+
+    const missingThreadId = 'missing-thread';
+    await expect(
+      controller.createSession({ resourceId: 'resource-b', threadId: missingThreadId, requireExistingThread: true }),
+    ).rejects.toThrow(`Thread not found: ${missingThreadId}`);
+    await expect(controller.queryThreadById({ threadId: missingThreadId })).resolves.toBeNull();
+  });
+
+  it('rechecks a same-id cached binding when requiring an existing thread', async () => {
+    const controller = createController(new InMemoryStore(), { resourceId: 'resource-a' });
+    await controller.init();
+    const session = await controller.createSession({ resourceId: 'resource-a' });
+    const threadId = session.thread.requireId();
+    const getById = vi.spyOn(session.thread, 'getById').mockResolvedValue(null);
+
+    await expect(
+      controller.createSession({ resourceId: 'resource-a', threadId, requireExistingThread: true }),
+    ).rejects.toThrow(`Thread not found: ${threadId}`);
+    expect(getById).toHaveBeenCalledWith({ threadId });
   });
 
   it('isolates mode switches between sessions', async () => {

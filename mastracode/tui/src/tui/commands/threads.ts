@@ -9,7 +9,7 @@ import type { SlashCommandContext } from './types.js';
 export function showThreadLockPrompt(
   ctx: SlashCommandContext,
   threadTitle: string,
-  ownerPid: number,
+  ownerPid: number | null,
   lockedThreadId?: string,
 ): void {
   ctx.analytics?.trackInteractivePrompt('thread_lock_prompt', {
@@ -20,7 +20,10 @@ export function showThreadLockPrompt(
 
   void (async () => {
     const answer = await askModalQuestion(ctx.state.ui, {
-      question: `Thread "${threadTitle}" is locked by pid ${ownerPid}. What would you like to do?`,
+      question:
+        ownerPid === null
+          ? `Thread "${threadTitle}" is locked by another process. What would you like to do?`
+          : `Thread "${threadTitle}" is locked by pid ${ownerPid}. What would you like to do?`,
       options: [
         { label: 'Switch thread', description: 'Pick a different thread' },
         { label: 'New thread', description: 'Start a fresh thread' },

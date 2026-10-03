@@ -68,7 +68,7 @@ export async function handleMastraGatewayCommand(ctx: SlashCommandContext): Prom
     // ESC with no key — abort; ESC with existing key — proceed to URL prompt
     if (!currentKey) return;
   } else if (keyAnswer.toLowerCase() === 'clear') {
-    authStorage.remove(`apikey:${MASTRA_GATEWAY_PROVIDER}`);
+    await authStorage.remove(`apikey:${MASTRA_GATEWAY_PROVIDER}`);
     delete process.env['MASTRA_GATEWAY_API_KEY'];
     delete process.env['MASTRA_GATEWAY_URL'];
     settings.memoryGateway = {};
@@ -77,7 +77,7 @@ export async function handleMastraGatewayCommand(ctx: SlashCommandContext): Prom
     ctx.showInfo('Gateway cleared. Memory mode changes take effect on next restart.');
     return;
   } else if (keyAnswer.length > 0) {
-    authStorage.setStoredApiKey(MASTRA_GATEWAY_PROVIDER, keyAnswer, 'MASTRA_GATEWAY_API_KEY');
+    await authStorage.setStoredApiKey(MASTRA_GATEWAY_PROVIDER, keyAnswer, 'MASTRA_GATEWAY_API_KEY');
   }
 
   const urlChoice = await askSelect(ctx, 'Gateway URL', [

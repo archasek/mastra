@@ -175,7 +175,7 @@ describe('Kimi For Coding OAuth', () => {
     const dir = mkdtempSync(join(tmpdir(), 'kimi-auth-'));
     try {
       const storage = new AuthStorage(join(dir, 'auth.json'));
-      storage.set('kimi-for-coding', {
+      await storage.set('kimi-for-coding', {
         type: 'oauth',
         access: 'old-at',
         refresh: 'old-rt',

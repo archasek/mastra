@@ -208,7 +208,7 @@ async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> 
 
 const asyncCleanup = (): Promise<void> => {
   cleanupPromise ??= (async () => {
-    releaseAllThreadLocks();
+    await releaseAllThreadLocks();
     // Stop plugin-contributed signal providers (and the plugin reload listener)
     // before quiescing workers: a provider that keeps polling past this point
     // could dispatch into a controller that is shutting down.
@@ -254,44 +254,36 @@ process.on('beforeExit', () => {
   void asyncCleanup();
 });
 process.on('exit', () => {
-  // Ensure terminal protocols (kitty keyboard, modifyOtherKeys, bracketed paste,
-  // raw mode) are disabled on ANY exit path. Without this, killing the process
-  // via SIGINT/SIGTERM leaves the terminal in a corrupted state where keypresses
-  // produce escape sequences like "5;99~" instead of normal characters.
-  try {
-    tui?.stop();
-  } catch {
-    // Failsafe: even if MastraTUI.stop() throws, write raw terminal reset
-    // sequences to disable Kitty keyboard protocol, bracketed paste, and
-    // modifyOtherKeys. These are the exact sequences pi-tui's terminal.stop()
-    // would write.
-  }
-  // Belt-and-suspenders: always write terminal reset sequences directly,
-  // regardless of whether tui.stop() succeeded. Writing them twice is harmless
-  // but missing them leaves the terminal in a corrupted state.
-  try {
-    process.stdout.write(
-      '\x1b[?2004l' + // disable bracketed paste
-        '\x1b[<u' + // pop kitty keyboard protocol
-        '\x1b[>4;0m' + // disable modifyOtherKeys
-        '\x1b[?25h', // show cursor
-    );
-    if (process.stdin.setRawMode) {
-      process.stdin.setRawMode(false);
+  if (!process.argv.includes('--acp')) {
+    // ACP stdout is the NDJSON protocol stream, never a terminal channel.
+    // Keep terminal reset bytes off stdout even when the ACP child exits.
+    try {
+      tui?.stop();
+    } catch {
+      // Failsafe: the raw reset below still restores the interactive terminal.
     }
-  } catch {
-    // stdout may already be closed during exit
+    try {
+      process.stdout.write(
+        '\x1b[?2004l' + // disable bracketed paste
+          '\x1b[<u' + // pop kitty keyboard protocol
+          '\x1b[>4;0m' + // disable modifyOtherKeys
+          '\x1b[?25h', // show cursor
+      );
+      if (process.stdin.setRawMode) {
+        process.stdin.setRawMode(false);
+      }
+    } catch {
+      // stdout may already be closed during exit
+    }
+    restoreTerminalForeground();
+    try {
+      const threadId = getResumeThreadId?.();
+      if (threadId) process.stdout.write(`\n${formatResumeHint(threadId)}\n`);
+    } catch {
+      // session state or stdout may already be closed during exit
+    }
   }
-  restoreTerminalForeground();
   releaseAllThreadLocks();
-  try {
-    const threadId = getResumeThreadId?.();
-    if (threadId) {
-      process.stdout.write(`\n${formatResumeHint(threadId)}\n`);
-    }
-  } catch {
-    // session state or stdout may already be closed during exit
-  }
 });
 
 // Start durable diagnostics shutdown before synchronous TUI teardown so a stalled
@@ -438,9 +430,13 @@ async function main() {
 
   if (process.argv.includes('--acp')) {
     rejectInitialPromptFlag('it cannot be combined with --acp');
+    if (process.argv.includes('--dangerous-auto-approve')) {
+      process.stderr.write('--dangerous-auto-approve is not supported in ACP mode.\n');
+      process.exit(1);
+    }
     const { acpMain } = await import('@mastra/code-sdk/acp/index');
     return acpMain({
-      dangerousAutoApprove: process.argv.includes('--dangerous-auto-approve'),
+      version: getCurrentVersion(),
       coAuthor: TUI_CO_AUTHOR,
     });
   }

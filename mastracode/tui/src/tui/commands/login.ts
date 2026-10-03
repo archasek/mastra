@@ -57,7 +57,7 @@ async function promptForAccountName(
   const name = input.trim();
   const label = name ? withProviderPrefix(baseLabel, name) : defaultLabel;
   if (label !== account.label) {
-    authStorage.renameAccount(providerId, account.id, label);
+    await authStorage.renameAccount(providerId, account.id, label);
   }
 }
 
@@ -191,21 +191,33 @@ async function openAccountManager(
         finish();
         void performLogin(ctx, providerId, { replaceAccountId: accountId });
       },
-      onRemove: accountId => {
+      onRemove: async accountId => {
         const label =
           ctx.authStorage?.listAccounts(providerId).find(account => account.id === accountId)?.label ?? accountId;
-        ctx.authStorage?.removeAccount(providerId, accountId);
+        try {
+          await ctx.authStorage?.removeAccount(providerId, accountId);
+        } catch {
+          ctx.showError(`Could not remove ${label}. Please try again.`);
+          return;
+        }
         removeAccountRoutingPreferences([accountId]);
         ctx.state.controller.invalidateAvailableModelsCache();
         ctx.showInfo(`Removed ${label}`);
         finish();
       },
-      onActivate: accountId => {
+      onActivate: async accountId => {
         // `activateAccount` reloads the registry first, so another process may
         // have removed the account since the manager snapshot — in that case it
         // returns undefined and nothing changed. Reporting a switch then would
         // be a lie about which credential the next request uses.
-        const activated = ctx.authStorage?.activateAccount(providerId, accountId);
+        let activated: OAuthAccountRecord | undefined;
+        try {
+          activated = await ctx.authStorage?.activateAccount(providerId, accountId);
+        } catch {
+          ctx.showError(`Could not activate that ${providerName} account. Please try again.`);
+          finish();
+          return;
+        }
         if (!activated) {
           ctx.showError(`Could not activate that ${providerName} account. It may have been removed elsewhere.`);
           finish();
@@ -274,7 +286,7 @@ export async function handleLoginCommand(ctx: SlashCommandContext, mode: 'login'
           } else {
             if (ctx.authStorage) {
               const removedAccountIds = ctx.authStorage.listAccounts(provider.id).map(account => account.id);
-              ctx.authStorage.logout(provider.id);
+              await ctx.authStorage.logout(provider.id);
               removeAccountRoutingPreferences(removedAccountIds);
               ctx.state.controller.invalidateAvailableModelsCache();
               ctx.showInfo(`Logged out from ${provider.name}`);

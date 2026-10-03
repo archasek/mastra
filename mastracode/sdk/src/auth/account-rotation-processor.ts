@@ -600,7 +600,7 @@ async function applyPreferredAccountRoute(
   // Activate before recording the request-scoped selection: a failed
   // activation must not leave the selection claiming an account that never
   // became the provider's active credential.
-  const activated = store.activateAccount ? store.activateAccount(route.providerId, selected.id) : selected;
+  const activated = store.activateAccount ? await store.activateAccount(route.providerId, selected.id) : selected;
   if (!activated) {
     // Only a targeted route is out of options here. The exhausted marker is
     // request-wide and fails every credential read closed, so setting it for
@@ -750,7 +750,7 @@ export class AccountRotationProcessor implements Processor {
     const candidates = active ? accounts : orderAccountsFromActive(accounts, store.getActiveAccount?.(providerId)?.id);
     const nextCandidate = candidates.find(account => !tried.has(account.id));
 
-    const next = nextCandidate ? store.activateAccount?.(providerId, nextCandidate.id) : undefined;
+    const next = nextCandidate ? await store.activateAccount?.(providerId, nextCandidate.id) : undefined;
     if (!next) {
       return this.declarePoolUnavailable(args, providerId, 'pool-exhausted');
     }
