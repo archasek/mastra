@@ -822,6 +822,93 @@ describe('ACP Agent - Sessions and turns', () => {
     await harness.agent.dispose();
   });
 
+  it.each([false, true])('preserves a parked approval across unrelated completion with captured=%s', async captured => {
+    const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+    const requestPermission = vi.fn(() => answer.promise);
+    const approval = { toolCallId: 'approval', toolName: 'write_file', args: { path: 'file' } };
+    const harness = setup([], {
+      requestPermission,
+      pendingApprovals: captured ? new Map() : new Map([['approval', approval]]),
+    });
+    harness.listMessages.mockImplementationOnce(async () => {
+      if (captured) harness.emit({ type: 'tool_approval_required', ...approval });
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      return [];
+    });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    expect(requestPermission).toHaveBeenCalledOnce();
+    harness.emit({ type: 'agent_end', reason: 'complete' });
+    answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+    await answer.promise;
+    await Promise.resolve();
+    expect(harness.respondToToolApproval).toHaveBeenCalledWith({ decision: 'approve', toolCallId: 'approval' });
+    await harness.agent.dispose();
+  });
+
+  it.each(['tool_end', 'cancel', 'dispose'] as const)(
+    'invalidates a deferred restored approval after %s',
+    async terminal => {
+      const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+      const harness = setup([], {
+        requestPermission: vi.fn(() => answer.promise),
+        pendingApprovals: new Map([['approval', { toolCallId: 'approval', toolName: 'write_file', args: {} }]]),
+      });
+      await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      if (terminal === 'tool_end')
+        harness.emit({ type: 'tool_end', toolCallId: 'approval', result: {}, isError: false });
+      else if (terminal === 'cancel') {
+        await harness.agent.cancel({ sessionId: 'existing-thread' });
+        expect(harness.respondToToolApproval).toHaveBeenCalledExactlyOnceWith({
+          decision: 'decline',
+          toolCallId: 'approval',
+        });
+        expect(harness.abort).toHaveBeenCalledOnce();
+      } else await harness.agent.dispose();
+      answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+      await answer.promise;
+      await Promise.resolve();
+      expect(harness.respondToToolApproval).not.toHaveBeenCalledWith({ decision: 'approve', toolCallId: 'approval' });
+      await harness.agent.dispose();
+    },
+  );
+
+  it.each(['call', 'partial-call'])('replays unresolved stored tool state %s as in progress', async state => {
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {});
+    const harness = setup(
+      [
+        {
+          role: 'assistant',
+          content: {
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state,
+                  toolCallId: 'pending',
+                  toolName: 'write_file',
+                  args: { path: 'file' },
+                },
+              },
+            ],
+          },
+        },
+      ],
+      { sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'] },
+    );
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    expect(sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ toolCallId: 'pending', status: 'in_progress' }),
+      }),
+    );
+    const update = sessionUpdate.mock.calls
+      .map(([notification]) => notification as { update: { toolCallId?: string; rawOutput?: unknown } })
+      .find(notification => notification.update.toolCallId === 'pending')!.update;
+    expect(update).not.toHaveProperty('rawOutput');
+    await harness.agent.dispose();
+  });
+
   it('invalidates a continuation permission response when disposal starts', async () => {
     const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
     const harness = setup([], { requestPermission: vi.fn(() => answer.promise) });

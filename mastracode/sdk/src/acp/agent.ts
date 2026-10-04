@@ -50,6 +50,7 @@ interface SessionEntry extends AcpSessionRuntime {
   models: { modelId: string; name: string }[];
   state: PromptState | null;
   continuationState?: PromptState;
+  approvalGates: Set<string>;
   queue: Promise<void>;
   turns: Set<{ cancelled: boolean }>;
   unsubscribe: () => void;
@@ -274,22 +275,27 @@ export class MastraCodeAcpAgent implements Agent {
         this.handleSessionEvent(request.sessionId, entry, { type: 'message_start', message: initialMessage });
       }
       const deliveredInteractions = new Set<string>();
-      const obsoleteInteraction = (toolCallId: string, after: number): boolean =>
+      const restoredApprovals: Array<{
+        event: Extract<AgentControllerEvent, { type: 'tool_approval_required' }>;
+        after: number;
+      }> = [];
+      const obsoleteInteraction = (toolCallId: string, after: number, suspension: boolean): boolean =>
         captured
           .slice(after + 1)
           .some(
             next =>
-              (next.type === 'agent_end' && next.reason !== 'suspended') ||
+              (suspension && next.type === 'agent_end' && next.reason !== 'suspended') ||
               ((next.type === 'tool_end' || next.type === 'tool_suspension_cancelled') &&
                 next.toolCallId === toolCallId),
           );
       for (const event of pendingInteractions) {
         if (event.type !== 'tool_approval_required' && event.type !== 'tool_suspended') continue;
-        if (obsoleteInteraction(event.toolCallId, -1)) continue;
+        if (obsoleteInteraction(event.toolCallId, -1, event.type === 'tool_suspended')) continue;
         // A captured transition is newer than the initial parked snapshot.
         if (captured.some(next => 'toolCallId' in next && next.toolCallId === event.toolCallId)) continue;
         deliveredInteractions.add(`${event.type}:${event.toolCallId}`);
-        this.handleSessionEvent(request.sessionId, entry, event);
+        if (event.type === 'tool_approval_required') restoredApprovals.push({ event, after: -1 });
+        else this.handleSessionEvent(request.sessionId, entry, event);
       }
       for (let index = 0; index < captured.length; index++) {
         if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
@@ -299,14 +305,26 @@ export class MastraCodeAcpAgent implements Agent {
           replayedIds.add(event.message.id);
         }
         if (event.type === 'tool_approval_required' || event.type === 'tool_suspended') {
-          if (obsoleteInteraction(event.toolCallId, index)) continue;
+          if (obsoleteInteraction(event.toolCallId, index, event.type === 'tool_suspended')) continue;
           const key = `${event.type}:${event.toolCallId}`;
           if (deliveredInteractions.has(key)) continue;
           deliveredInteractions.add(key);
+          if (event.type === 'tool_approval_required') {
+            restoredApprovals.push({ event, after: index });
+            continue;
+          }
         }
         this.handleSessionEvent(request.sessionId, entry, event);
       }
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
+      // Approvals survive unrelated agent_end events in the native display.
+      // Dispatch after buffered lifecycle replay so those events cannot finish
+      // the mapper state before a still-armed approval receives its answer.
+      for (const { event, after } of restoredApprovals) {
+        if (!obsoleteInteraction(event.toolCallId, after, false)) {
+          this.handleSessionEvent(request.sessionId, entry, event);
+        }
+      }
       // Handoff is synchronous: there is no await or unobserved event between
       // the private capture and the public subscription.
       const unsubscribeCapture = stopCapture;
@@ -392,6 +410,7 @@ export class MastraCodeAcpAgent implements Agent {
       ...runtime,
       models: models?.availableModels ?? [],
       state: null,
+      approvalGates: new Set(),
       queue: Promise.resolve(),
       turns: new Set(),
       unsubscribe: () => {},
@@ -405,6 +424,10 @@ export class MastraCodeAcpAgent implements Agent {
   }
 
   private handleSessionEvent(sessionId: string, entry: SessionEntry, event: AgentControllerEvent): void {
+    if (event.type === 'tool_approval_required') entry.approvalGates.add(event.toolCallId);
+    if (event.type === 'tool_end' || event.type === 'tool_suspension_cancelled') {
+      entry.approvalGates.delete(event.toolCallId);
+    }
     // Durable continuations emit outside an ACP prompt request. They still
     // require a mapper state, but must not resolve or overwrite a prompt.
     if (
@@ -420,6 +443,7 @@ export class MastraCodeAcpAgent implements Agent {
           supportsElicitation: this.supportsElicitation,
           usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
           isActive: () => !this.disposed && entry.continuationState === state && !state.finished,
+          isApprovalActive: toolCallId => !this.disposed && !state.cancelled && entry.approvalGates.has(toolCallId),
           resolve: () => {
             state.finished = true;
           },
@@ -640,10 +664,15 @@ export class MastraCodeAcpAgent implements Agent {
   async cancel(notification: CancelNotification): Promise<void> {
     const entry = this.sessions.get(notification.sessionId);
     if (!entry) return;
+    const approvals = [...entry.approvalGates];
+    entry.approvalGates.clear();
     for (const turn of entry.turns) turn.cancelled = true;
     const state = entry.state ?? entry.continuationState;
-    if (state && !state.finished && !state.cancelled) {
+    if (state && (!state.finished || approvals.length > 0) && !state.cancelled) {
       state.cancelled = true;
+      for (const toolCallId of approvals) {
+        entry.session.respondToToolApproval({ decision: 'decline', toolCallId });
+      }
       // Persist denial before aborting, otherwise a parked snapshot can replay on the next turn.
       for (const deny of state.cancelSuspensions?.values() ?? []) {
         try {
@@ -827,6 +856,7 @@ function getReplayToolCall(value: unknown): ToolCall | null {
     return null;
   }
   const completed = invocation.state === 'result' && invocation.isError !== true;
+  const pending = invocation.state === 'call' || invocation.state === 'partial-call';
   const result =
     invocation.state === 'output-error' &&
     typeof invocation.result === 'string' &&
@@ -846,9 +876,9 @@ function getReplayToolCall(value: unknown): ToolCall | null {
     toolCallId: invocation.toolCallId,
     title: typeof invocation.title === 'string' && invocation.title ? invocation.title : invocation.toolName,
     kind: mapToolKind(invocation.toolName),
-    status: completed ? 'completed' : 'failed',
+    status: completed ? 'completed' : pending ? 'in_progress' : 'failed',
     ...(invocation.args !== undefined ? { rawInput: invocation.args } : {}),
-    rawOutput,
+    ...(!pending ? { rawOutput } : {}),
   };
 }
 
