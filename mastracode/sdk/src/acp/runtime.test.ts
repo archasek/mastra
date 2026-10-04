@@ -218,6 +218,41 @@ describe('ACP runtime factory', () => {
     );
   });
 
+  it('retains thread ownership through fallback cleanup after shutdown fails', async () => {
+    const boot = bootResult();
+    const shutdownError = new Error('shutdown failed');
+    boot.shutdown.mockRejectedValueOnce(shutdownError);
+    let finishStorage!: () => void;
+    let storageStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      storageStarted = resolve;
+    });
+    const storage = new Promise<void>(resolve => {
+      finishStorage = resolve;
+    });
+    boot.closeStorage.mockImplementationOnce(async () => {
+      storageStarted();
+      await storage;
+    });
+    boot.closePubSub.mockImplementationOnce(function (this: unknown) {
+      expect(this).toBe(boot.signalsPubSub);
+      return Promise.resolve();
+    });
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    const runtime = await createAcpSession(newRequest());
+    const cleanup = runtime.cleanup!();
+    const rejected = expect(cleanup).rejects.toMatchObject({ errors: [shutdownError] });
+    try {
+      await started;
+      expect(boot.session.thread.clearAndReleaseLock).not.toHaveBeenCalled();
+    } finally {
+      finishStorage();
+    }
+    await rejected;
+    expect(boot.closePubSub).toHaveBeenCalledOnce();
+    expect(boot.session.thread.clearAndReleaseLock).toHaveBeenCalledOnce();
+  });
+
   it('binds resume to the exact existing thread and refuses to create a replacement', async () => {
     const boot = bootResult();
     vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);

@@ -186,18 +186,18 @@ async function cleanupRuntime(result: Awaited<ReturnType<typeof bootLocalAgentCo
   await attempt(() => result.githubSignals?.stopAllPolling());
   await attempt(() => result.stopNotificationDispatch());
 
-  const closeSignalsPubSub = (result.signalsPubSub as { close?: () => Promise<void> | void } | undefined)?.close;
+  const signalsPubSub = result.signalsPubSub as { close?: () => Promise<void> | void } | undefined;
   // Shutdown drains durable work and needs workers/storage to remain available.
   await attempt(() => result.controller.getMastra()?.shutdown());
-  // Keep exclusive thread ownership while shutdown persists aborted suspensions.
-  await attempt(() => result.session.thread.clearAndReleaseLock());
   const settled = await Promise.allSettled([
     Promise.resolve().then(() => result.mcpManager?.disconnect()),
     Promise.resolve().then(() => result.controller.getMastra()?.stopWorkers()),
     Promise.resolve().then(() => result.controller.stopIntervals()),
-    Promise.resolve().then(() => closeSignalsPubSub?.()),
+    Promise.resolve().then(() => signalsPubSub?.close?.()),
     Promise.resolve().then(() => result.storageMaintenance.closeStorage?.()),
   ]);
   failures.push(...settled.filter(item => item.status === 'rejected').map(item => item.reason));
+  // Even a failed shutdown must retain ownership until fallback cleanup settles.
+  await attempt(() => result.session.thread.clearAndReleaseLock());
   if (failures.length) throw new AggregateError(failures, 'ACP runtime cleanup failed');
 }

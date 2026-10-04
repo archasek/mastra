@@ -224,8 +224,8 @@ export class MastraCodeAcpAgent implements Agent {
         throw RequestError.invalidParams(undefined, 'ACP session not found');
       }
       const messages = await runtime.session.thread.listMessages({ threadId: request.sessionId });
-      entry = await this.registerSession(request.sessionId, runtime);
       await this.replayHistory(request.sessionId, messages);
+      entry = await this.registerSession(request.sessionId, runtime);
       const response = this.sessionInfo(entry);
       this.scheduleCommandRefresh(request.sessionId, entry);
       return response;

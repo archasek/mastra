@@ -1893,7 +1893,6 @@ export async function bootLocalAgentController(config?: MastraCodeConfig) {
       await Promise.resolve()
         .then(async () => {
           await session!.thread.detachFromCurrent();
-          await session!.thread.clearAndReleaseLock();
         })
         .catch(() => {
           // Preserve the boot failure after best-effort session cleanup.
@@ -1904,7 +1903,7 @@ export async function bootLocalAgentController(config?: MastraCodeConfig) {
     } catch {
       // Preserve the boot failure after best-effort plugin cleanup.
     }
-    const closeSignalsPubSub = (base.signalsPubSub as { close?: () => Promise<void> | void } | undefined)?.close;
+    const signalsPubSub = base.signalsPubSub as { close?: () => Promise<void> | void } | undefined;
     await Promise.allSettled([Promise.resolve().then(() => base.stopNotificationDispatch())]);
     // Drain suspended/background work before closing its workers and transports.
     await Promise.allSettled([Promise.resolve().then(() => controller.getMastra()?.shutdown())]);
@@ -1912,9 +1911,12 @@ export async function bootLocalAgentController(config?: MastraCodeConfig) {
       Promise.resolve().then(() => mcpManager?.disconnect()),
       Promise.resolve().then(() => controller.getMastra()?.stopWorkers()),
       Promise.resolve().then(() => controller.stopIntervals()),
-      Promise.resolve().then(() => closeSignalsPubSub?.()),
+      Promise.resolve().then(() => signalsPubSub?.close?.()),
     ]);
     await Promise.allSettled([Promise.resolve().then(() => base.storageMaintenance.closeStorage?.())]);
+    if (session) {
+      await Promise.allSettled([Promise.resolve().then(() => session!.thread.clearAndReleaseLock())]);
+    }
     throw error;
   }
 }

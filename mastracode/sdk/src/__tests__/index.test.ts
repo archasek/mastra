@@ -613,6 +613,10 @@ describe('createMastraCode', () => {
   });
 
   it('drains Mastra shutdown before stopping workers after a failed local boot', async () => {
+    const signals = await import('../utils/signals-pubsub.js');
+    const pubsub = signals.createSignalsPubSub('failed-boot-cleanup-test');
+    const closePubSub = vi.spyOn(pubsub, 'close');
+    const pubsubFactory = vi.spyOn(signals, 'createSignalsPubSub').mockReturnValueOnce(pubsub);
     const dispatch = await import('../utils/notification-dispatch.js');
     const startDispatch = vi.fn();
     const stopDispatch = vi.fn(async () => {});
@@ -636,7 +640,7 @@ describe('createMastraCode', () => {
     mastraStub.shutdown.mockImplementationOnce(async () => {
       await drain;
     });
-    const boot = createMastraCode();
+    const boot = createMastraCode({ unixSocketPubSub: true });
     const rejection = expect(boot).rejects.toThrow('Session startup failed');
     try {
       await vi.waitFor(() => expect(mastraStub.shutdown).toHaveBeenCalledOnce());
@@ -649,8 +653,66 @@ describe('createMastraCode', () => {
       dispatcher.mockRestore();
       createSession.mockRestore();
     }
-    await rejection;
-    expect(mastraStub.stopWorkers).toHaveBeenCalledOnce();
+    try {
+      await rejection;
+      expect(mastraStub.stopWorkers).toHaveBeenCalledOnce();
+      expect(closePubSub).toHaveBeenCalledOnce();
+      expect(closePubSub.mock.contexts[0]).toBe(pubsub);
+    } finally {
+      pubsubFactory.mockRestore();
+      closePubSub.mockRestore();
+      await pubsub.close();
+    }
+  });
+
+  it('retains a created session lease until failed-boot storage cleanup settles', async () => {
+    const maintenance = await import('../utils/storage-maintenance.js');
+    const { AgentController } = await import('@mastra/core/agent-controller');
+    const originalCreateSession = AgentController.prototype.createSession;
+    const detach = vi.fn(async () => {});
+    const releaseLock = vi.fn(async () => {});
+    const createSession = vi.spyOn(AgentController.prototype, 'createSession').mockImplementationOnce(async function (
+      ...args
+    ) {
+      const session = await originalCreateSession.apply(this, args);
+      Object.assign(session.thread, { detachFromCurrent: detach, clearAndReleaseLock: releaseLock });
+      return session;
+    });
+    let finishStorage!: () => void;
+    let signalStorageStarted!: () => void;
+    const storageStarted = new Promise<void>(resolve => {
+      signalStorageStarted = resolve;
+    });
+    const storageDrain = new Promise<void>(resolve => {
+      finishStorage = resolve;
+    });
+    const closeStorage = vi.fn(async () => {
+      signalStorageStarted();
+      await storageDrain;
+    });
+    const storageFactory = vi
+      .spyOn(maintenance, 'createStorageMaintenance')
+      .mockReturnValueOnce({ closeStorage } as never);
+    const bootError = new Error('knowledge initialization failed');
+    createKnowledgeInspectorMock.mockRejectedValueOnce(bootError);
+    mastraStub.shutdown.mockRejectedValueOnce(new Error('shutdown failed'));
+    const { createMastraCode } = await import('../index.js');
+    const boot = createMastraCode();
+    const rejection = expect(boot).rejects.toBe(bootError);
+    try {
+      await storageStarted;
+      expect(detach).toHaveBeenCalledOnce();
+      expect(releaseLock).not.toHaveBeenCalled();
+    } finally {
+      finishStorage();
+    }
+    try {
+      await rejection;
+      expect(releaseLock).toHaveBeenCalledOnce();
+    } finally {
+      createSession.mockRestore();
+      storageFactory.mockRestore();
+    }
   });
 
   it('omits background task infrastructure unless background tools are enabled', async () => {

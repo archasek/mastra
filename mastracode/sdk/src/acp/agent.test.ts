@@ -522,6 +522,23 @@ describe('ACP Agent - Sessions and turns', () => {
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(sessionUpdate).toHaveBeenCalledTimes(1);
 
+    await expect(
+      harness.agent.prompt({ sessionId: 'existing-thread', prompt: [{ type: 'text', text: 'Too early' }] }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(harness.agent.setSessionMode({ sessionId: 'existing-thread', modeId: 'build' })).rejects.toMatchObject(
+      { code: -32602 },
+    );
+    await expect(
+      harness.agent.unstable_setSessionModel({ sessionId: 'existing-thread', modelId: 'openai/gpt-5' }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(
+      harness.agent.setSessionConfigOption({
+        sessionId: 'existing-thread',
+        configId: 'thinking_level',
+        value: 'medium',
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+
     finishFirstReplay();
     await load;
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -556,7 +573,7 @@ describe('ACP Agent - Sessions and turns', () => {
     expect(sessionInfoError.cause).toBeInstanceOf(AggregateError);
   });
 
-  it('still cleans up a restored runtime when unsubscribe throws during replay failure', async () => {
+  it('cleans up an unregistered restored runtime when history replay fails', async () => {
     const replayError = new Error('history replay failed');
     const unsubscribeError = new Error('unsubscribe failed');
     const unsubscribe = vi.fn(() => {
@@ -575,9 +592,9 @@ describe('ACP Agent - Sessions and turns', () => {
     await expect(harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' })).rejects.toBe(
       replayError,
     );
-    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(unsubscribe).not.toHaveBeenCalled();
     expect(cleanup).toHaveBeenCalledOnce();
-    expect(replayError.cause).toBeInstanceOf(AggregateError);
+    expect(replayError.cause).toBeUndefined();
   });
 
   it('fails closed when the requested saved thread does not exist', async () => {
