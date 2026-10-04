@@ -33,6 +33,45 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('ACP server shutdown', () => {
+  it.each(['uncaughtException', 'unhandledRejection'] as const)(
+    'drains once before exiting on %s, including repeated signals',
+    async event => {
+      const closed = Promise.withResolvers<void>();
+      const cleanup = Promise.withResolvers<void>();
+      state.closed = closed.promise;
+      state.dispose.mockReturnValue(cleanup.promise);
+      const on = vi.spyOn(process, 'on');
+      vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      const initialListeners = process.listenerCount(event);
+      const server = runAcpServer(vi.fn());
+      // Invoke only our handler: emitting fatal process events would also
+      // trigger Vitest's own error reporting and unrelated global listeners.
+      const handleFatal = on.mock.calls.find(([name]) => name === event)![1] as (error: unknown) => void;
+      try {
+        handleFatal({ code: 'ERR_STREAM_DESTROYED' });
+        await Promise.resolve();
+        expect(state.dispose).not.toHaveBeenCalled();
+        process.emit('SIGTERM', 'SIGTERM');
+        handleFatal(new Error('private payload'));
+        handleFatal(new Error('repeated'));
+        process.emit('SIGHUP', 'SIGHUP');
+        await Promise.resolve();
+        expect(state.dispose).toHaveBeenCalledTimes(1);
+        expect(process.exit).not.toHaveBeenCalled();
+        cleanup.resolve();
+        await vi.waitFor(() => expect(process.exit).toHaveBeenCalledExactlyOnceWith(1));
+        closed.resolve();
+        await server;
+        expect(process.listenerCount(event)).toBe(initialListeners);
+        expect(process.stderr.write).not.toHaveBeenCalledWith(expect.stringContaining('private payload'));
+      } finally {
+        cleanup.resolve();
+        closed.resolve();
+        await server;
+      }
+    },
+  );
+
   it.each(['SIGINT', 'SIGTERM', 'SIGHUP'] as const)('waits for cleanup once when %s arrives first', async signal => {
     const closed = Promise.withResolvers<void>();
     const cleanup = Promise.withResolvers<void>();

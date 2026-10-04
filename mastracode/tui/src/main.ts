@@ -32,8 +32,8 @@ import {
 import {
   formatResumeHint,
   parseResumeThreadId,
+  resolveEntrypointMode,
   shouldRejectResumeWithoutTTY,
-  shouldRunHeadless,
 } from './resume-command.js';
 import { resolveTuiSubagents } from './subagent-settings.js';
 import { detectTerminalTheme } from './tui/detect-theme.js';
@@ -59,6 +59,12 @@ let getResumeThreadId: (() => string | null) | undefined;
 
 const CRASH_LOG_PATH = '/tmp/mastra-crash.log';
 
+// Use the same prompt parser as main: a prompt value such as "--acp" is
+// not a mode flag. A copy preserves main's environment-consumption behavior.
+const startupArgv = takeInitialPrompt(process.argv, { ...process.env }).argv;
+const entrypointMode = resolveEntrypointMode(startupArgv, hasHeadlessFlag(startupArgv), process.argv);
+const acpMode = entrypointMode === 'acp';
+
 function isTruthyEnv(name: string): boolean {
   return ['1', 'true', 'yes', 'on'].includes(process.env[name]?.trim().toLowerCase() ?? '');
 }
@@ -72,16 +78,18 @@ function resolveInitialStateFromEnv() {
 }
 
 // Global safety nets — catch any uncaught errors from storage init, etc.
-process.on('uncaughtException', error => {
-  // ERR_STREAM_DESTROYED is non-fatal — happens routinely when streams close
-  // during shutdown, cancelled LLM requests, or LSP/subprocess exits (#13548, #13549)
-  if (isStreamDestroyedError(error)) return;
-  handleFatalError(error);
-});
-process.on('unhandledRejection', reason => {
-  if (isStreamDestroyedError(reason)) return;
-  handleFatalError(reason instanceof Error ? reason : new Error(String(reason)));
-});
+if (!acpMode) {
+  process.on('uncaughtException', error => {
+    // ERR_STREAM_DESTROYED is non-fatal — happens routinely when streams close
+    // during shutdown, cancelled LLM requests, or LSP/subprocess exits (#13548, #13549)
+    if (isStreamDestroyedError(error)) return;
+    handleFatalError(error);
+  });
+  process.on('unhandledRejection', reason => {
+    if (isStreamDestroyedError(reason)) return;
+    handleFatalError(reason instanceof Error ? reason : new Error(String(reason)));
+  });
+}
 
 async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> = {}, resumeThreadId?: string) {
   const settings = loadSettings();
@@ -253,10 +261,10 @@ const asyncCleanup = (): Promise<void> => {
 const shutdownAndExit = createShutdownCoordinator(asyncCleanup, exitCode => process.exit(exitCode));
 
 process.on('beforeExit', () => {
-  if (!process.argv.includes('--acp')) void asyncCleanup();
+  if (!acpMode) void asyncCleanup();
 });
 process.on('exit', () => {
-  if (!process.argv.includes('--acp')) {
+  if (!acpMode) {
     // ACP stdout is the NDJSON protocol stream, never a terminal channel.
     // Keep terminal reset bytes off stdout even when the ACP child exits.
     try {
@@ -302,7 +310,7 @@ const handleTermSignal = () => {
 };
 // ACP owns its runtime and signal-driven drain. TUI cleanup has no references
 // to that runtime and must not release its leases or exit ahead of its disposer.
-if (!process.argv.includes('--acp')) {
+if (!acpMode) {
   process.on('SIGINT', handleTermSignal);
   process.on('SIGTERM', handleTermSignal);
   process.on('SIGHUP', handleTermSignal);
@@ -429,12 +437,12 @@ async function main() {
   }
 
   const headless = hasHeadlessFlag(process.argv);
-  if (shouldRunHeadless(process.argv, resumeThreadId, headless)) {
+  if (entrypointMode === 'headless') {
     if (headless) rejectInitialPromptFlag('use --prompt for headless runs');
     return runMCCli(undefined, { coAuthor: TUI_CO_AUTHOR });
   }
 
-  if (process.argv.includes('--acp')) {
+  if (acpMode) {
     rejectInitialPromptFlag('it cannot be combined with --acp');
     if (process.argv.includes('--dangerous-auto-approve')) {
       process.stderr.write('--dangerous-auto-approve is not supported in ACP mode.\n');
@@ -481,5 +489,12 @@ async function main() {
 }
 
 main().catch(error => {
+  if (acpMode) {
+    // runAcpServer owns any created runtime's cleanup. Pre-server import/boot
+    // errors have no TUI resources, and must not invoke its crash writer.
+    process.stderr.write('[acp] Failed to start.\n');
+    process.exitCode = 1;
+    return;
+  }
   handleFatalError(error);
 });
