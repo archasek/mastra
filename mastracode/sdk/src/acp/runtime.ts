@@ -1,52 +1,67 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { isIP } from 'node:net';
+import { isAbsolute, resolve } from 'node:path';
+
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { NewSessionRequest } from '@agentclientprotocol/sdk';
-import { createMastraCode } from '../index.js';
+import type { LoadSessionRequest, McpServer, NewSessionRequest } from '@agentclientprotocol/sdk';
+import { bootLocalAgentController } from '../index.js';
 import type { MastraCodeConfig } from '../index.js';
-import type { McpServerConfig } from '../mcp/types.js';
+import type { McpHttpServerConfig } from '../mcp/types.js';
 import { loadSettings, resolveDefaultThinkingLevel } from '../onboarding/settings.js';
+import { detectProject } from '../utils/project.js';
 import type { AcpSessionRuntime } from './agent.js';
 import { withCleanupFailure } from './errors.js';
 
 export async function createAcpSession(
-  request: NewSessionRequest,
+  request: NewSessionRequest | LoadSessionRequest,
   options: Pick<MastraCodeConfig, 'coAuthor'> = {},
 ): Promise<AcpSessionRuntime> {
-  const names = new Set<string>();
-  const servers = request.mcpServers.map(server => {
-    if ('type' in server && server.type === 'sse')
-      throw RequestError.invalidParams(undefined, 'Legacy SSE MCP servers are unsupported; use HTTP or stdio');
-    if (names.has(server.name))
-      throw RequestError.invalidParams(undefined, `Duplicate MCP server name: ${server.name}`);
-    names.add(server.name);
-    const config: McpServerConfig =
-      'command' in server
-        ? {
-            command: server.command,
-            args: server.args,
-            env: Object.fromEntries(server.env.map(item => [item.name, item.value])),
-            cwd: request.cwd,
-          }
-        : { url: server.url, headers: Object.fromEntries(server.headers.map(item => [item.name, item.value])) };
-    return [server.name, config] as const;
-  });
-  const result = await createMastraCode({
-    coAuthor: options.coAuthor,
-    cwd: request.cwd,
-    initialState: {
-      projectPath: request.cwd,
-      yolo: false,
-      permissionRules: { categories: {}, tools: { ask_user: 'deny' } },
-    },
-    mcpServers: Object.fromEntries(servers),
-    // ACP clients can answer permission requests, but have no free-text tool response method.
-    disabledTools: ['ask_user'],
-    unixSocketPubSub: false,
-    disableMcp: false,
-    disableHooks: false,
-    // Project environment files must not mutate other ACP sessions.
-    disableEnvFile: true,
-  });
-  const settings = loadSettings();
+  if (!isAbsolute(request.cwd)) throw RequestError.invalidParams(undefined, 'cwd must be an absolute path');
+  if (request.additionalDirectories?.length) {
+    throw RequestError.invalidParams(undefined, 'ACP additionalDirectories are not supported');
+  }
+  const cwd = resolve(request.cwd);
+  const projectRoot = detectProject(cwd).rootPath;
+  const mcpServers = mapAcpMcpServers(request.mcpServers);
+  const requestedMcpNames = new Set(Object.keys(mcpServers));
+  const isResume = 'sessionId' in request;
+  const initialThreadId = isResume ? request.sessionId : randomUUID();
+  let settings: ReturnType<typeof loadSettings>;
+  try {
+    settings = loadSettings();
+  } catch {
+    throw RequestError.internalError(undefined, 'Mastra Code ACP settings could not be loaded');
+  }
+  let result: Awaited<ReturnType<typeof bootLocalAgentController>>;
+  try {
+    result = await bootLocalAgentController({
+      cwd,
+      resourceId: `mastracode-acp-${createHash('sha256').update(projectRoot).digest('hex').slice(0, 24)}`,
+      initialThreadId,
+      ...(isResume ? { requireExistingThread: true } : {}),
+      coAuthor: options.coAuthor,
+      mcpServers,
+      disableMcpConfigDiscovery: true,
+      disableMcpOAuth: true,
+      disableHooks: true,
+      disablePlugins: true,
+      disableEnvFile: true,
+      disableGithubSignals: true,
+      disableSettingsOmSeed: true,
+      unixSocketPubSub: false,
+      initialState: {
+        projectPath: cwd,
+        yolo: false,
+        permissionRules: { categories: {}, tools: {} },
+      },
+    });
+  } catch (error) {
+    if (error instanceof Error && /thread not found/i.test(error.message)) {
+      throw RequestError.invalidParams(undefined, 'ACP session not found');
+    }
+    throw RequestError.internalError(undefined, 'Mastra Code ACP session initialization failed');
+  }
+
   let cleanupPromise: Promise<void> | undefined;
   const runtime: AcpSessionRuntime = {
     controller: result.controller,
@@ -56,38 +71,133 @@ export async function createAcpSession(
     getThinkingLevel: () =>
       result.session.state.get().thinkingLevel ??
       resolveDefaultThinkingLevel(settings, result.session.mode.get()).level,
-    cleanup: () =>
-      (cleanupPromise ??= (async () => {
-        result.session.abort();
-        result.session.thread.detachFromCurrent();
-        result.stopPluginSignalProviders();
-        result.githubSignals?.stopAllPolling();
-        await Promise.allSettled([
-          result.session.thread.clearAndReleaseLock(),
-          result.mcpManager?.disconnect(),
-          result.controller.getMastra()?.stopWorkers(),
-          result.controller.stopIntervals(),
-          (result.signalsPubSub as { close?: () => void | Promise<void> } | undefined)?.close?.(),
-        ]);
-        await result.storage.close();
-      })()),
+    cleanup: () => (cleanupPromise ??= cleanupRuntime(result)),
   };
   try {
     const status = await result.mcpManager?.initInBackground();
-    const failed = status?.failed.filter(server => names.has(server.name)) ?? [];
-    if (failed.length)
-      throw RequestError.internalError(
-        undefined,
-        failed.map(server => `MCP server ${server.name}: ${server.error ?? 'connection failed'}`).join('; '),
-      );
+    const failed = status?.failed.some(server => requestedMcpNames.has(server.name)) ?? false;
+    const disabled = result.mcpManager?.getDisabledServers?.().some(name => requestedMcpNames.has(name)) ?? false;
+    if (failed || disabled)
+      throw RequestError.internalError(undefined, 'Mastra Code ACP HTTP MCP initialization failed');
 
     return runtime;
   } catch (error) {
+    const safeError =
+      error instanceof RequestError
+        ? error
+        : RequestError.internalError(undefined, 'Mastra Code ACP session setup failed');
     try {
       await runtime.cleanup?.();
     } catch (cleanupError) {
-      throw withCleanupFailure(error, cleanupError);
+      throw withCleanupFailure(safeError, cleanupError);
     }
-    throw error;
+    throw safeError;
   }
+}
+
+/** Convert untrusted ACP entries to HTTP-only config; never launch client commands. */
+export function mapAcpMcpServers(servers: McpServer[]): Record<string, McpHttpServerConfig> {
+  const mapped = Object.create(null) as Record<string, McpHttpServerConfig>;
+  const names = new Set<string>();
+
+  for (const server of servers) {
+    if (!server || typeof server !== 'object' || !('url' in server) || !('type' in server) || server.type !== 'http') {
+      throw RequestError.invalidParams(undefined, 'Only HTTP MCP servers are supported by ACP');
+    }
+    if (
+      typeof server.name !== 'string' ||
+      !server.name.trim() ||
+      server.name !== server.name.trim() ||
+      ['__proto__', 'constructor', 'prototype'].includes(server.name) ||
+      names.has(server.name)
+    ) {
+      throw RequestError.invalidParams(undefined, 'Invalid or duplicate ACP MCP server name');
+    }
+    names.add(server.name);
+
+    let url: URL;
+    try {
+      url = new URL(server.url);
+    } catch {
+      throw RequestError.invalidParams(undefined, 'Invalid ACP HTTP MCP URL');
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
+      throw RequestError.invalidParams(undefined, 'Unsupported ACP HTTP MCP URL');
+    }
+    if (url.protocol === 'http:' && !isLoopbackHost(url.hostname)) {
+      throw RequestError.invalidParams(undefined, 'Remote ACP HTTP MCP servers must use HTTPS');
+    }
+
+    const headers = Object.create(null) as Record<string, string>;
+    const seenHeaders = new Set<string>();
+    for (const header of server.headers ?? []) {
+      if (!header || typeof header.name !== 'string' || typeof header.value !== 'string') {
+        throw RequestError.invalidParams(undefined, 'Invalid ACP HTTP MCP headers');
+      }
+      const normalizedName = header.name.toLowerCase();
+      if (
+        !/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(header.name) ||
+        /[\u0000-\u0008\u000a-\u001f\u007f]/.test(header.value) ||
+        seenHeaders.has(normalizedName)
+      ) {
+        throw RequestError.invalidParams(undefined, 'Invalid ACP HTTP MCP headers');
+      }
+      seenHeaders.add(normalizedName);
+      headers[header.name] = header.value;
+    }
+
+    mapped[server.name] = {
+      url: url.toString(),
+      ...(Object.keys(headers).length ? { headers } : {}),
+      allowedHosts: [url.host],
+      fetch: (target, init) => {
+        const destination = new URL(target);
+        if (destination.origin !== url.origin || destination.username || destination.password) {
+          throw new Error('ACP MCP transport target is outside the validated origin');
+        }
+        // Fail before following any redirect; custom auth headers never leave
+        // the explicitly validated HTTPS or loopback HTTP endpoint.
+        return globalThis.fetch(destination, { ...init, redirect: 'error' });
+      },
+    };
+  }
+  return mapped;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host === '::1') return true;
+  return isIP(host) === 4 && host.split('.')[0] === '127';
+}
+
+async function cleanupRuntime(result: Awaited<ReturnType<typeof bootLocalAgentController>>): Promise<void> {
+  const failures: unknown[] = [];
+  const attempt = async (operation: () => unknown | Promise<unknown>) => {
+    try {
+      await operation();
+    } catch (error) {
+      failures.push(error);
+    }
+  };
+
+  await attempt(() => result.session.abort());
+  await attempt(() => result.session.thread.detachFromCurrent());
+  await attempt(() => result.stopPluginSignalProviders());
+  await attempt(() => result.githubSignals?.stopAllPolling());
+  await attempt(() => result.stopNotificationDispatch());
+
+  const signalsPubSub = result.signalsPubSub as { close?: () => Promise<void> | void } | undefined;
+  // Shutdown drains durable work and needs workers/storage to remain available.
+  await attempt(() => result.controller.getMastra()?.shutdown());
+  const settled = await Promise.allSettled([
+    Promise.resolve().then(() => result.mcpManager?.disconnect()),
+    Promise.resolve().then(() => result.controller.getMastra()?.stopWorkers()),
+    Promise.resolve().then(() => result.controller.stopIntervals()),
+    Promise.resolve().then(() => signalsPubSub?.close?.()),
+    Promise.resolve().then(() => result.storageMaintenance.closeStorage?.()),
+  ]);
+  failures.push(...settled.filter(item => item.status === 'rejected').map(item => item.reason));
+  // Even a failed shutdown must retain ownership until fallback cleanup settles.
+  await attempt(() => result.session.thread.clearAndReleaseLock());
+  if (failures.length) throw new AggregateError(failures, 'ACP runtime cleanup failed');
 }

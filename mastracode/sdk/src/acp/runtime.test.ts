@@ -1,170 +1,293 @@
+import type { LoadSessionRequest, McpServer, NewSessionRequest } from '@agentclientprotocol/sdk';
 import { describe, expect, it, vi } from 'vitest';
-import { createMastraCode } from '../index.js';
+import { bootLocalAgentController } from '../index.js';
 import { loadSettings, resolveDefaultThinkingLevel } from '../onboarding/settings.js';
-import { createAcpSession } from './runtime.js';
+import { createAcpSession, mapAcpMcpServers } from './runtime.js';
 
 vi.mock('../onboarding/settings.js', () => ({
   loadSettings: vi.fn(() => ({})),
   resolveDefaultThinkingLevel: vi.fn(() => ({ level: 'medium' })),
 }));
 
-vi.mock('../index.js', () => ({ createMastraCode: vi.fn() }));
+vi.mock('../index.js', () => ({ bootLocalAgentController: vi.fn() }));
 
 function bootResult() {
   const session = {
     abort: vi.fn(),
     mode: { get: vi.fn(() => 'build') },
     state: { get: vi.fn(() => ({})) },
-    thread: { detachFromCurrent: vi.fn(), clearAndReleaseLock: vi.fn().mockResolvedValue(undefined) },
+    thread: {
+      getId: vi.fn(() => 'boot-thread'),
+      detachFromCurrent: vi.fn().mockResolvedValue(undefined),
+      clearAndReleaseLock: vi.fn().mockResolvedValue(undefined),
+    },
   };
   const stopWorkers = vi.fn().mockResolvedValue(undefined);
-  const close = vi.fn().mockResolvedValue(undefined);
-  const pubsub = {
-    close: vi.fn(function (this: unknown) {
-      expect(this).toBe(pubsub);
-    }),
+  const shutdown = vi.fn().mockResolvedValue(undefined);
+  const closeStorage = vi.fn().mockResolvedValue(undefined);
+  const closePubSub = vi.fn().mockResolvedValue(undefined);
+  const pubsub = { close: closePubSub };
+  const mcpManager = {
+    initInBackground: vi.fn().mockResolvedValue({ failed: [] }),
+    getDisabledServers: vi.fn(() => []),
+    disconnect: vi.fn().mockResolvedValue(undefined),
   };
   return {
     session,
-    controller: { listModes: () => [{ id: 'build' }], getMastra: () => ({ stopWorkers }), stopIntervals: vi.fn() },
-    mcpManager: {
-      initInBackground: vi.fn().mockResolvedValue({ failed: [] }),
-      disconnect: vi.fn().mockResolvedValue(undefined),
+    controller: {
+      listModes: () => [{ id: 'build' }],
+      getMastra: () => ({ stopWorkers, shutdown }),
+      stopIntervals: vi.fn(),
     },
+    mcpManager,
     githubSignals: { stopAllPolling: vi.fn() },
     stopPluginSignalProviders: vi.fn(),
+    stopNotificationDispatch: vi.fn(async () => {}),
     signalsPubSub: pubsub,
-    storage: { close },
+    storageMaintenance: { closeStorage },
     stopWorkers,
+    shutdown,
+    closeStorage,
+    closePubSub,
   };
 }
 
-describe('ACP runtime factory', () => {
-  it('rejects legacy SSE servers before starting a runtime', async () => {
-    vi.mocked(createMastraCode).mockClear();
-    await expect(
-      createAcpSession({
-        cwd: '/project',
-        mcpServers: [{ name: 'legacy', type: 'sse', url: 'https://example.com/sse', headers: [] }],
-      }),
-    ).rejects.toMatchObject({ code: -32602, message: expect.stringContaining('SSE') });
-    expect(createMastraCode).not.toHaveBeenCalled();
-  });
+function newRequest(mcpServers: McpServer[] = []): NewSessionRequest {
+  return { cwd: '/project', mcpServers };
+}
 
-  it('reads defaults once while observing live mode and session reasoning changes', async () => {
-    vi.mocked(loadSettings).mockClear();
-    vi.mocked(resolveDefaultThinkingLevel).mockClear();
-    const boot = bootResult();
-    vi.mocked(createMastraCode).mockResolvedValueOnce(boot as never);
-    const runtime = await createAcpSession({ cwd: '/project', mcpServers: [] });
-    expect(runtime.getThinkingLevel?.()).toBe('medium');
-    boot.session.mode.get.mockReturnValue('plan');
-    expect(runtime.getThinkingLevel?.()).toBe('medium');
-    expect(loadSettings).toHaveBeenCalledOnce();
-    expect(resolveDefaultThinkingLevel).toHaveBeenLastCalledWith({}, 'plan');
-    boot.session.state.get.mockReturnValue({ thinkingLevel: 'high' });
-    expect(runtime.getThinkingLevel?.()).toBe('high');
-    expect(resolveDefaultThinkingLevel).toHaveBeenCalledTimes(2);
-    await runtime.cleanup?.();
-  });
-
-  it('preserves co-author configuration when booting a session', async () => {
-    const boot = bootResult();
-    vi.mocked(createMastraCode).mockResolvedValueOnce(boot as never);
-    const coAuthor = { name: 'ACP Test', email: 'acp@example.com' };
-    await createAcpSession({ cwd: '/project', mcpServers: [] }, { coAuthor });
-    expect(createMastraCode).toHaveBeenLastCalledWith(expect.objectContaining({ coAuthor }));
-  });
-  it('boots in the requested cwd with client MCP servers and uses the wired session', async () => {
-    const boot = bootResult();
-    vi.mocked(createMastraCode).mockResolvedValueOnce(boot as never);
-    const runtime = await createAcpSession({
-      cwd: '/project/subdirectory',
-      mcpServers: [
-        { name: 'local', command: '/mcp', args: ['serve'], env: [{ name: 'TEST_VALUE', value: 'example' }] },
+describe('ACP HTTP MCP mapping', () => {
+  it('accepts HTTPS with caller-provided headers and local loopback HTTP', () => {
+    expect(
+      mapAcpMcpServers([
         {
-          name: 'remote',
+          name: 'hq-tools',
           type: 'http',
-          url: 'https://example.com/mcp',
-          headers: [{ name: 'X-Test', value: 'example' }],
+          url: 'https://mcp.example.com/tools',
+          headers: [{ name: 'Authorization', value: 'Bearer test-token' }],
+        },
+        { name: 'local-tools', type: 'http', url: 'http://127.0.0.1:4312/mcp', headers: [] },
+      ]),
+    ).toEqual({
+      'hq-tools': {
+        url: 'https://mcp.example.com/tools',
+        headers: { Authorization: 'Bearer test-token' },
+        allowedHosts: ['mcp.example.com'],
+        fetch: expect.any(Function),
+      },
+      'local-tools': {
+        url: 'http://127.0.0.1:4312/mcp',
+        allowedHosts: ['127.0.0.1:4312'],
+        fetch: expect.any(Function),
+      },
+    });
+  });
+
+  it('pins ACP transport to the validated origin and refuses redirect following', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('ok'));
+    try {
+      const config = mapAcpMcpServers([
+        { name: 'guarded', type: 'http', url: 'https://mcp.example.com/tools', headers: [] },
+      ]).guarded!;
+      await config.fetch!('https://mcp.example.com/tools', { redirect: 'follow' });
+      expect(fetch).toHaveBeenCalledWith(new URL('https://mcp.example.com/tools'), { redirect: 'error' });
+      for (const target of [
+        'https://other.example.com/tools',
+        'http://mcp.example.com/tools',
+        'http://127.0.0.1/tools',
+        'https://mcp.example.com:444/tools',
+      ]) {
+        expect(() => config.fetch!(target)).toThrow('outside the validated origin');
+      }
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it.each([
+    ...['__proto__', 'constructor', 'prototype'].map(name => [
+      `reserved server name ${name}`,
+      [{ name, type: 'http', url: 'https://mcp.example.com/tools', headers: [] }],
+    ]),
+    ['stdio', [{ name: 'local', command: '/tmp/should-not-run', args: [], env: [] }]],
+    ['remote HTTP', [{ name: 'remote-http', type: 'http', url: 'http://mcp.example.com/tools', headers: [] }]],
+    [
+      'embedded credentials',
+      [{ name: 'credentials', type: 'http', url: 'https://user:password@mcp.example.com/tools', headers: [] }],
+    ],
+    ['URL fragment', [{ name: 'fragment', type: 'http', url: 'https://mcp.example.com/tools#secret', headers: [] }]],
+    [
+      'header injection',
+      [
+        {
+          name: 'bad-header',
+          type: 'http',
+          url: 'https://mcp.example.com/tools',
+          headers: [{ name: 'Authorization', value: 'Bearer one\r\nX-Evil: yes' }],
         },
       ],
+    ],
+    [
+      'duplicate headers',
+      [
+        {
+          name: 'duplicate-header',
+          type: 'http',
+          url: 'https://mcp.example.com/tools',
+          headers: [
+            { name: 'X-Token', value: 'one' },
+            { name: 'x-token', value: 'two' },
+          ],
+        },
+      ],
+    ],
+  ] as unknown as Array<[string, McpServer[]]>)('rejects %s MCP entries before boot', (_label, servers) => {
+    expect(() => mapAcpMcpServers(servers)).toThrow();
+  });
+
+  it('rejects a client stdio command before Mastra Code starts', async () => {
+    vi.mocked(bootLocalAgentController).mockClear();
+    await expect(
+      createAcpSession(newRequest([{ name: 'local', command: '/tmp/should-not-run', args: [], env: [] }])),
+    ).rejects.toMatchObject({
+      code: -32602,
     });
-    expect(createMastraCode).toHaveBeenCalledWith(
-      expect.objectContaining({
-        disableEnvFile: true,
-        cwd: '/project/subdirectory',
-        initialState: {
-          projectPath: '/project/subdirectory',
-          yolo: false,
-          permissionRules: { categories: {}, tools: { ask_user: 'deny' } },
+    expect(bootLocalAgentController).not.toHaveBeenCalled();
+  });
+});
+
+describe('ACP runtime factory', () => {
+  it('creates an isolated runtime with only the request MCP servers and disables ambient execution/config', async () => {
+    const boot = bootResult();
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    const runtime = await createAcpSession(
+      newRequest([
+        {
+          name: 'hq-tools',
+          type: 'http',
+          url: 'https://mcp.example.com/tools',
+          headers: [{ name: 'Authorization', value: 'Bearer token' }],
         },
-        disabledTools: ['ask_user'],
-        mcpServers: {
-          local: { command: '/mcp', args: ['serve'], env: { TEST_VALUE: 'example' }, cwd: '/project/subdirectory' },
-          remote: { url: 'https://example.com/mcp', headers: { 'X-Test': 'example' } },
-        },
-      }),
+      ]),
+      { coAuthor: { name: 'ACP Test', email: 'acp@example.com' } },
     );
-    expect(boot.mcpManager.initInBackground).toHaveBeenCalledTimes(1);
+    const [config] = vi.mocked(bootLocalAgentController).mock.lastCall!;
+    expect(config).toMatchObject({
+      cwd: '/project',
+      initialThreadId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      resourceId: expect.stringMatching(/^mastracode-acp-[a-f0-9]{24}$/),
+      coAuthor: { name: 'ACP Test', email: 'acp@example.com' },
+      mcpServers: { 'hq-tools': { url: 'https://mcp.example.com/tools', headers: { Authorization: 'Bearer token' } } },
+      disableMcpConfigDiscovery: true,
+      disableMcpOAuth: true,
+      disableHooks: true,
+      disablePlugins: true,
+      disableEnvFile: true,
+      disableGithubSignals: true,
+      disableSettingsOmSeed: true,
+      unixSocketPubSub: false,
+      initialState: { projectPath: '/project', yolo: false, permissionRules: { categories: {}, tools: {} } },
+    });
+    expect(boot.mcpManager.initInBackground).toHaveBeenCalledOnce();
     expect(runtime.session).toBe(boot.session);
     expect(runtime.modes).toEqual([{ id: 'build' }]);
+    expect(runtime.getThinkingLevel?.()).toBe('medium');
+    expect(loadSettings).toHaveBeenCalled();
+    expect(resolveDefaultThinkingLevel).toHaveBeenCalledWith({}, 'build');
+
     await runtime.cleanup?.();
     await runtime.cleanup?.();
-    expect(boot.session.thread.clearAndReleaseLock).toHaveBeenCalledTimes(1);
-    expect(boot.mcpManager.disconnect).toHaveBeenCalledTimes(1);
-    expect(boot.stopWorkers).toHaveBeenCalledTimes(1);
-    expect(boot.stopPluginSignalProviders).toHaveBeenCalledTimes(1);
-    expect(boot.githubSignals.stopAllPolling).toHaveBeenCalledTimes(1);
-    expect(boot.signalsPubSub.close).toHaveBeenCalledTimes(1);
-    expect(boot.storage.close).toHaveBeenCalledTimes(1);
+    expect(boot.session.thread.detachFromCurrent).toHaveBeenCalledOnce();
+    expect(boot.session.thread.clearAndReleaseLock).toHaveBeenCalledOnce();
+    expect(boot.mcpManager.disconnect).toHaveBeenCalledOnce();
+    expect(boot.stopWorkers).toHaveBeenCalledOnce();
+    expect(boot.shutdown).toHaveBeenCalledOnce();
+    expect(boot.stopPluginSignalProviders).toHaveBeenCalledOnce();
+    expect(boot.stopNotificationDispatch).toHaveBeenCalledOnce();
+    expect(boot.stopNotificationDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+      boot.controller.getMastra().shutdown.mock.invocationCallOrder[0]!,
+    );
+    expect(boot.githubSignals.stopAllPolling).toHaveBeenCalledOnce();
+    expect(boot.closePubSub).toHaveBeenCalledOnce();
+    expect(boot.closeStorage).toHaveBeenCalledOnce();
+    expect(boot.shutdown.mock.invocationCallOrder[0]).toBeLessThan(boot.stopWorkers.mock.invocationCallOrder[0]!);
+    expect(boot.shutdown.mock.invocationCallOrder[0]).toBeLessThan(boot.closeStorage.mock.invocationCallOrder[0]!);
+    expect(boot.shutdown.mock.invocationCallOrder[0]).toBeLessThan(
+      boot.session.thread.clearAndReleaseLock.mock.invocationCallOrder[0]!,
+    );
   });
 
-  it('reports client MCP connection failures and cleans up the failed runtime', async () => {
+  it('retains thread ownership through fallback cleanup after shutdown fails', async () => {
+    const boot = bootResult();
+    const shutdownError = new Error('shutdown failed');
+    boot.shutdown.mockRejectedValueOnce(shutdownError);
+    let finishStorage!: () => void;
+    let storageStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      storageStarted = resolve;
+    });
+    const storage = new Promise<void>(resolve => {
+      finishStorage = resolve;
+    });
+    boot.closeStorage.mockImplementationOnce(async () => {
+      storageStarted();
+      await storage;
+    });
+    boot.closePubSub.mockImplementationOnce(function (this: unknown) {
+      expect(this).toBe(boot.signalsPubSub);
+      return Promise.resolve();
+    });
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    const runtime = await createAcpSession(newRequest());
+    const cleanup = runtime.cleanup!();
+    const rejected = expect(cleanup).rejects.toMatchObject({ errors: [shutdownError] });
+    try {
+      await started;
+      expect(boot.session.thread.clearAndReleaseLock).not.toHaveBeenCalled();
+    } finally {
+      finishStorage();
+    }
+    await rejected;
+    expect(boot.closePubSub).toHaveBeenCalledOnce();
+    expect(boot.session.thread.clearAndReleaseLock).toHaveBeenCalledOnce();
+  });
+
+  it('binds resume to the exact existing thread and refuses to create a replacement', async () => {
+    const boot = bootResult();
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    const request: LoadSessionRequest = { cwd: '/project', mcpServers: [], sessionId: 'existing-thread' };
+    const runtime = await createAcpSession(request);
+    expect(vi.mocked(bootLocalAgentController).mock.lastCall?.[0]).toMatchObject({
+      initialThreadId: 'existing-thread',
+      requireExistingThread: true,
+    });
+    await runtime.cleanup?.();
+  });
+
+  it('does not return MCP initialization details that may contain credentials or private URLs', async () => {
     const boot = bootResult();
     boot.mcpManager.initInBackground.mockResolvedValueOnce({
-      failed: [{ name: 'broken', error: 'command not found' }],
+      failed: [{ name: 'hq-tools', error: 'Authorization: Bearer secret-token at https://private.example' }],
     } as never);
-    vi.mocked(createMastraCode).mockResolvedValueOnce(boot as never);
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
     await expect(
-      createAcpSession({
-        cwd: '/project',
-        mcpServers: [{ name: 'broken', command: '/missing-command', args: [], env: [] }],
-      }),
-    ).rejects.toMatchObject({ code: -32603, message: expect.stringContaining('broken: command not found') });
-    expect(boot.mcpManager.disconnect).toHaveBeenCalledTimes(1);
-    expect(boot.storage.close).toHaveBeenCalledTimes(1);
-  });
-
-  it('rejects duplicate client MCP server names instead of overwriting one', async () => {
-    await expect(
-      createAcpSession({
-        cwd: '/project',
-        mcpServers: [
-          { name: 'duplicate', command: '/one', args: [], env: [] },
-          { name: 'duplicate', command: '/two', args: [], env: [] },
-        ],
-      }),
-    ).rejects.toMatchObject({ code: -32602 });
-  });
-
-  it('preserves the MCP initialization error when storage cleanup fails', async () => {
-    const boot = bootResult();
-    const cleanupError = new Error('storage close failed');
-    boot.mcpManager.initInBackground.mockResolvedValueOnce({
-      failed: [{ name: 'broken', error: 'command not found' }],
-    } as never);
-    boot.storage.close.mockRejectedValueOnce(cleanupError);
-    vi.mocked(createMastraCode).mockResolvedValueOnce(boot as never);
-    await expect(
-      createAcpSession({
-        cwd: '/project',
-        mcpServers: [{ name: 'broken', command: '/missing-command', args: [], env: [] }],
-      }),
+      createAcpSession(
+        newRequest([{ name: 'hq-tools', type: 'http', url: 'https://mcp.example.com/tools', headers: [] }]),
+      ),
     ).rejects.toMatchObject({
       code: -32603,
-      message: expect.stringContaining('broken: command not found'),
-      cause: expect.objectContaining({ errors: [cleanupError] }),
+      message: 'Internal error: Mastra Code ACP HTTP MCP initialization failed',
+    });
+    expect(boot.mcpManager.disconnect).toHaveBeenCalledOnce();
+    expect(boot.closeStorage).toHaveBeenCalledOnce();
+  });
+
+  it('maps a missing resumed thread to a generic not-found response', async () => {
+    vi.mocked(bootLocalAgentController).mockRejectedValueOnce(new Error('Thread not found: private-id'));
+    await expect(createAcpSession({ cwd: '/project', mcpServers: [], sessionId: 'private-id' })).rejects.toMatchObject({
+      code: -32602,
+      message: 'Invalid params: ACP session not found',
     });
   });
 });

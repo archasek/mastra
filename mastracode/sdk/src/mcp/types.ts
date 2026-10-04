@@ -27,6 +27,9 @@ export interface McpHttpServerConfig {
   url: string;
   /** Optional HTTP headers (e.g. for authentication) */
   headers?: Record<string, string>;
+  /** In-memory transport constraints for untrusted ACP-supplied servers. */
+  allowedHosts?: string[];
+  fetch?: (url: string | URL, init?: RequestInit) => Promise<Response>;
   /** Optional OAuth configuration for protected HTTP MCP servers */
   oauth?: McpHttpOAuthConfig;
 }

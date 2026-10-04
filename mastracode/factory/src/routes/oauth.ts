@@ -515,7 +515,7 @@ export class OAuthRoutes extends Route<OAuthRoutesDeps> {
               onCredentialsChanged(tenant);
             } else {
               if (!authStorage) return c.json({ error: 'Credential storage is not available' }, 503);
-              authStorage.logout(authProviderId);
+              await authStorage.logout(authProviderId);
             }
             return c.json({ ok: true });
           } catch (error) {

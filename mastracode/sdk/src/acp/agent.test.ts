@@ -1,9 +1,22 @@
-import type { AgentSideConnection, ContentBlock } from '@agentclientprotocol/sdk';
+import type {
+  AgentSideConnection,
+  ContentBlock,
+  LoadSessionRequest,
+  NewSessionRequest,
+} from '@agentclientprotocol/sdk';
+import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
 import type { AgentController, AgentControllerEvent, Session } from '@mastra/core/agent-controller';
 
 import { describe, it, expect, vi } from 'vitest';
 
-import { MastraCodeAcpAgent, extractTextFromContentBlocks, mapStopReason } from './agent.js';
+import { MastraCodeAcpAgent, extractTextFromContentBlocks, mapPromptContent, mapStopReason } from './agent.js';
+import type { AcpSkills } from './skills.js';
+
+it('reports the CLI release version rather than the SDK package version', async () => {
+  const agent = new MastraCodeAcpAgent({} as AgentSideConnection, vi.fn(), '0.43.0');
+  const response = await agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+  expect(response.agentInfo?.version).toBe('0.43.0');
+});
 
 describe('ACP Agent - Text Extraction', () => {
   it('extracts text from text blocks', () => {
@@ -71,7 +84,6 @@ describe('ACP Agent - Text Extraction', () => {
   });
 
   it.each<ContentBlock>([
-    { type: 'image', data: 'AA==', mimeType: 'image/png' },
     { type: 'audio', data: 'AA==', mimeType: 'audio/wav' },
     { type: 'resource', resource: { uri: 'file:///binary', blob: 'AA==' } },
   ])('rejects unsupported content instead of silently discarding it: $type', block => {
@@ -80,6 +92,18 @@ describe('ACP Agent - Text Extraction', () => {
 
   it('handles empty blocks array', () => {
     expect(extractTextFromContentBlocks([])).toBe('');
+  });
+
+  it('passes image content through to Mastra Code without flattening the bytes', () => {
+    expect(
+      mapPromptContent([
+        { type: 'text', text: 'Inspect this image' },
+        { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+      ]),
+    ).toEqual({
+      content: 'Inspect this image',
+      files: [{ data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' }],
+    });
   });
 });
 
@@ -101,38 +125,105 @@ describe('ACP Agent - StopReason Mapping', () => {
   });
 });
 
-describe('ACP Agent - Turn failures and cancellation', () => {
-  function setup() {
+describe('ACP Agent - Sessions and turns', () => {
+  function setup(
+    messages: unknown[] = [],
+    options: {
+      getSkills?: () => Promise<AcpSkills | undefined>;
+      sessionUpdate?: AgentSideConnection['sessionUpdate'];
+      getMode?: () => string;
+      runtimeThreadId?: string;
+      unsubscribe?: () => void;
+      cleanup?: () => Promise<void>;
+      currentMessage?: unknown;
+      requestPermission?: AgentSideConnection['requestPermission'];
+      pendingApprovals?: Map<string, { toolCallId: string; toolName: string; args: unknown }>;
+      pendingSuspensions?: Map<
+        string,
+        { toolCallId: string; toolName: string; args: unknown; suspendPayload: unknown }
+      >;
+    } = {},
+  ) {
     let listener: (event: AgentControllerEvent) => void = () => {};
     let nextThreadId = 0;
+    let currentThreadId = 'runtime-thread';
     const sendMessage = vi.fn().mockResolvedValue(undefined);
     const abort = vi.fn();
+    const resumeToolCall = vi.fn(async () => {});
+    const respondToToolSuspension = vi.fn(async () => {});
+    const respondToToolApproval = vi.fn();
+    const detach = vi.fn();
+    const createThread = vi.fn(async () => {
+      currentThreadId = `thread-${++nextThreadId}`;
+      return { id: currentThreadId };
+    });
+    const switchThread = vi.fn(async ({ threadId }: { threadId: string }) => {
+      currentThreadId = threadId;
+    });
+    const listMessages = vi.fn().mockResolvedValue(messages);
     const session = {
+      displayState: {
+        get: () => ({
+          currentMessage: options.currentMessage ?? null,
+          pendingApprovals: options.pendingApprovals,
+          pendingSuspensions: options.pendingSuspensions,
+        }),
+      },
       subscribe: (callback: typeof listener) => {
         listener = callback;
-        return () => {};
+        return options.unsubscribe ?? (() => {});
       },
       thread: {
-        create: async () => ({ id: `thread-${++nextThreadId}` }),
-        switch: async () => {},
+        create: createThread,
+        getId: () => currentThreadId,
+        switch: switchThread,
+        listMessages,
       },
-      mode: { get: () => 'default' },
+      mode: { get: options.getMode ?? (() => 'default') },
       model: { get: () => 'test-model' },
       sendMessage,
       abort,
+      resumeToolCall,
+      respondToToolSuspension,
+      respondToToolApproval,
+      stream: { detach },
     } as unknown as Session;
-    const agent = new MastraCodeAcpAgent(
-      { sessionUpdate: vi.fn().mockResolvedValue(undefined) } as unknown as AgentSideConnection,
-      async () => ({
+    const sessionUpdate = options.sessionUpdate ?? vi.fn().mockResolvedValue(undefined);
+    const connection = {
+      sessionUpdate,
+      requestPermission: options.requestPermission,
+    } as unknown as AgentSideConnection;
+    const createSession = vi.fn(async (request: NewSessionRequest | LoadSessionRequest) => {
+      currentThreadId =
+        options.runtimeThreadId ?? ('sessionId' in request && request.sessionId ? request.sessionId : currentThreadId);
+      return {
         controller: { listAvailableModels: async () => [] } as unknown as AgentController,
         session,
         modes: [],
-      }),
-    );
-    return { agent, sendMessage, abort, emit: (event: AgentControllerEvent) => listener(event) };
+        ...(options.getSkills ? { getSkills: options.getSkills } : {}),
+        ...(options.cleanup ? { cleanup: options.cleanup } : {}),
+      };
+    });
+    const agent = new MastraCodeAcpAgent(connection, createSession);
+    return {
+      agent,
+      sendMessage,
+      abort,
+      resumeToolCall,
+      respondToToolSuspension,
+      respondToToolApproval,
+      detach,
+      connection,
+      createSession,
+      createThread,
+      switchThread,
+      listMessages,
+      getThreadId: () => currentThreadId,
+      emit: (event: AgentControllerEvent) => listener(event),
+    };
   }
 
-  it('rejects a failed turn with its error and allows the next prompt to succeed', async () => {
+  it('rejects a failed turn without returning provider details, then allows the next prompt', async () => {
     const { agent, emit, sendMessage } = setup();
     const { sessionId } = await agent.newSession({ cwd: '/tmp', mcpServers: [] });
     sendMessage.mockImplementationOnce(async () => {
@@ -141,7 +232,7 @@ describe('ACP Agent - Turn failures and cancellation', () => {
     });
     await expect(agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'Hello' }] })).rejects.toMatchObject({
       code: -32603,
-      message: expect.stringContaining('Provider authentication failed'),
+      message: 'Internal error: Mastra Code turn failed',
     });
     sendMessage.mockImplementationOnce(async () => emit({ type: 'agent_end', reason: 'complete' }));
     await expect(agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'Try again' }] })).resolves.toMatchObject({
@@ -179,5 +270,810 @@ describe('ACP Agent - Turn failures and cancellation', () => {
     await expect(prompt).resolves.toMatchObject({ stopReason: 'cancelled' });
     await agent.cancel({ sessionId: first.sessionId });
     expect(abort).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds runtime cleanup until an in-flight sendMessage settles during dispose', async () => {
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>(resolve => {
+      releaseSend = resolve;
+    });
+    const cleanup = vi.fn(async () => {});
+    const harness = setup([], { cleanup });
+    const { sessionId } = await harness.agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    harness.sendMessage.mockImplementationOnce(async () => sendGate);
+
+    const prompt = harness.agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'Hold the lock' }] });
+    await vi.waitFor(() => expect(harness.sendMessage).toHaveBeenCalledOnce());
+    const disposal = harness.agent.dispose();
+
+    expect(harness.abort).toHaveBeenCalledOnce();
+    expect(cleanup).not.toHaveBeenCalled();
+    releaseSend();
+    await expect(prompt).resolves.toMatchObject({ stopReason: 'cancelled' });
+    await disposal;
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('still releases runtime resources when unsubscribe fails during dispose', async () => {
+    const unsubscribeFailure = new Error('unsubscribe failed');
+    const cleanupFailure = new Error('runtime cleanup failed');
+    const cleanup = vi.fn(async () => {
+      throw cleanupFailure;
+    });
+    const harness = setup([], {
+      unsubscribe: () => {
+        throw unsubscribeFailure;
+      },
+      cleanup,
+    });
+    await harness.agent.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    await expect(harness.agent.dispose()).rejects.toMatchObject({
+      errors: [expect.objectContaining({ errors: [unsubscribeFailure, cleanupFailure] })],
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('loadSession preserves the boot-bound thread lock while restoring its history', async () => {
+    const priorMessages = [
+      { role: 'user', content: { parts: [{ type: 'text', text: 'Earlier request' }] } },
+      { role: 'assistant', content: { parts: [{ type: 'text', text: 'Earlier answer' }] } },
+    ];
+    const harness = setup(priorMessages);
+    const initialized = await harness.agent.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { elicitation: { form: {} } },
+    });
+    expect(initialized.agentCapabilities?.loadSession).toBe(true);
+    expect(initialized.agentCapabilities?.promptCapabilities).toEqual({ image: true, embeddedContext: true });
+
+    const request: LoadSessionRequest = { cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' };
+    const response = await harness.agent.loadSession(request);
+    expect(response.modes).toEqual({ currentModeId: 'default', availableModes: [] });
+    expect(harness.createSession).toHaveBeenCalledWith(request);
+    expect(harness.createThread).not.toHaveBeenCalled();
+    expect(harness.getThreadId()).toBe('existing-thread');
+    expect(harness.switchThread).not.toHaveBeenCalled();
+    expect(harness.listMessages).toHaveBeenCalledWith({ threadId: 'existing-thread' });
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _meta: { isReplay: true },
+        sessionId: 'existing-thread',
+        update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Earlier request' } },
+      }),
+    );
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _meta: { isReplay: true },
+        sessionId: 'existing-thread',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Earlier answer' } },
+      }),
+    );
+  });
+
+  it('replays remote images as resource links and inline images as base64', async () => {
+    const harness = setup([
+      {
+        role: 'user',
+        content: {
+          parts: [
+            { type: 'file', data: 'https://example.test/image.png', mediaType: 'image/png' },
+            { type: 'file', data: 'data:image/png;base64,aGVsbG8=', mediaType: 'image/png' },
+          ],
+        },
+      },
+    ]);
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'image-thread' });
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'image-thread',
+        update: {
+          sessionUpdate: 'user_message_chunk',
+          content: {
+            type: 'resource_link',
+            uri: 'https://example.test/image.png',
+            name: 'Stored image',
+            mimeType: 'image/png',
+          },
+        },
+      }),
+    );
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: {
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+        },
+      }),
+    );
+  });
+
+  it('replays stored terminal errors and failed tool output', async () => {
+    const priorMessages = [
+      {
+        role: 'assistant',
+        content: {
+          parts: [
+            { type: 'error', error: { name: 'MastraError', message: 'Earlier turn failed' } },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-failed',
+                toolName: 'readFile',
+                title: 'Read file',
+                args: { path: 'missing.txt' },
+                errorText: 'File not found.',
+              },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-empty-error-text',
+                toolName: 'readFile',
+                errorText: '',
+              },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-whitespace-error-text',
+                toolName: 'readFile',
+                errorText: ' \t\n ',
+              },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-missing-error-text',
+                toolName: 'readFile',
+              },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-empty-result-empty-error-text',
+                toolName: 'readFile',
+                result: '',
+                errorText: '',
+              },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-whitespace-result-missing-error-text',
+                toolName: 'readFile',
+                result: ' \t\n ',
+              },
+            },
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'output-error',
+                toolCallId: 'call-empty-result-with-error-text',
+                toolName: 'readFile',
+                result: '',
+                errorText: 'File not found.',
+              },
+            },
+          ],
+        },
+      },
+    ];
+    const harness = setup(priorMessages);
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _meta: { isReplay: true },
+        sessionId: 'existing-thread',
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: '[Stored error: MastraError: Earlier turn failed]' },
+        },
+      }),
+    );
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _meta: { isReplay: true },
+        sessionId: 'existing-thread',
+        update: expect.objectContaining({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call-failed',
+          status: 'failed',
+          rawOutput: 'File not found.',
+        }),
+      }),
+    );
+    for (const toolCallId of [
+      'call-empty-error-text',
+      'call-whitespace-error-text',
+      'call-missing-error-text',
+      'call-empty-result-empty-error-text',
+      'call-whitespace-result-missing-error-text',
+    ]) {
+      expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          _meta: { isReplay: true },
+          sessionId: 'existing-thread',
+          update: expect.objectContaining({
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            status: 'failed',
+            rawOutput: 'No completed result was saved for this tool call (stored state: output-error).',
+          }),
+        }),
+      );
+    }
+    expect(harness.connection.sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _meta: { isReplay: true },
+        sessionId: 'existing-thread',
+        update: expect.objectContaining({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call-empty-result-with-error-text',
+          status: 'failed',
+          rawOutput: 'File not found.',
+        }),
+      }),
+    );
+    await harness.agent.dispose();
+  });
+
+  it('waits for load history replay before sending command-discovery updates', async () => {
+    const priorMessages = [
+      { role: 'user', content: { parts: [{ type: 'text', text: 'Earlier request' }] } },
+      { role: 'assistant', content: { parts: [{ type: 'text', text: 'Earlier answer' }] } },
+    ];
+    let finishFirstReplay!: () => void;
+    const firstReplay = new Promise<void>(resolve => {
+      finishFirstReplay = resolve;
+    });
+    const sessionUpdate = vi.fn(async (notification: Parameters<AgentSideConnection['sessionUpdate']>[0]) => {
+      if (notification.update.sessionUpdate === 'user_message_chunk') await firstReplay;
+    });
+    const skills = {
+      list: async () => [
+        { name: 'review', path: '/skills/review', description: 'Review code', 'user-invocable': true },
+      ],
+      get: async () => null,
+      maybeRefresh: async () => {},
+    } as unknown as AcpSkills;
+    const harness = setup(priorMessages, { getSkills: async () => skills, sessionUpdate });
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+
+    await vi.waitFor(() => expect(sessionUpdate).toHaveBeenCalledTimes(1));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(sessionUpdate).toHaveBeenCalledTimes(1);
+
+    await expect(
+      harness.agent.prompt({ sessionId: 'existing-thread', prompt: [{ type: 'text', text: 'Too early' }] }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(harness.agent.setSessionMode({ sessionId: 'existing-thread', modeId: 'build' })).rejects.toMatchObject(
+      { code: -32602 },
+    );
+    await expect(
+      harness.agent.unstable_setSessionModel({ sessionId: 'existing-thread', modelId: 'openai/gpt-5' }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(
+      harness.agent.setSessionConfigOption({
+        sessionId: 'existing-thread',
+        configId: 'thinking_level',
+        value: 'medium',
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+
+    finishFirstReplay();
+    await load;
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(sessionUpdate).toHaveBeenCalledTimes(3);
+    expect(sessionUpdate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        sessionId: 'existing-thread',
+        update: expect.objectContaining({ sessionUpdate: 'available_commands_update' }),
+      }),
+    );
+  });
+
+  it('still cleans up a newly registered runtime when unsubscribe throws', async () => {
+    const sessionInfoError = new Error('session info failed');
+    const unsubscribeError = new Error('unsubscribe failed');
+    const unsubscribe = vi.fn(() => {
+      throw unsubscribeError;
+    });
+    const cleanup = vi.fn(async () => {});
+    const harness = setup([], {
+      getMode: () => {
+        throw sessionInfoError;
+      },
+      unsubscribe,
+      cleanup,
+    });
+
+    await expect(harness.agent.newSession({ cwd: '/tmp', mcpServers: [] })).rejects.toBe(sessionInfoError);
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(sessionInfoError.cause).toBeInstanceOf(AggregateError);
+  });
+
+  it('cleans up an unregistered restored runtime when history replay fails', async () => {
+    const replayError = new Error('history replay failed');
+    const unsubscribeError = new Error('unsubscribe failed');
+    const unsubscribe = vi.fn(() => {
+      throw unsubscribeError;
+    });
+    const cleanup = vi.fn(async () => {});
+    const sessionUpdate = vi.fn(async () => {
+      throw replayError;
+    });
+    const harness = setup([{ role: 'user', content: { parts: [{ type: 'text', text: 'Earlier request' }] } }], {
+      sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
+      unsubscribe,
+      cleanup,
+    });
+
+    await expect(harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' })).rejects.toBe(
+      replayError,
+    );
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(replayError.cause).toBeInstanceOf(AggregateError);
+  });
+
+  it('captures a durable continuation during private history replay and continues delivery after load', async () => {
+    const replay = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {});
+    sessionUpdate.mockImplementationOnce(async () => {
+      started.resolve();
+      await replay.promise;
+    });
+    const harness = setup([{ id: 'old', role: 'user', content: { parts: [{ type: 'text', text: 'Earlier' }] } }], {
+      sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
+    });
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    await started.promise;
+    harness.emit({ type: 'agent_start' });
+    harness.emit({
+      type: 'message_start',
+      message: {
+        id: 'continued',
+        role: 'assistant',
+        content: { format: 2, parts: [] },
+      } as never,
+    });
+    harness.emit({ type: 'message_update', id: 'continued', event: { type: 'text-delta', delta: 'During replay' } });
+    await expect(harness.agent.prompt({ sessionId: 'existing-thread', prompt: [] })).rejects.toMatchObject({
+      code: -32602,
+    });
+    replay.resolve();
+    await load;
+    harness.emit({ type: 'message_update', id: 'continued', event: { type: 'text-delta', delta: ' after load' } });
+    const chunks = sessionUpdate.mock.calls
+      .map(
+        ([notification]) =>
+          notification as unknown as {
+            update: { content?: { text?: string } };
+          },
+      )
+      .flatMap(notification => (notification.update.content?.text ? [notification.update.content.text] : []));
+    expect(chunks).toEqual(['Earlier', 'During replay', ' after load']);
+    await harness.agent.dispose();
+  });
+
+  it('uses stable message identity to avoid snapshot and captured-live duplication', async () => {
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {});
+    const harness = setup([], { sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'] });
+    harness.listMessages.mockImplementationOnce(async () => {
+      harness.emit({ type: 'agent_start' });
+      harness.emit({
+        type: 'message_start',
+        message: {
+          id: 'overlap',
+          role: 'assistant',
+          content: { format: 2, parts: [] },
+        } as never,
+      });
+      harness.emit({ type: 'message_update', id: 'overlap', event: { type: 'text-delta', delta: 'Once only' } });
+      harness.emit({ type: 'message_end', id: 'overlap' });
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      return [{ id: 'overlap', role: 'assistant', content: { parts: [{ type: 'text', text: 'Once only' }] } }];
+    });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    const chunks = sessionUpdate.mock.calls
+      .map(
+        ([notification]) =>
+          notification as unknown as {
+            update: { content?: { text?: string } };
+          },
+      )
+      .flatMap(notification => (notification.update.content?.text ? [notification.update.content.text] : []));
+    expect(chunks).toEqual(['Once only']);
+    await harness.agent.dispose();
+  });
+
+  it('disposes a private restored runtime after replay settles without publishing it', async () => {
+    const replay = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const unsubscribe = vi.fn();
+    const cleanup = vi.fn(async () => {});
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {
+      started.resolve();
+      await replay.promise;
+    });
+    const harness = setup([{ id: 'old', role: 'user', content: { parts: [{ type: 'text', text: 'Earlier' }] } }], {
+      sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
+      unsubscribe,
+      cleanup,
+    });
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    // Install the rejection observer before triggering disposal.
+    const failedLoad = expect(load).rejects.toMatchObject({ code: -32603 });
+    await started.promise;
+    const disposal = harness.agent.dispose();
+    expect(cleanup).not.toHaveBeenCalled();
+    replay.resolve();
+    await failedLoad;
+    await disposal;
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('seeds an already-streaming message before captured deltas without replaying its newer stored row', async () => {
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {});
+    const harness = setup([], {
+      currentMessage: { id: 'stream', role: 'assistant', content: { parts: [{ type: 'text', text: 'Prefix' }] } },
+      sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
+    });
+    harness.listMessages.mockImplementationOnce(async () => {
+      harness.emit({ type: 'message_update', id: 'stream', event: { type: 'text-delta', delta: ' suffix' } });
+      return [{ id: 'stream', role: 'assistant', content: { parts: [{ type: 'text', text: 'Prefix suffix' }] } }];
+    });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    const chunks = sessionUpdate.mock.calls
+      .map(
+        ([notification]) =>
+          notification as {
+            update: { content?: { text?: string } };
+          },
+      )
+      .flatMap(notification => (notification.update.content?.text ? [notification.update.content.text] : []));
+    expect(chunks).toEqual(['Prefix', ' suffix']);
+    await harness.agent.dispose();
+  });
+
+  it('denies a restored continuation plan on cancel and ignores a late approval', async () => {
+    const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+    const requestPermission = vi.fn(() => answer.promise);
+    const harness = setup([], { requestPermission });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    harness.emit({ type: 'agent_start' });
+    harness.emit({ type: 'tool_suspended', toolCallId: 'plan', toolName: 'submit_plan', args: {}, suspendPayload: {} });
+    harness.emit({ type: 'agent_end', reason: 'suspended' });
+    expect(requestPermission).toHaveBeenCalledOnce();
+    await harness.agent.cancel({ sessionId: 'existing-thread' });
+    expect(harness.resumeToolCall).toHaveBeenCalledWith({
+      toolCallId: 'plan',
+      resumeData: { action: 'rejected' },
+      resolveOnToolEnd: true,
+    });
+    expect(harness.abort).toHaveBeenCalledOnce();
+    expect(harness.detach).toHaveBeenCalledOnce();
+    answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+    await answer.promise;
+    await Promise.resolve();
+    expect(harness.respondToToolSuspension).not.toHaveBeenCalled();
+    await harness.agent.dispose();
+  });
+
+  it.each([false, true])('restores parked approval and plan exactly once with captured overlap=%s', async overlap => {
+    const requestPermission = vi.fn(async () => ({ outcome: { outcome: 'selected' as const, optionId: 'approve' } }));
+    const harness = setup([], {
+      requestPermission,
+      pendingApprovals: new Map([
+        ['approval', { toolCallId: 'approval', toolName: 'write_file', args: { path: 'file' } }],
+      ]),
+      pendingSuspensions: new Map([
+        [
+          'plan',
+          {
+            toolCallId: 'plan',
+            toolName: 'submit_plan',
+            args: { plan: 'Original plan' },
+            suspendPayload: { plan: 'Original plan' },
+          },
+        ],
+      ]),
+    });
+    if (overlap) {
+      harness.listMessages.mockImplementationOnce(async () => {
+        harness.emit({
+          type: 'tool_approval_required',
+          toolCallId: 'approval',
+          toolName: 'write_file',
+          args: { path: 'file' },
+        });
+        const plan = {
+          type: 'tool_suspended' as const,
+          toolCallId: 'plan',
+          toolName: 'submit_plan',
+          args: { plan: 'Original plan' },
+          suspendPayload: { plan: 'Original plan' },
+        };
+        harness.emit(plan);
+        harness.emit(plan);
+        return [];
+      });
+    }
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    await Promise.resolve();
+    expect(requestPermission).toHaveBeenCalledTimes(2);
+    expect(harness.respondToToolApproval).toHaveBeenCalledWith({ decision: 'approve', toolCallId: 'approval' });
+    expect(harness.respondToToolSuspension).toHaveBeenCalledExactlyOnceWith({
+      toolCallId: 'plan',
+      resumeData: { action: 'approved' },
+    });
+    await harness.agent.dispose();
+  });
+
+  it.each([false, true])('preserves a parked approval across unrelated completion with captured=%s', async captured => {
+    const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+    const requestPermission = vi.fn(() => answer.promise);
+    const approval = { toolCallId: 'approval', toolName: 'write_file', args: { path: 'file' } };
+    const harness = setup([], {
+      requestPermission,
+      pendingApprovals: captured ? new Map() : new Map([['approval', approval]]),
+    });
+    harness.listMessages.mockImplementationOnce(async () => {
+      if (captured) harness.emit({ type: 'tool_approval_required', ...approval });
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      return [];
+    });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    expect(requestPermission).toHaveBeenCalledOnce();
+    harness.emit({ type: 'agent_end', reason: 'complete' });
+    answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+    await answer.promise;
+    await Promise.resolve();
+    expect(harness.respondToToolApproval).toHaveBeenCalledWith({ decision: 'approve', toolCallId: 'approval' });
+    await harness.agent.dispose();
+  });
+
+  it.each(['tool_end', 'cancel', 'dispose'] as const)(
+    'invalidates a deferred restored approval after %s',
+    async terminal => {
+      const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+      const harness = setup([], {
+        requestPermission: vi.fn(() => answer.promise),
+        pendingApprovals: new Map([['approval', { toolCallId: 'approval', toolName: 'write_file', args: {} }]]),
+      });
+      await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      if (terminal === 'tool_end')
+        harness.emit({ type: 'tool_end', toolCallId: 'approval', result: {}, isError: false });
+      else if (terminal === 'cancel') {
+        await harness.agent.cancel({ sessionId: 'existing-thread' });
+        expect(harness.respondToToolApproval).toHaveBeenCalledExactlyOnceWith({
+          decision: 'decline',
+          toolCallId: 'approval',
+        });
+        expect(harness.abort).toHaveBeenCalledOnce();
+      } else await harness.agent.dispose();
+      answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+      await answer.promise;
+      await Promise.resolve();
+      expect(harness.respondToToolApproval).not.toHaveBeenCalledWith({ decision: 'approve', toolCallId: 'approval' });
+      await harness.agent.dispose();
+    },
+  );
+
+  it.each(['call', 'partial-call'])('replays unresolved stored tool state %s as in progress', async state => {
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {});
+    const harness = setup(
+      [
+        {
+          role: 'assistant',
+          content: {
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state,
+                  toolCallId: 'pending',
+                  toolName: 'write_file',
+                  args: { path: 'file' },
+                },
+              },
+            ],
+          },
+        },
+      ],
+      { sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'] },
+    );
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    expect(sessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ toolCallId: 'pending', status: 'in_progress' }),
+      }),
+    );
+    const update = sessionUpdate.mock.calls
+      .map(([notification]) => notification as { update: { toolCallId?: string; rawOutput?: unknown } })
+      .find(notification => notification.update.toolCallId === 'pending')!.update;
+    expect(update).not.toHaveProperty('rawOutput');
+    await harness.agent.dispose();
+  });
+
+  it('invalidates a continuation permission response when disposal starts', async () => {
+    const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+    const harness = setup([], { requestPermission: vi.fn(() => answer.promise) });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    harness.emit({ type: 'tool_suspended', toolCallId: 'plan', toolName: 'submit_plan', args: {}, suspendPayload: {} });
+    await harness.agent.dispose();
+    answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+    await answer.promise;
+    await Promise.resolve();
+    expect(harness.respondToToolSuspension).not.toHaveBeenCalled();
+    expect(harness.abort).toHaveBeenCalledOnce();
+  });
+
+  it('invalidates a private plan permission if capture unsubscribe fails during load', async () => {
+    const answer = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection['requestPermission']>>>();
+    const failure = new Error('capture unsubscribe failed');
+    const cleanup = vi.fn(async () => {});
+    const unsubscribe = vi.fn(() => {
+      throw failure;
+    });
+    const harness = setup([], {
+      requestPermission: vi.fn(() => answer.promise),
+      cleanup,
+      unsubscribe,
+      pendingSuspensions: new Map([
+        ['plan', { toolCallId: 'plan', toolName: 'submit_plan', args: {}, suspendPayload: {} }],
+      ]),
+    });
+    await expect(harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' })).rejects.toBe(
+      failure,
+    );
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    answer.resolve({ outcome: { outcome: 'selected', optionId: 'approve' } });
+    await answer.promise;
+    await Promise.resolve();
+    expect(harness.respondToToolSuspension).not.toHaveBeenCalled();
+    expect(harness.resumeToolCall).not.toHaveBeenCalled();
+    await harness.agent.dispose();
+  });
+
+  it.each(['cancelled', 'tool_end', 'agent_end'] as const)(
+    'does not redispatch a captured plan after %s',
+    async terminal => {
+      const replay = Promise.withResolvers<void>();
+      const started = Promise.withResolvers<void>();
+      const requestPermission = vi.fn(async () => ({ outcome: { outcome: 'selected' as const, optionId: 'approve' } }));
+      const sessionUpdate = vi.fn(async (_notification: unknown) => {
+        started.resolve();
+        await replay.promise;
+      });
+      const harness = setup([{ id: 'old', role: 'user', content: { parts: [{ type: 'text', text: 'Earlier' }] } }], {
+        requestPermission,
+        sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
+      });
+      const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+      await started.promise;
+      harness.emit({
+        type: 'tool_suspended',
+        toolCallId: 'plan',
+        toolName: 'submit_plan',
+        args: {},
+        suspendPayload: {},
+      });
+      if (terminal === 'cancelled')
+        harness.emit({
+          type: 'tool_suspension_cancelled',
+          toolCallId: 'plan',
+          toolName: 'submit_plan',
+          reason: 'aborted',
+        });
+      else if (terminal === 'tool_end')
+        harness.emit({ type: 'tool_end', toolCallId: 'plan', result: {}, isError: false });
+      else harness.emit({ type: 'agent_end', reason: 'complete' });
+      replay.resolve();
+      await load;
+      expect(requestPermission).not.toHaveBeenCalled();
+      expect(harness.respondToToolSuspension).not.toHaveBeenCalled();
+      await harness.agent.dispose();
+    },
+  );
+
+  it('does not redispatch an initial parked plan after captured terminal completion', async () => {
+    const requestPermission = vi.fn(async () => ({ outcome: { outcome: 'selected' as const, optionId: 'approve' } }));
+    const harness = setup([], {
+      requestPermission,
+      pendingSuspensions: new Map([
+        ['plan', { toolCallId: 'plan', toolName: 'submit_plan', args: {}, suspendPayload: {} }],
+      ]),
+    });
+    harness.listMessages.mockImplementationOnce(async () => {
+      harness.emit({ type: 'agent_end', reason: 'complete' });
+      return [];
+    });
+    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    expect(requestPermission).not.toHaveBeenCalled();
+    await harness.agent.dispose();
+  });
+
+  it('does not replay a persisted signal twice when its start arrives during history delivery', async () => {
+    const replay = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const sessionUpdate = vi.fn(async (_notification: unknown) => {});
+    sessionUpdate.mockImplementationOnce(async () => {
+      started.resolve();
+      await replay.promise;
+    });
+    const signal = {
+      id: 'signal',
+      role: 'assistant' as const,
+      content: { parts: [{ type: 'text', text: 'Persisted signal' }] },
+    };
+    const harness = setup(
+      [{ id: 'old', role: 'user', content: { parts: [{ type: 'text', text: 'Earlier' }] } }, signal],
+      {
+        sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
+      },
+    );
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    await started.promise;
+    harness.emit({ type: 'message_start', message: signal as never });
+    harness.emit({ type: 'message_end', id: 'signal' });
+    replay.resolve();
+    await load;
+    const chunks = sessionUpdate.mock.calls
+      .map(
+        ([notification]) =>
+          notification as {
+            update: { content?: { text?: string } };
+          },
+      )
+      .flatMap(notification => (notification.update.content?.text ? [notification.update.content.text] : []));
+    expect(chunks).toEqual(['Earlier', 'Persisted signal']);
+    await harness.agent.dispose();
+  });
+
+  it('fails closed when the requested saved thread does not exist', async () => {
+    const harness = setup();
+    harness.createSession.mockRejectedValueOnce(new Error('Thread not found: private-thread-id'));
+    await expect(
+      harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'private-thread-id' }),
+    ).rejects.toMatchObject({ code: -32602, message: 'Invalid params: ACP session not found' });
+    expect(harness.createThread).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when boot binds a different thread instead of switching and dropping the lock', async () => {
+    const harness = setup([], { runtimeThreadId: 'unexpected-thread' });
+    await expect(
+      harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' }),
+    ).rejects.toMatchObject({ code: -32602, message: 'Invalid params: ACP session not found' });
+    expect(harness.switchThread).not.toHaveBeenCalled();
+    expect(harness.listMessages).not.toHaveBeenCalled();
+    await harness.agent.dispose();
+  });
+
+  it('rejects extra workspace roots rather than silently widening access', async () => {
+    const harness = setup();
+    await expect(
+      harness.agent.loadSession({
+        cwd: '/tmp',
+        mcpServers: [],
+        sessionId: 'existing-thread',
+        additionalDirectories: ['/private/extra-root'],
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(harness.createSession).not.toHaveBeenCalled();
   });
 });

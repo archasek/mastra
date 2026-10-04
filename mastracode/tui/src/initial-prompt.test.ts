@@ -11,6 +11,16 @@ import {
 const node = ['node', 'mastracode'];
 
 describe('takeInitialPrompt', () => {
+  it.each(['--tui-prompt', '--tui-initial-prompt'])('does not treat %s value as ACP mode', flag => {
+    const parsed = takeInitialPrompt([...node, flag, '--acp'], {});
+    expect(parsed.prompt).toBe('--acp');
+    expect(parsed.argv.slice(2).includes('--acp')).toBe(false);
+    expect(
+      takeInitialPrompt([...node, `${flag}=--acp`, '--acp'], {})
+        .argv.slice(2)
+        .includes('--acp'),
+    ).toBe(true);
+  });
   it('takes the prompt from --tui-initial-prompt <text> and removes both arguments', () => {
     const result = takeInitialPrompt([...node, '--tui-initial-prompt', 'review this PR', '--acp'], {});
     expect(result).toEqual({

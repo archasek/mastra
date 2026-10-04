@@ -81,6 +81,7 @@
     "execa": "^9.6.1",
     "libsql": "^0.5.29",
     "posthog-node": "^5.46.1",
+    "proper-lockfile": "^4.1.2",
     "smol-toml": "1.8.0",
     "tokenx": "^1.3.0",
     "vscode-jsonrpc": "^8.2.1",

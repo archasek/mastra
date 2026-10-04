@@ -1,13 +1,33 @@
+import { hasHeadlessFlag } from '@mastra/code-sdk/headless/index';
 import { describe, expect, it } from 'vitest';
+import { takeInitialPrompt } from './initial-prompt.js';
 
 import {
   formatResumeHint,
   parseResumeThreadId,
+  resolveEntrypointMode,
   shouldRejectResumeWithoutTTY,
   shouldRunHeadless,
 } from './resume-command.js';
 
 describe('resume command', () => {
+  it.each([
+    [['--prompt', '--acp'], 'headless'],
+    [['-p', '--acp'], 'headless'],
+    [['--tui-prompt', '--acp'], 'tui'],
+    [['--tui-initial-prompt', '--acp'], 'tui'],
+    [['--acp', '--help'], 'headless'],
+    [['--acp'], 'acp'],
+    [['plugin', '--acp'], 'command'],
+    [['prune', '--acp'], 'command'],
+    [['--tui-prompt', 'hello', 'plugin'], 'headless'],
+    [['--tui-prompt', 'hello', 'prune', '--acp'], 'headless'],
+  ] as const)('selects matching dispatch and cleanup ownership for %j', (args, expected) => {
+    const original = ['node', 'mastracode', ...args];
+    const argv = takeInitialPrompt(original, {}).argv;
+    expect(resolveEntrypointMode(argv, hasHeadlessFlag(argv), original)).toBe(expected);
+  });
+
   it('reads an explicit thread ID', () => {
     expect(parseResumeThreadId(['resume', 'thread-123'])).toBe('thread-123');
   });

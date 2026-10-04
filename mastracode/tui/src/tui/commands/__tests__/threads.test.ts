@@ -245,4 +245,15 @@ describe('handleThreadsCommand thread listing', () => {
       mode: 'build',
     });
   });
+
+  it('shows a lock without inventing a PID when the owner is unknown', () => {
+    const { ctx } = createContext([]);
+    showThreadLockPrompt(ctx, 'Locked Thread', null, 'thread-locked');
+    expect(askModalQuestion).toHaveBeenCalledWith(
+      ctx.state.ui,
+      expect.objectContaining({
+        question: 'Thread "Locked Thread" is locked by another process. What would you like to do?',
+      }),
+    );
+  });
 });

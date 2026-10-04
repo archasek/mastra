@@ -14,6 +14,10 @@ export type OAuthProviderId = string;
 export interface OAuthAuthInfo {
   url: string;
   instructions?: string;
+  /** Structured device code for headless clients. Never place it only in prose. */
+  userCode?: string;
+  /** ISO-8601 deadline for a device-code flow. */
+  expiresAt?: string;
 }
 
 export interface OAuthPrompt {
@@ -173,8 +177,11 @@ export interface CredentialStore {
    * active record, or undefined when there is no other instance to rotate to
    * (or `instanceId` is unknown).
    */
-  activateAccount?(providerId: string, instanceId?: string): OAuthAccountRecord | undefined;
+  activateAccount?(
+    providerId: string,
+    instanceId?: string,
+  ): OAuthAccountRecord | undefined | Promise<OAuthAccountRecord | undefined>;
 
   /** Remove one account from the registry (activating the next if it was active). */
-  removeAccount?(providerId: string, instanceId: string): void;
+  removeAccount?(providerId: string, instanceId: string): void | Promise<void>;
 }

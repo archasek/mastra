@@ -18,7 +18,7 @@ async function setup(modelIds = ['openai/gpt-5.5', 'openai/gpt-5.6-sol'], unavai
       emit = listener;
       return () => {};
     },
-    thread: { create: async () => ({ id: 'config-session' }), switch: async () => {} },
+    thread: { create: async () => ({ id: 'config-session' }), getId: () => 'config-session', switch: async () => {} },
     mode: {
       get: () => modeId,
       switch: async ({ modeId: id }: { modeId: string }) => {

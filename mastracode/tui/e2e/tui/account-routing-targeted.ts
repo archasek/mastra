@@ -186,7 +186,7 @@ export const accountRoutingTargetedScenario: McE2eScenario = {
       },
       { label: 'Kimi Account B' },
     );
-    storage.activateAccount(PROVIDER, storage.listAccounts(PROVIDER)[0]!.id);
+    await storage.activateAccount(PROVIDER, storage.listAccounts(PROVIDER)[0]!.id);
   },
   env() {
     return {

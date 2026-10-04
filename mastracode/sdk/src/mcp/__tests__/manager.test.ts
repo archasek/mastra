@@ -88,6 +88,46 @@ describe('createMcpManager', () => {
     });
   });
 
+  describe('MCP config discovery isolation', () => {
+    it('uses only explicitly supplied servers when file discovery is disabled', () => {
+      setupConfig({ mcpServers: { repoConfig: { command: 'untrusted-repo-command' } } });
+      const explicitServers = { t3Tools: { url: 'https://mcp.example.com/mcp' } };
+
+      const manager = createMcpManager('/tmp/test', undefined, explicitServers, undefined, {
+        disableConfigFileDiscovery: true,
+      });
+
+      expect(mockedLoadMcpConfig).not.toHaveBeenCalled();
+      expect(manager.getConfig().mcpServers).toEqual(explicitServers);
+    });
+
+    it('does not attach MCP OAuth providers when OAuth is disabled', async () => {
+      setupConfig({});
+      MockedMCPClient.mockImplementation(function (this: any) {
+        this.listToolsetsWithErrors = vi.fn().mockResolvedValue({ toolsets: { remote: {} }, errors: {} });
+        this.disconnect = vi.fn().mockResolvedValue(undefined);
+      } as any);
+
+      const manager = createMcpManager(
+        '/tmp/test',
+        undefined,
+        {
+          remote: {
+            url: 'https://mcp.example.com/mcp',
+            oauth: { clientId: 'configured-client' },
+          },
+        },
+        undefined,
+        { disableConfigFileDiscovery: true, disableOAuthProviders: true },
+      );
+      await manager.init();
+
+      const server = MockedMCPClient.mock.calls[0]![0]!.servers['remote'] as any;
+      expect(server.authProvider).toBeUndefined();
+      expect(MockedMCPOAuthClientProvider).not.toHaveBeenCalled();
+    });
+  });
+
   describe('init with server defs', () => {
     it('builds stdio server def correctly with stderr piped', async () => {
       const stdioConfig: McpStdioServerConfig = {
@@ -122,9 +162,12 @@ describe('createMcpManager', () => {
     });
 
     it('builds http server def with URL object and requestInit', async () => {
+      const fetch = vi.fn().mockResolvedValue(new Response('ok'));
       const httpConfig: McpHttpServerConfig = {
         url: 'https://mcp.example.com/sse',
         headers: { Authorization: 'Bearer tok' },
+        allowedHosts: ['mcp.example.com'],
+        fetch,
       };
       setupConfig({ mcpServers: { remote: httpConfig } });
 
@@ -137,6 +180,8 @@ describe('createMcpManager', () => {
       await manager.init();
 
       const call = MockedMCPClient.mock.calls[0]![0]!;
+      expect(call.servers.remote.allowedHosts).toEqual(['mcp.example.com']);
+      expect(call.servers.remote.fetch).toBe(fetch);
       const serverDef = call.servers['remote'] as any;
       expect(serverDef.url).toBeInstanceOf(URL);
       expect(serverDef.url.href).toBe('https://mcp.example.com/sse');
@@ -1426,6 +1471,30 @@ describe('createMcpManager', () => {
         this.disconnect = vi.fn().mockResolvedValue(undefined);
       } as any);
     }
+
+    it('ignores ambient disable state for programmatic servers in isolated ACP mode', async () => {
+      await withTempAppData(async () => {
+        setupConfig({});
+        mockClientWithToolsets({ t3Tools: { search: {} } });
+        const explicitServers = { t3Tools: { url: 'https://mcp.example.com/mcp' } };
+
+        const ordinaryManager = createMcpManager('/tmp/test', undefined, explicitServers);
+        await ordinaryManager.init();
+        await ordinaryManager.setServerDisabled('t3Tools', true, { global: true });
+        await ordinaryManager.setAllDisabled(true);
+
+        const acpManager = createMcpManager('/tmp/test', undefined, explicitServers, undefined, {
+          disableConfigFileDiscovery: true,
+        });
+        await acpManager.init();
+
+        expect(acpManager.getDisabledServers()).toEqual([]);
+        expect(acpManager.getServerStatuses()).toMatchObject([
+          { name: 't3Tools', connected: true, globalKillSwitch: false },
+        ]);
+        expect(Object.keys(acpManager.getTools())).toEqual(['t3Tools_search']);
+      });
+    });
 
     it('setServerDisabled removes tools, reports disabled status, and rebuilds without the server', async () => {
       await withTempAppData(async () => {

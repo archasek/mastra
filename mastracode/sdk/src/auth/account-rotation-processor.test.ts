@@ -94,7 +94,7 @@ async function makeTwoAccountStorage(): Promise<SeededStorage> {
     { access: 'token-b', refresh: 'refresh-b', expires: FUTURE },
     { label: 'Account B' },
   );
-  storage.activateAccount(PROVIDER, storage.listAccounts(PROVIDER)[0]!.id);
+  await storage.activateAccount(PROVIDER, storage.listAccounts(PROVIDER)[0]!.id);
   const [a, b] = storage.listAccounts(PROVIDER);
   return { storage, authPath, accountA: { id: a.id, label: a.label }, accountB: { id: b.id, label: b.label } };
 }
@@ -598,7 +598,7 @@ describe('AccountRotationProcessor.processAPIError', () => {
       { label: 'Account C' },
     );
     // The cursor sits on A while A and B were both already tried this request.
-    seeded.storage.activateAccount(PROVIDER, seeded.accountA.id);
+    await seeded.storage.activateAccount(PROVIDER, seeded.accountA.id);
     const processor = new AccountRotationProcessor({ credentialStore: seeded.storage, maxProcessorRetries: 22 });
     const args = makeArgs({
       error: apiError(429),
@@ -654,8 +654,8 @@ describe('AccountStartNoticeProcessor.processInput', () => {
     async removeOld => {
       const seeded = await makeTwoAccountStorage();
       const peers = Array.from({ length: 10 }, () => new AuthStorage(seeded.authPath));
-      seeded.storage.activateAccount(PROVIDER, seeded.accountB.id);
-      if (removeOld) seeded.storage.removeAccount(PROVIDER, seeded.accountA.id);
+      await seeded.storage.activateAccount(PROVIDER, seeded.accountB.id);
+      if (removeOld) await seeded.storage.removeAccount(PROVIDER, seeded.accountA.id);
 
       for (const peer of peers) {
         expect(peer.getActiveAccount(PROVIDER)?.id).toBe(seeded.accountA.id);
@@ -681,8 +681,8 @@ describe('AccountStartNoticeProcessor.processInput', () => {
       expect(getRequestAccountSelection(requestContext, PROVIDER)).toBe(seeded.accountA.id);
 
       const peer = new AuthStorage(seeded.authPath);
-      peer.activateAccount(PROVIDER, seeded.accountB.id);
-      peer.removeAccount(PROVIDER, seeded.accountA.id);
+      await peer.activateAccount(PROVIDER, seeded.accountB.id);
+      await peer.removeAccount(PROVIDER, seeded.accountA.id);
       if (reloaded) seeded.storage.reload();
       const gateway = createRequestScopedCredentialStore(new AuthStorage(seeded.authPath), requestContext);
       expect(await gateway.getOAuthCredential?.(PROVIDER)).toBeUndefined();
@@ -712,7 +712,7 @@ describe('AccountStartNoticeProcessor.processInput', () => {
       const input = makeInputArgs({ requestContext });
       const start = new AccountStartNoticeProcessor({ credentialStore: seeded.storage, settingsPath });
       if (inFlight) await start.processInput(input as never);
-      new AuthStorage(seeded.authPath).removeAccount(PROVIDER, seeded.accountA.id);
+      await new AuthStorage(seeded.authPath).removeAccount(PROVIDER, seeded.accountA.id);
       if (!inFlight) await start.processInput(input as never);
       const gateway = createRequestScopedCredentialStore(new AuthStorage(seeded.authPath), requestContext);
       expect(await gateway.getOAuthCredential?.(PROVIDER)).toBeUndefined();
@@ -735,8 +735,8 @@ describe('AccountStartNoticeProcessor.processInput', () => {
     const seeded = await makeTwoAccountStorage();
     const { settingsPath, requestContext, emitEvent } = makeSharedFileRoute(seeded, seeded.accountB.id);
     const activate = seeded.storage.activateAccount.bind(seeded.storage);
-    vi.spyOn(seeded.storage, 'activateAccount').mockImplementation((providerId, accountId) => {
-      new AuthStorage(seeded.authPath).removeAccount(PROVIDER, accountId);
+    vi.spyOn(seeded.storage, 'activateAccount').mockImplementation(async (providerId, accountId) => {
+      await new AuthStorage(seeded.authPath).removeAccount(PROVIDER, accountId);
       return activate(providerId, accountId);
     });
     const args = makeInputArgs({ requestContext });
@@ -752,11 +752,11 @@ describe('AccountStartNoticeProcessor.processInput', () => {
   it('lets error recovery reach a survivor when an automatic route loses its account during activation', async () => {
     const seeded = await makeTwoAccountStorage();
     const accountC = await addThirdAccount(seeded.storage);
-    seeded.storage.activateAccount(PROVIDER, seeded.accountA.id);
+    await seeded.storage.activateAccount(PROVIDER, seeded.accountA.id);
     const { settingsPath, requestContext, emitEvent } = makeSharedFileRoute(seeded);
     const activate = seeded.storage.activateAccount.bind(seeded.storage);
-    vi.spyOn(seeded.storage, 'activateAccount').mockImplementation((providerId, accountId) => {
-      if (accountId === seeded.accountB.id) new AuthStorage(seeded.authPath).removeAccount(PROVIDER, accountId);
+    vi.spyOn(seeded.storage, 'activateAccount').mockImplementation(async (providerId, accountId) => {
+      if (accountId === seeded.accountB.id) await new AuthStorage(seeded.authPath).removeAccount(PROVIDER, accountId);
       return activate(providerId, accountId);
     });
     const state: Record<string, unknown> = { triedInstances: new Set([seeded.accountA.id]) };
@@ -797,7 +797,7 @@ describe('AccountStartNoticeProcessor.processInput', () => {
 
   it('emits the start notice once when the active account is not the first entry', async () => {
     const seeded = await makeTwoAccountStorage();
-    seeded.storage.activateAccount(PROVIDER, seeded.accountB.id);
+    await seeded.storage.activateAccount(PROVIDER, seeded.accountB.id);
     const processor = new AccountStartNoticeProcessor({ credentialStore: seeded.storage });
     const args = makeInputArgs();
 
@@ -955,7 +955,7 @@ describe('AccountStartNoticeProcessor.processInput', () => {
       { access: 'kimi-token-b', refresh: 'kimi-refresh-b', expires: FUTURE },
       { label: 'Kimi Account B' },
     );
-    seeded.storage.activateAccount(KIMI_PROVIDER, kimiA.id);
+    await seeded.storage.activateAccount(KIMI_PROVIDER, kimiA.id);
     const appDataDir = process.env.MASTRA_APP_DATA_DIR!;
     mkdirSync(appDataDir, { recursive: true });
     writeFileSync(
@@ -1282,7 +1282,7 @@ describe('pack-fallback parts', () => {
       { label: 'OpenAI B' },
     );
     const [openaiA, openaiB] = seeded.storage.listAccounts('openai-codex');
-    seeded.storage.activateAccount('openai-codex', openaiA!.id);
+    await seeded.storage.activateAccount('openai-codex', openaiA!.id);
     seedSettingsWithFallbacks({ anthropic: 'openai' }, { openai: { 'openai/gpt-5.6-sol': openaiB!.id } });
     const processor = new AccountRotationProcessor({ credentialStore: seeded.storage, maxProcessorRetries: 22 });
     const args = makeControllerArgs('anthropic/claude-fable-5');
@@ -1310,7 +1310,7 @@ describe('pack-fallback parts', () => {
       { label: 'OpenAI B' },
     );
     const [openaiA, openaiB] = seeded.storage.listAccounts('openai-codex');
-    seeded.storage.activateAccount('openai-codex', openaiA!.id);
+    await seeded.storage.activateAccount('openai-codex', openaiA!.id);
     seedSettingsWithFallbacks({ anthropic: 'openai' }, { openai: { 'openai/gpt-5.6-sol': openaiB!.id } });
     const processor = new AccountRotationProcessor({ credentialStore: seeded.storage, maxProcessorRetries: 22 });
     const args = makeControllerArgs('anthropic/claude-fable-5');
@@ -1344,7 +1344,7 @@ describe('pack-fallback parts', () => {
       { label: 'OpenAI B' },
     );
     const [openaiA, openaiB] = seeded.storage.listAccounts('openai-codex');
-    seeded.storage.activateAccount('openai-codex', openaiA!.id);
+    await seeded.storage.activateAccount('openai-codex', openaiA!.id);
     seedSettingsWithFallbacks({ anthropic: 'openai' }, { openai: { 'openai/gpt-5.6-sol': openaiB!.id } });
     const processor = new AccountRotationProcessor({ credentialStore: seeded.storage, maxProcessorRetries: 22 });
     const args = makeControllerArgs('anthropic/claude-fable-5');
@@ -1437,7 +1437,7 @@ describe('pack-fallback parts', () => {
     expect(await scoped.getApiKey(PROVIDER)).toBeUndefined();
     expect(await scoped.getOAuthCredential?.(PROVIDER)).toBeUndefined();
     // A different provider on the same request is unaffected.
-    seeded.storage.setStoredApiKey('openai-codex', 'sk-other');
+    await seeded.storage.setStoredApiKey('openai-codex', 'sk-other');
     expect(scoped.getStoredApiKey('openai-codex')).toBe('sk-other');
   });
 
@@ -1805,7 +1805,7 @@ describe('cross-provider cascades', () => {
       { access: 'token-d', refresh: 'refresh-d', expires: FUTURE },
       { label: 'Codex D' },
     );
-    seeded.storage.activateAccount('openai-codex', seeded.storage.listAccounts('openai-codex')[0]!.id);
+    await seeded.storage.activateAccount('openai-codex', seeded.storage.listAccounts('openai-codex')[0]!.id);
     seedSettingsWithFallbacks({ anthropic: 'openai' });
     const processor = new AccountRotationProcessor({ credentialStore: seeded.storage, maxProcessorRetries: 22 });
     const args = makeControllerArgs('anthropic/claude-fable-5');

@@ -21,7 +21,7 @@ import {
 } from '@mastra/code-sdk/process-memory-diagnostics';
 import { setupDebugLogging, truncateLogFile } from '@mastra/code-sdk/utils/debug-log';
 import { drainPipedStdin, reopenStdinFromTTY } from '@mastra/code-sdk/utils/stdin-pipe';
-import { releaseAllThreadLocks } from '@mastra/code-sdk/utils/thread-lock';
+import { releaseAllThreadLocks, releaseAllThreadLocksSync } from '@mastra/code-sdk/utils/thread-lock';
 import { TUI_CO_AUTHOR } from './commit-attribution.js';
 import { initialMessageOptions, pipedInputConflict, takeInitialPrompt } from './initial-prompt.js';
 import {
@@ -32,8 +32,8 @@ import {
 import {
   formatResumeHint,
   parseResumeThreadId,
+  resolveEntrypointMode,
   shouldRejectResumeWithoutTTY,
-  shouldRunHeadless,
 } from './resume-command.js';
 import { resolveTuiSubagents } from './subagent-settings.js';
 import { detectTerminalTheme } from './tui/detect-theme.js';
@@ -59,6 +59,12 @@ let getResumeThreadId: (() => string | null) | undefined;
 
 const CRASH_LOG_PATH = '/tmp/mastra-crash.log';
 
+// Use the same prompt parser as main: a prompt value such as "--acp" is
+// not a mode flag. A copy preserves main's environment-consumption behavior.
+const startupArgv = takeInitialPrompt(process.argv, { ...process.env }).argv;
+const entrypointMode = resolveEntrypointMode(startupArgv, hasHeadlessFlag(startupArgv), process.argv);
+const acpMode = entrypointMode === 'acp';
+
 function isTruthyEnv(name: string): boolean {
   return ['1', 'true', 'yes', 'on'].includes(process.env[name]?.trim().toLowerCase() ?? '');
 }
@@ -72,16 +78,18 @@ function resolveInitialStateFromEnv() {
 }
 
 // Global safety nets — catch any uncaught errors from storage init, etc.
-process.on('uncaughtException', error => {
-  // ERR_STREAM_DESTROYED is non-fatal — happens routinely when streams close
-  // during shutdown, cancelled LLM requests, or LSP/subprocess exits (#13548, #13549)
-  if (isStreamDestroyedError(error)) return;
-  handleFatalError(error);
-});
-process.on('unhandledRejection', reason => {
-  if (isStreamDestroyedError(reason)) return;
-  handleFatalError(reason instanceof Error ? reason : new Error(String(reason)));
-});
+if (!acpMode) {
+  process.on('uncaughtException', error => {
+    // ERR_STREAM_DESTROYED is non-fatal — happens routinely when streams close
+    // during shutdown, cancelled LLM requests, or LSP/subprocess exits (#13548, #13549)
+    if (isStreamDestroyedError(error)) return;
+    handleFatalError(error);
+  });
+  process.on('unhandledRejection', reason => {
+    if (isStreamDestroyedError(reason)) return;
+    handleFatalError(reason instanceof Error ? reason : new Error(String(reason)));
+  });
+}
 
 async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> = {}, resumeThreadId?: string) {
   const settings = loadSettings();
@@ -208,7 +216,6 @@ async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> 
 
 const asyncCleanup = (): Promise<void> => {
   cleanupPromise ??= (async () => {
-    releaseAllThreadLocks();
     // Stop plugin-contributed signal providers (and the plugin reload listener)
     // before quiescing workers: a provider that keeps polling past this point
     // could dispatch into a controller that is shutting down.
@@ -244,6 +251,9 @@ const asyncCleanup = (): Promise<void> => {
       });
     }
     await diagnosticsShutdown;
+    // Retain thread ownership until all producers and storage have drained.
+    // The synchronous exit handler remains the fallback for forced exits.
+    await releaseAllThreadLocks();
   })();
   return cleanupPromise;
 };
@@ -251,47 +261,39 @@ const asyncCleanup = (): Promise<void> => {
 const shutdownAndExit = createShutdownCoordinator(asyncCleanup, exitCode => process.exit(exitCode));
 
 process.on('beforeExit', () => {
-  void asyncCleanup();
+  if (!acpMode) void asyncCleanup();
 });
 process.on('exit', () => {
-  // Ensure terminal protocols (kitty keyboard, modifyOtherKeys, bracketed paste,
-  // raw mode) are disabled on ANY exit path. Without this, killing the process
-  // via SIGINT/SIGTERM leaves the terminal in a corrupted state where keypresses
-  // produce escape sequences like "5;99~" instead of normal characters.
-  try {
-    tui?.stop();
-  } catch {
-    // Failsafe: even if MastraTUI.stop() throws, write raw terminal reset
-    // sequences to disable Kitty keyboard protocol, bracketed paste, and
-    // modifyOtherKeys. These are the exact sequences pi-tui's terminal.stop()
-    // would write.
-  }
-  // Belt-and-suspenders: always write terminal reset sequences directly,
-  // regardless of whether tui.stop() succeeded. Writing them twice is harmless
-  // but missing them leaves the terminal in a corrupted state.
-  try {
-    process.stdout.write(
-      '\x1b[?2004l' + // disable bracketed paste
-        '\x1b[<u' + // pop kitty keyboard protocol
-        '\x1b[>4;0m' + // disable modifyOtherKeys
-        '\x1b[?25h', // show cursor
-    );
-    if (process.stdin.setRawMode) {
-      process.stdin.setRawMode(false);
+  if (!acpMode) {
+    // ACP stdout is the NDJSON protocol stream, never a terminal channel.
+    // Keep terminal reset bytes off stdout even when the ACP child exits.
+    try {
+      tui?.stop();
+    } catch {
+      // Failsafe: the raw reset below still restores the interactive terminal.
     }
-  } catch {
-    // stdout may already be closed during exit
-  }
-  restoreTerminalForeground();
-  releaseAllThreadLocks();
-  try {
-    const threadId = getResumeThreadId?.();
-    if (threadId) {
-      process.stdout.write(`\n${formatResumeHint(threadId)}\n`);
+    try {
+      process.stdout.write(
+        '\x1b[?2004l' + // disable bracketed paste
+          '\x1b[<u' + // pop kitty keyboard protocol
+          '\x1b[>4;0m' + // disable modifyOtherKeys
+          '\x1b[?25h', // show cursor
+      );
+      if (process.stdin.setRawMode) {
+        process.stdin.setRawMode(false);
+      }
+    } catch {
+      // stdout may already be closed during exit
     }
-  } catch {
-    // session state or stdout may already be closed during exit
+    restoreTerminalForeground();
+    try {
+      const threadId = getResumeThreadId?.();
+      if (threadId) process.stdout.write(`\n${formatResumeHint(threadId)}\n`);
+    } catch {
+      // session state or stdout may already be closed during exit
+    }
   }
+  releaseAllThreadLocksSync();
 });
 
 // Start durable diagnostics shutdown before synchronous TUI teardown so a stalled
@@ -306,9 +308,13 @@ const handleTermSignal = () => {
   }
   void shutdownAndExit(0);
 };
-process.on('SIGINT', handleTermSignal);
-process.on('SIGTERM', handleTermSignal);
-process.on('SIGHUP', handleTermSignal);
+// ACP owns its runtime and signal-driven drain. TUI cleanup has no references
+// to that runtime and must not release its leases or exit ahead of its disposer.
+if (!acpMode) {
+  process.on('SIGINT', handleTermSignal);
+  process.on('SIGTERM', handleTermSignal);
+  process.on('SIGHUP', handleTermSignal);
+}
 
 function hasEconnrefused(err: unknown, depth = 0): boolean {
   if (!err || depth > 5) return false;
@@ -431,16 +437,20 @@ async function main() {
   }
 
   const headless = hasHeadlessFlag(process.argv);
-  if (shouldRunHeadless(process.argv, resumeThreadId, headless)) {
+  if (entrypointMode === 'headless') {
     if (headless) rejectInitialPromptFlag('use --prompt for headless runs');
     return runMCCli(undefined, { coAuthor: TUI_CO_AUTHOR });
   }
 
-  if (process.argv.includes('--acp')) {
+  if (acpMode) {
     rejectInitialPromptFlag('it cannot be combined with --acp');
+    if (process.argv.includes('--dangerous-auto-approve')) {
+      process.stderr.write('--dangerous-auto-approve is not supported in ACP mode.\n');
+      process.exit(1);
+    }
     const { acpMain } = await import('@mastra/code-sdk/acp/index');
     return acpMain({
-      dangerousAutoApprove: process.argv.includes('--dangerous-auto-approve'),
+      version: getCurrentVersion(),
       coAuthor: TUI_CO_AUTHOR,
     });
   }
@@ -479,5 +489,12 @@ async function main() {
 }
 
 main().catch(error => {
+  if (acpMode) {
+    // runAcpServer owns any created runtime's cleanup. Pre-server import/boot
+    // errors have no TUI resources, and must not invoke its crash writer.
+    process.stderr.write('[acp] Failed to start.\n');
+    process.exitCode = 1;
+    return;
+  }
   handleFatalError(error);
 });

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -135,6 +136,18 @@ describe('createOneShotFatalErrorHandler', () => {
 });
 
 describe('createShutdownCoordinator', () => {
+  it('keeps the TUI thread leases until shutdown and storage cleanup complete', async () => {
+    // Assert the real entrypoint ordering without importing main.ts, which
+    // installs process handlers and launches the interactive application.
+    const source = await readFile(new URL('../main.ts', import.meta.url), 'utf8');
+    const cleanup = source.slice(source.indexOf('const asyncCleanup ='), source.indexOf('const shutdownAndExit ='));
+    const release = cleanup.indexOf('await releaseAllThreadLocks()');
+    expect(release).toBeGreaterThan(cleanup.indexOf('await Promise.allSettled([controller?.getMastra()?.shutdown()'));
+    expect(release).toBeGreaterThan(cleanup.indexOf('await storageMaintenance?.closeStorage?.()'));
+    expect(release).toBeGreaterThan(cleanup.indexOf('await diagnosticsShutdown'));
+    expect(source.slice(source.indexOf("process.on('exit'"))).toContain('releaseAllThreadLocksSync()');
+  });
+
   it('shares one cleanup and exit across concurrent fatal and signal shutdowns', async () => {
     let releaseCleanup!: () => void;
     const cleanup = vi.fn(

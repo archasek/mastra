@@ -471,6 +471,7 @@ export class AgentController<TState = {}> {
     scope,
     tags,
     threadId,
+    requireExistingThread,
     createInitialThread = true,
     workspace,
     browser,
@@ -499,6 +500,8 @@ export class AgentController<TState = {}> {
     tags?: Record<string, string>;
     /** Exact thread id to bind during session creation. Existing threads are resumed; missing threads are created with this id. */
     threadId?: string;
+    /** Reject a missing or foreign threadId instead of creating a thread with that id. */
+    requireExistingThread?: boolean;
     /** Create a thread when no existing thread matches. Set false to defer creation until first use, so unused sessions leave no empty thread behind. */
     createInitialThread?: boolean;
     workspace?: Workspace;
@@ -508,6 +511,15 @@ export class AgentController<TState = {}> {
     const effectiveResourceId = resourceId ?? this.config.resourceId ?? this.config.id;
     const effectiveSessionId = id ?? this.config.id;
     const effectiveOwnerId = ownerId ?? this.config.id;
+    if (requireExistingThread && !threadId) {
+      throw new Error('requireExistingThread needs threadId.');
+    }
+    if (requireExistingThread && threadId) {
+      const existingThread = await this.queryThreadById({ threadId });
+      if (!existingThread || existingThread.resourceId !== effectiveResourceId) {
+        throw new Error(`Thread not found: ${threadId}`);
+      }
+    }
     const registryKey = sessionRegistryKey(effectiveResourceId, scope);
 
     // Get-or-create loop: a (resourceId, scope) pair maps to exactly one
@@ -552,14 +564,24 @@ export class AgentController<TState = {}> {
         // subscribe, message listing) racing ahead of an exact-thread create
         // would leave the session bound to a different thread and the requested
         // thread never created.
+        const requestedThread =
+          requireExistingThread && threadId ? await session.thread.getById({ threadId }) : undefined;
+        if (
+          requireExistingThread &&
+          threadId &&
+          (!requestedThread || requestedThread.resourceId !== effectiveResourceId)
+        ) {
+          throw new Error(`Thread not found: ${threadId}`);
+        }
         if (threadId && session.thread.getId() !== threadId) {
-          const existingThread = await session.thread.getById({ threadId });
+          const existingThread = requestedThread ?? (await session.thread.getById({ threadId }));
           if (existingThread) {
             if (existingThread.resourceId !== effectiveResourceId) {
               throw new Error(`Thread not found: ${threadId}`);
             }
             await session.thread.switch({ threadId, requestContext });
           } else {
+            if (requireExistingThread) throw new Error(`Thread not found: ${threadId}`);
             await session.thread.create({ id: threadId, requestContext });
           }
         } else if (createInitialThread && session.thread.getId() === null) {
@@ -585,6 +607,7 @@ export class AgentController<TState = {}> {
       const creation = this.#createSessionForResource(effectiveOwnerId, effectiveSessionId, effectiveResourceId, tags, {
         scope,
         threadId,
+        requireExistingThread,
         createInitialThread,
         workspace,
         browser,
@@ -619,6 +642,7 @@ export class AgentController<TState = {}> {
     overrides?: {
       scope?: string;
       threadId?: string;
+      requireExistingThread?: boolean;
       createInitialThread?: boolean;
       workspace?: Workspace;
       browser?: MastraBrowser;
@@ -707,44 +731,55 @@ export class AgentController<TState = {}> {
       }),
     );
 
-    if (overrides?.threadId) {
-      const existingThread = await session.thread.getById({ threadId: overrides.threadId });
-      if (existingThread) {
-        if (existingThread.resourceId !== effectiveResourceId) {
-          throw new Error(`Thread not found: ${overrides.threadId}`);
+    try {
+      if (overrides?.threadId) {
+        const existingThread = await session.thread.getById({ threadId: overrides.threadId });
+        if (existingThread) {
+          if (existingThread.resourceId !== effectiveResourceId) {
+            throw new Error(`Thread not found: ${overrides.threadId}`);
+          }
+          await this.config.threadLock?.acquire(existingThread.id);
+          session.thread.set({ threadId: existingThread.id });
+          await session.thread.loadMetadata();
+          await session.thread.ensureCurrentSubscription(requestContext);
+        } else {
+          if (overrides.requireExistingThread) throw new Error(`Thread not found: ${overrides.threadId}`);
+          await session.thread.create({ id: overrides.threadId, requestContext });
         }
-        await this.config.threadLock?.acquire(existingThread.id);
-        session.thread.set({ threadId: existingThread.id });
-        await session.thread.loadMetadata();
-        await session.thread.ensureCurrentSubscription(requestContext);
       } else {
-        await session.thread.create({ id: overrides.threadId, requestContext });
-      }
-    } else {
-      // Same scope `thread.create()` stamps, matched strictly: a thread outside
-      // this session's scope — including one carrying no scope at all — belongs
-      // to nobody here and must not be auto-resumed.
-      const scopeEntries = Object.entries(session.getThreadScope());
+        // Same scope `thread.create()` stamps, matched strictly: a thread outside
+        // this session's scope — including one carrying no scope at all — belongs
+        // to nobody here and must not be auto-resumed.
+        const scopeEntries = Object.entries(session.getThreadScope());
 
-      const threads = await session.thread.list();
-      const candidates = threads.filter(t => {
-        const metadata = (t.metadata as Record<string, unknown> | undefined) ?? {};
-        return scopeEntries.every(([key, value]) => metadata[key] === value);
-      });
+        const threads = await session.thread.list();
+        const candidates = threads.filter(t => {
+          const metadata = (t.metadata as Record<string, unknown> | undefined) ?? {};
+          return scopeEntries.every(([key, value]) => metadata[key] === value);
+        });
 
-      if (candidates.length === 0 && overrides?.createInitialThread !== false) {
-        await session.thread.create({ requestContext });
-      } else if (candidates.length > 0) {
-        const mostRecent = [...candidates].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0]!;
-        await this.config.threadLock?.acquire(mostRecent.id);
-        session.thread.set({ threadId: mostRecent.id });
-        await session.thread.loadMetadata();
-        await session.thread.ensureCurrentSubscription(requestContext);
+        if (candidates.length === 0 && overrides?.createInitialThread !== false) {
+          await session.thread.create({ requestContext });
+        } else if (candidates.length > 0) {
+          const mostRecent = [...candidates].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0]!;
+          await this.config.threadLock?.acquire(mostRecent.id);
+          session.thread.set({ threadId: mostRecent.id });
+          await session.thread.loadMetadata();
+          await session.thread.ensureCurrentSubscription(requestContext);
+        }
       }
+
+      await this.#notifySessionCreated(session);
+      return session;
+    } catch (error) {
+      try {
+        session.thread.detachFromCurrent();
+      } catch {
+        // Preserve the setup error while still attempting to release its lock.
+      }
+      await session.thread.clearAndReleaseLock().catch(() => {});
+      throw error;
     }
-
-    await this.#notifySessionCreated(session);
-    return session;
   }
 
   /**

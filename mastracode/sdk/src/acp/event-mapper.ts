@@ -1,4 +1,9 @@
-import type { SessionNotification, RequestPermissionRequest, AgentSideConnection } from '@agentclientprotocol/sdk';
+import type {
+  AgentSideConnection,
+  ElicitationPropertySchema,
+  RequestPermissionRequest,
+  SessionNotification,
+} from '@agentclientprotocol/sdk';
 import type { AgentControllerEvent, Session, TokenUsage } from '@mastra/core/agent-controller';
 
 let autoApprove = false;
@@ -13,7 +18,7 @@ export function setAutoApprove(value: boolean): void {
 /**
  * Map a mastracode tool name to an ACP ToolKind.
  */
-function mapToolKind(
+export function mapToolKind(
   toolName: string,
 ): 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'think' | 'fetch' | 'other' {
   const name = toolName.toLowerCase();
@@ -41,6 +46,9 @@ function mapToolKind(
  */
 export interface PromptState {
   sessionId: string;
+  supportsElicitation?: boolean;
+  isActive?: () => boolean;
+  isApprovalActive?: (toolCallId: string) => boolean;
   activeAssistantMessageId?: string;
   usage: TokenUsage;
   error?: Error;
@@ -116,14 +124,14 @@ export function handleAgentControllerEvent(
       break;
 
     case 'tool_approval_required':
-      void handleToolApproval(state, connection, session, event).catch(err => {
-        failTurn(state, session, err);
+      void handleToolApproval(state, connection, session, event).catch(() => {
+        failTurn(state, session, new Error('ACP permission request failed'));
       });
       break;
 
     case 'tool_suspended':
-      void handleToolSuspended(state, connection, session, event).catch(err => {
-        failTurn(state, session, err);
+      void handleToolSuspended(state, connection, session, event).catch(() => {
+        failTurn(state, session, new Error('ACP suspended tool could not be resumed'));
       });
       break;
 
@@ -131,11 +139,18 @@ export function handleAgentControllerEvent(
       accumulateUsage(state.usage, event.usage);
       break;
 
-    case 'error':
+    case 'error': {
       state.error = event.error;
-      if (event.finishReason === 'length') state.stopReason = 'max_tokens';
-      else if (event.finishReason === 'content-filter') state.stopReason = 'refusal';
+      // Local core adds provider finish reasons before its generated workspace
+      // declarations are rebuilt; keep ACP compilable against the prior package d.ts.
+      const finishReason = (event as typeof event & { finishReason?: string }).finishReason;
+      if (finishReason === 'length') state.stopReason = 'max_tokens';
+      else if (finishReason === 'content-filter') state.stopReason = 'refusal';
+      // Retryable provider errors may be followed by another attempt. A final
+      // core error can be followed by agent_end:aborted, so resolve it here.
+      if (!event.retryable) failTurn(state, session, event.error);
       break;
+    }
 
     case 'agent_end':
       // A suspended run continues after the client answers the permission request.
@@ -158,8 +173,8 @@ export function handleAgentControllerEvent(
 }
 
 function sendUpdate(connection: AgentSideConnection, sessionId: string, update: SessionNotification['update']): void {
-  connection.sessionUpdate({ sessionId, update }).catch(err => {
-    process.stderr.write(`[acp] sessionUpdate error: ${err}\n`);
+  connection.sessionUpdate({ sessionId, update }).catch(() => {
+    process.stderr.write('[acp] Session update delivery failed.\n');
   });
 }
 
@@ -169,6 +184,11 @@ async function handleToolApproval(
   session: Session,
   event: Extract<AgentControllerEvent, { type: 'tool_approval_required' }>,
 ): Promise<void> {
+  const inactive = () =>
+    state.cancelled ||
+    (state.isApprovalActive
+      ? !state.isApprovalActive(event.toolCallId)
+      : state.finished || state.isActive?.() === false);
   if (state.cancelled) {
     session.respondToToolApproval({ decision: 'decline', toolCallId: event.toolCallId });
     return;
@@ -194,16 +214,16 @@ async function handleToolApproval(
 
   try {
     const resp = await connection.requestPermission(req);
-    if (state.finished || state.cancelled) return;
+    if (inactive()) return;
     if (resp.outcome.outcome === 'selected') {
       const decision = resp.outcome.optionId === 'approve' ? 'approve' : 'decline';
       session.respondToToolApproval({ decision, toolCallId: event.toolCallId });
     } else {
       session.respondToToolApproval({ decision: 'decline', toolCallId: event.toolCallId });
     }
-  } catch (err) {
-    if (state.finished || state.cancelled) return;
-    process.stderr.write(`[acp] requestPermission error: ${err}\n`);
+  } catch {
+    if (inactive()) return;
+    process.stderr.write('[acp] Permission request failed; denying the tool call.\n');
     session.respondToToolApproval({ decision: 'decline', toolCallId: event.toolCallId });
   }
 }
@@ -261,7 +281,7 @@ async function handleToolSuspended(
         approved = false;
       }
     }
-    if (state.finished || state.cancelled) return;
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
     state.cancelSuspensions?.delete(toolCallId);
     await session.respondToToolSuspension({ toolCallId, resumeData: approved ? 'Yes' : 'No' });
     return;
@@ -289,13 +309,74 @@ async function handleToolSuspended(
     } catch {
       // A missing answer never grants permission.
     }
-    if (state.finished || state.cancelled) return;
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
     state.cancelSuspensions?.delete(toolCallId);
     await session.respondToToolSuspension({ toolCallId, resumeData: { action } });
     return;
   }
 
-  throw new Error(`Tool "${toolName}" requires an interaction that this ACP server does not support`);
+  if (toolName === 'ask_user') {
+    if (!state.supportsElicitation || !connection.unstable_createElicitation) {
+      failTurn(state, session, new Error('The ACP client does not support Mastra Code questions'));
+      return;
+    }
+    const payload = parseAskUserPayload(suspendPayload);
+    if (!payload) {
+      failTurn(state, session, new Error('Mastra Code question payload is invalid'));
+      return;
+    }
+
+    // ask_user resumes with labels, not option IDs. Equal labels are the same
+    // native answer and must not create overlapping oneOf branches.
+    const answerOptions = [...new Set(payload.options.map(option => option.label))].map(label => ({
+      const: label,
+      title: label,
+    }));
+    const answerSchema: ElicitationPropertySchema = answerOptions.length
+      ? payload.selectionMode === 'multi_select'
+        ? {
+            type: 'array',
+            title: 'Your answer',
+            items: { anyOf: answerOptions },
+            minItems: 1,
+          }
+        : {
+            type: 'string',
+            title: 'Your answer',
+            oneOf: answerOptions,
+          }
+      : { type: 'string', title: 'Your answer' };
+
+    const response = await connection.unstable_createElicitation({
+      sessionId: state.sessionId,
+      toolCallId,
+      mode: 'form',
+      message: payload.question,
+      requestedSchema: {
+        type: 'object',
+        title: 'Mastra Code question',
+        properties: { answer: answerSchema },
+        required: ['answer'],
+      },
+    });
+
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
+    if (response.action !== 'accept') {
+      // Core persists a denial for parked tools before emitting agent_end.
+      // Do not release the ACP turn while that asynchronous settlement is pending.
+      session.abort();
+      return;
+    }
+    const answer = response.content?.answer;
+    if (typeof answer !== 'string' && !(Array.isArray(answer) && answer.every(item => typeof item === 'string'))) {
+      failTurn(state, session, new Error('Mastra Code question response is invalid'));
+      return;
+    }
+    await session.respondToToolSuspension({ toolCallId, resumeData: answer });
+    return;
+  }
+
+  throw new Error('This ACP server does not support the suspended tool interaction');
 }
 
 function failTurn(state: PromptState, session: Session, error: unknown): void {
@@ -315,4 +396,27 @@ function accumulateUsage(target: TokenUsage, usage: TokenUsage): void {
   if (usage.cacheCreationInputTokens) {
     target.cacheCreationInputTokens = (target.cacheCreationInputTokens ?? 0) + usage.cacheCreationInputTokens;
   }
+}
+
+function parseAskUserPayload(value: unknown): {
+  question: string;
+  options: Array<{ label: string }>;
+  selectionMode: 'single_select' | 'multi_select';
+} | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const payload = value as { question?: unknown; options?: unknown; selectionMode?: unknown };
+  if (typeof payload.question !== 'string' || !payload.question.trim()) return null;
+  const options = Array.isArray(payload.options)
+    ? payload.options.flatMap(option =>
+        option && typeof option === 'object' && typeof (option as { label?: unknown }).label === 'string'
+          ? [{ label: (option as { label: string }).label }]
+          : [],
+      )
+    : [];
+  const selectionMode = payload.selectionMode === 'multi_select' ? 'multi_select' : 'single_select';
+  if (payload.options !== undefined && (!Array.isArray(payload.options) || options.length !== payload.options.length)) {
+    return null;
+  }
+  if (options.length === 0 && payload.selectionMode !== undefined) return null;
+  return { question: payload.question, options, selectionMode };
 }

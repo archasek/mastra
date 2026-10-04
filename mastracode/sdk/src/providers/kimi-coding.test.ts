@@ -101,7 +101,7 @@ describe('Kimi For Coding model provider', () => {
     const deviceId = 'f'.repeat(32);
     try {
       const storage = new AuthStorage(authPath);
-      storage.set('kimi-for-coding', {
+      await storage.set('kimi-for-coding', {
         type: 'oauth',
         access: 'expired-token',
         refresh: 'old-refresh-token',
@@ -145,7 +145,7 @@ describe('Kimi For Coding model provider', () => {
     const deviceId = 'e'.repeat(32);
     try {
       const storage = new AuthStorage(authPath);
-      storage.set('kimi-for-coding', {
+      await storage.set('kimi-for-coding', {
         type: 'oauth',
         access: 'access-token',
         refresh: 'refresh-token',

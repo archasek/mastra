@@ -67,37 +67,40 @@ describe('resumeThreadOnStartup', () => {
     expect(state.pendingNewThread).toBe(true);
   });
 
-  it('reports a locked requested thread and unbinds the auto-selected thread', async () => {
-    const latest = createThread('thread-latest', 'Latest', '2026-08-28T11:00:00Z');
-    const requested = createThread('thread-requested', 'Requested', '2026-08-28T10:00:00Z');
-    const switchThread = vi.fn().mockRejectedValue(new ThreadLockError('thread-requested', 4321));
-    const clearAndReleaseLock = vi.fn().mockResolvedValue(undefined);
-    const state = {
-      projectInfo: { rootPath: '/tmp/project' },
-      pendingNewThread: false,
-      controller: { setResourceId: vi.fn() },
-      session: {
-        identity: { getResourceId: vi.fn(() => 'resource-1') },
-        thread: {
-          getId: vi.fn(() => 'thread-latest'),
-          list: vi.fn().mockResolvedValue([latest, requested]),
-          switch: switchThread,
-          cleanupSubscription: vi.fn(),
-          clearAndReleaseLock,
+  it.each([4321, null])(
+    'reports a locked requested thread with owner PID %s and unbinds the auto-selected thread',
+    async ownerPid => {
+      const latest = createThread('thread-latest', 'Latest', '2026-08-28T11:00:00Z');
+      const requested = createThread('thread-requested', 'Requested', '2026-08-28T10:00:00Z');
+      const switchThread = vi.fn().mockRejectedValue(new ThreadLockError('thread-requested', ownerPid));
+      const clearAndReleaseLock = vi.fn().mockResolvedValue(undefined);
+      const state = {
+        projectInfo: { rootPath: '/tmp/project' },
+        pendingNewThread: false,
+        controller: { setResourceId: vi.fn() },
+        session: {
+          identity: { getResourceId: vi.fn(() => 'resource-1') },
+          thread: {
+            getId: vi.fn(() => 'thread-latest'),
+            list: vi.fn().mockResolvedValue([latest, requested]),
+            switch: switchThread,
+            cleanupSubscription: vi.fn(),
+            clearAndReleaseLock,
+          },
         },
-      },
-    } as any;
+      } as any;
 
-    await expect(resumeThreadOnStartup(state, 'thread-requested')).resolves.toEqual({
-      kind: 'locked',
-      threadId: 'thread-requested',
-      title: 'Requested',
-      ownerPid: 4321,
-    });
-    expect(state.controller.setResourceId).not.toHaveBeenCalled();
-    expect(clearAndReleaseLock).toHaveBeenCalled();
-    expect(state.pendingNewThread).toBe(true);
-  });
+      await expect(resumeThreadOnStartup(state, 'thread-requested')).resolves.toEqual({
+        kind: 'locked',
+        threadId: 'thread-requested',
+        title: 'Requested',
+        ownerPid,
+      });
+      expect(state.controller.setResourceId).not.toHaveBeenCalled();
+      expect(clearAndReleaseLock).toHaveBeenCalled();
+      expect(state.pendingNewThread).toBe(true);
+    },
+  );
 
   it('restores the original resource when a cross-resource requested thread is locked', async () => {
     const requested = {
