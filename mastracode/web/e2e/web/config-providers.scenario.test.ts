@@ -35,7 +35,7 @@ describe('web provider listing (TUI /api-keys parity)', () => {
   });
 
   it('classifies a stored key as source "stored"', async () => {
-    auth.setStoredApiKey('acme', 'sk-123');
+    await auth.setStoredApiKey('acme', 'sk-123');
     const providers = await listProviders({
       controller: catalog([{ provider: 'acme', hasApiKey: true }]),
       authStorage: auth,
@@ -75,7 +75,7 @@ describe('web provider listing (TUI /api-keys parity)', () => {
 
   it('prefers a stored key over an env var for the same provider', async () => {
     process.env[ENV_VAR] = 'sk-from-env';
-    auth.setStoredApiKey('acme', 'sk-stored');
+    await auth.setStoredApiKey('acme', 'sk-stored');
     const providers = await listProviders({
       controller: catalog([{ provider: 'acme', hasApiKey: true, apiKeyEnvVar: ENV_VAR }]),
       authStorage: auth,
@@ -84,9 +84,9 @@ describe('web provider listing (TUI /api-keys parity)', () => {
   });
 
   it('removing a stored key clears it from storage', async () => {
-    auth.setStoredApiKey('acme', 'sk-123');
+    await auth.setStoredApiKey('acme', 'sk-123');
     expect(auth.hasStoredApiKey('acme')).toBe(true);
-    auth.remove('apikey:acme');
+    await auth.remove('apikey:acme');
     expect(auth.hasStoredApiKey('acme')).toBe(false);
   });
 });

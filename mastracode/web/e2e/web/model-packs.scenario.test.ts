@@ -54,7 +54,7 @@ describe('web model packs (TUI /models-pack parity)', () => {
     // anthropic access comes from a credential stored under the bare provider id
     // (mirrors `/login` storing an api_key or oauth cred), matching the TUI's
     // accessLevel('anthropic') derivation.
-    auth.set('anthropic', { type: 'api_key', key: 'sk-ant' });
+    await auth.set('anthropic', { type: 'api_key', key: 'sk-ant' });
     const access = await buildProviderAccess({
       controller: catalog([{ provider: 'anthropic', hasApiKey: true }]),
       authStorage: auth,
