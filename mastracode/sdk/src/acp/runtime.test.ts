@@ -69,9 +69,40 @@ describe('ACP HTTP MCP mapping', () => {
         { name: 'local-tools', type: 'http', url: 'http://127.0.0.1:4312/mcp', headers: [] },
       ]),
     ).toEqual({
-      'hq-tools': { url: 'https://mcp.example.com/tools', headers: { Authorization: 'Bearer test-token' } },
-      'local-tools': { url: 'http://127.0.0.1:4312/mcp' },
+      'hq-tools': {
+        url: 'https://mcp.example.com/tools',
+        headers: { Authorization: 'Bearer test-token' },
+        allowedHosts: ['mcp.example.com'],
+        fetch: expect.any(Function),
+      },
+      'local-tools': {
+        url: 'http://127.0.0.1:4312/mcp',
+        allowedHosts: ['127.0.0.1:4312'],
+        fetch: expect.any(Function),
+      },
     });
+  });
+
+  it('pins ACP transport to the validated origin and refuses redirect following', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('ok'));
+    try {
+      const config = mapAcpMcpServers([
+        { name: 'guarded', type: 'http', url: 'https://mcp.example.com/tools', headers: [] },
+      ]).guarded!;
+      await config.fetch!('https://mcp.example.com/tools', { redirect: 'follow' });
+      expect(fetch).toHaveBeenCalledWith(new URL('https://mcp.example.com/tools'), { redirect: 'error' });
+      for (const target of [
+        'https://other.example.com/tools',
+        'http://mcp.example.com/tools',
+        'http://127.0.0.1/tools',
+        'https://mcp.example.com:444/tools',
+      ]) {
+        expect(() => config.fetch!(target)).toThrow('outside the validated origin');
+      }
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   it.each([
@@ -182,6 +213,9 @@ describe('ACP runtime factory', () => {
     expect(boot.closeStorage).toHaveBeenCalledOnce();
     expect(boot.shutdown.mock.invocationCallOrder[0]).toBeLessThan(boot.stopWorkers.mock.invocationCallOrder[0]!);
     expect(boot.shutdown.mock.invocationCallOrder[0]).toBeLessThan(boot.closeStorage.mock.invocationCallOrder[0]!);
+    expect(boot.shutdown.mock.invocationCallOrder[0]).toBeLessThan(
+      boot.session.thread.clearAndReleaseLock.mock.invocationCallOrder[0]!,
+    );
   });
 
   it('binds resume to the exact existing thread and refuses to create a replacement', async () => {

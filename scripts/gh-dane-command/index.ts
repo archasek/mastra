@@ -130,7 +130,7 @@ async function main(): Promise<never> {
   const exitCode = runResult.exitCode;
 
   // Cleanup
-  releaseAllThreadLocks();
+  await releaseAllThreadLocks();
   await Promise.allSettled([mcpManager?.disconnect(), controller?.stopIntervals()]);
 
   process.exit(exitCode);

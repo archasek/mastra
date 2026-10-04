@@ -12,6 +12,7 @@ import { getAppDataDir } from './project.js';
 
 type ProperLockfile = {
   lock: (targetPath: string, options: Record<string, unknown>) => Promise<() => Promise<void>>;
+  unlockSync: (targetPath: string, options: Record<string, unknown>) => void;
 };
 
 const require = createRequire(import.meta.url);
@@ -135,8 +136,11 @@ export async function acquireThreadLock(threadId: string): Promise<void> {
       update: 30_000,
       retries: 0,
     });
-  } catch {
-    throw new ThreadLockError(threadId, readOwnerPid(targetPath));
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ELOCKED') {
+      throw new ThreadLockError(threadId, readOwnerPid(targetPath));
+    }
+    throw error;
   }
 
   try {
@@ -186,6 +190,19 @@ export async function releaseAllThreadLocks(): Promise<void> {
       if (ownedLocks.get(targetPath) === owned) ownedLocks.delete(targetPath);
     } catch {
       // Best-effort cleanup; a crashed holder's lease expires automatically.
+    }
+  }
+}
+
+/** Exit-event fallback: Node cannot await asynchronous cleanup at this point. */
+export function releaseAllThreadLocksSync(): void {
+  for (const [targetPath, owned] of [...ownedLocks]) {
+    try {
+      if (readOwnerPid(targetPath) === process.pid) fs.unlinkSync(targetPath);
+      properLockfile.unlockSync(targetPath, { realpath: false });
+      if (ownedLocks.get(targetPath) === owned) ownedLocks.delete(targetPath);
+    } catch {
+      // A failed release remains owned; its lease expires after process exit.
     }
   }
 }

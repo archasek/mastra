@@ -378,6 +378,8 @@ export function createMcpManager(
           url: new URL(httpCfg.url),
           requestInit: httpCfg.headers ? { headers: httpCfg.headers } : undefined,
           authProvider: createOAuthProvider(name, httpCfg),
+          ...(httpCfg.allowedHosts ? { allowedHosts: httpCfg.allowedHosts } : {}),
+          ...(httpCfg.fetch ? { fetch: httpCfg.fetch } : {}),
         };
       } else {
         defs[name] = {

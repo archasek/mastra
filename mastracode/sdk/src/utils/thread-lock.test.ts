@@ -1,17 +1,46 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 
-import { acquireThreadLock, releaseAllThreadLocks, releaseThreadLock, ThreadLockError } from './thread-lock.js';
+import {
+  acquireThreadLock,
+  releaseAllThreadLocks,
+  releaseAllThreadLocksSync,
+  releaseThreadLock,
+  ThreadLockError,
+} from './thread-lock.js';
 
 let root: string | undefined;
 
 afterEach(async () => {
   await releaseAllThreadLocks();
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
+});
+
+it('releases owned leases synchronously before process exit', async () => {
+  root = mkdtempSync(join(tmpdir(), 'mastracode-thread-lock-'));
+  const appDataDir = join(root, 'app-data');
+  vi.stubEnv('MASTRA_APP_DATA_DIR', appDataDir);
+  await acquireThreadLock('exit-thread');
+  releaseAllThreadLocksSync();
+  expect(existsSync(join(appDataDir, 'locks', 'exit-thread.lock'))).toBe(false);
+  expect(existsSync(join(appDataDir, 'locks', 'exit-thread'))).toBe(false);
+  await acquireThreadLock('exit-thread');
+  await releaseThreadLock('exit-thread');
+});
+
+it('preserves filesystem acquisition errors rather than reporting contention', async () => {
+  root = mkdtempSync(join(tmpdir(), 'mastracode-thread-lock-'));
+  vi.stubEnv('MASTRA_APP_DATA_DIR', join(root, 'app-data'));
+  const library = createRequire(import.meta.url)('proper-lockfile');
+  const error = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
+  vi.spyOn(library, 'lock').mockRejectedValueOnce(error);
+  await expect(acquireThreadLock('error-thread')).rejects.toBe(error);
 });
 
 it('does not create app data when there are no locks', async () => {

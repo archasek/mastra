@@ -21,7 +21,7 @@ import {
 } from '@mastra/code-sdk/process-memory-diagnostics';
 import { setupDebugLogging, truncateLogFile } from '@mastra/code-sdk/utils/debug-log';
 import { drainPipedStdin, reopenStdinFromTTY } from '@mastra/code-sdk/utils/stdin-pipe';
-import { releaseAllThreadLocks } from '@mastra/code-sdk/utils/thread-lock';
+import { releaseAllThreadLocks, releaseAllThreadLocksSync } from '@mastra/code-sdk/utils/thread-lock';
 import { TUI_CO_AUTHOR } from './commit-attribution.js';
 import { initialMessageOptions, pipedInputConflict, takeInitialPrompt } from './initial-prompt.js';
 import {
@@ -208,7 +208,6 @@ async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> 
 
 const asyncCleanup = (): Promise<void> => {
   cleanupPromise ??= (async () => {
-    await releaseAllThreadLocks();
     // Stop plugin-contributed signal providers (and the plugin reload listener)
     // before quiescing workers: a provider that keeps polling past this point
     // could dispatch into a controller that is shutting down.
@@ -244,6 +243,9 @@ const asyncCleanup = (): Promise<void> => {
       });
     }
     await diagnosticsShutdown;
+    // Retain thread ownership until all producers and storage have drained.
+    // The synchronous exit handler remains the fallback for forced exits.
+    await releaseAllThreadLocks();
   })();
   return cleanupPromise;
 };
@@ -283,7 +285,7 @@ process.on('exit', () => {
       // session state or stdout may already be closed during exit
     }
   }
-  releaseAllThreadLocks();
+  releaseAllThreadLocksSync();
 });
 
 // Start durable diagnostics shutdown before synchronous TUI teardown so a stalled

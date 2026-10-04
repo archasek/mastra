@@ -149,6 +149,16 @@ export function mapAcpMcpServers(servers: McpServer[]): Record<string, McpHttpSe
     mapped[server.name] = {
       url: url.toString(),
       ...(Object.keys(headers).length ? { headers } : {}),
+      allowedHosts: [url.host],
+      fetch: (target, init) => {
+        const destination = new URL(target);
+        if (destination.origin !== url.origin || destination.username || destination.password) {
+          throw new Error('ACP MCP transport target is outside the validated origin');
+        }
+        // Fail before following any redirect; custom auth headers never leave
+        // the explicitly validated HTTPS or loopback HTTP endpoint.
+        return globalThis.fetch(destination, { ...init, redirect: 'error' });
+      },
     };
   }
   return mapped;
@@ -172,7 +182,6 @@ async function cleanupRuntime(result: Awaited<ReturnType<typeof bootLocalAgentCo
 
   await attempt(() => result.session.abort());
   await attempt(() => result.session.thread.detachFromCurrent());
-  await attempt(() => result.session.thread.clearAndReleaseLock());
   await attempt(() => result.stopPluginSignalProviders());
   await attempt(() => result.githubSignals?.stopAllPolling());
   await attempt(() => result.stopNotificationDispatch());
@@ -180,6 +189,8 @@ async function cleanupRuntime(result: Awaited<ReturnType<typeof bootLocalAgentCo
   const closeSignalsPubSub = (result.signalsPubSub as { close?: () => Promise<void> | void } | undefined)?.close;
   // Shutdown drains durable work and needs workers/storage to remain available.
   await attempt(() => result.controller.getMastra()?.shutdown());
+  // Keep exclusive thread ownership while shutdown persists aborted suspensions.
+  await attempt(() => result.session.thread.clearAndReleaseLock());
   const settled = await Promise.allSettled([
     Promise.resolve().then(() => result.mcpManager?.disconnect()),
     Promise.resolve().then(() => result.controller.getMastra()?.stopWorkers()),

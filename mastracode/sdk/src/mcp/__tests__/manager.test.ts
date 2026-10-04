@@ -162,9 +162,12 @@ describe('createMcpManager', () => {
     });
 
     it('builds http server def with URL object and requestInit', async () => {
+      const fetch = vi.fn().mockResolvedValue(new Response('ok'));
       const httpConfig: McpHttpServerConfig = {
         url: 'https://mcp.example.com/sse',
         headers: { Authorization: 'Bearer tok' },
+        allowedHosts: ['mcp.example.com'],
+        fetch,
       };
       setupConfig({ mcpServers: { remote: httpConfig } });
 
@@ -177,6 +180,8 @@ describe('createMcpManager', () => {
       await manager.init();
 
       const call = MockedMCPClient.mock.calls[0]![0]!;
+      expect(call.servers.remote.allowedHosts).toEqual(['mcp.example.com']);
+      expect(call.servers.remote.fetch).toBe(fetch);
       const serverDef = call.servers['remote'] as any;
       expect(serverDef.url).toBeInstanceOf(URL);
       expect(serverDef.url.href).toBe('https://mcp.example.com/sse');
