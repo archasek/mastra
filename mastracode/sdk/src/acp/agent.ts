@@ -19,7 +19,13 @@ import type {
   SetSessionConfigOptionResponse,
   AvailableCommand,
 } from '@agentclientprotocol/sdk';
-import type { AgentController, AgentControllerMode, MastraDBMessage, Session } from '@mastra/core/agent-controller';
+import type {
+  AgentController,
+  AgentControllerEvent,
+  AgentControllerMode,
+  MastraDBMessage,
+  Session,
+} from '@mastra/core/agent-controller';
 import { getAvailableThinkingLevelsForModel, isThinkingLevelSetting } from '../thinking.js';
 import type { ThinkingLevelSetting } from '../thinking.js';
 import { getCurrentVersion } from '../utils/update-check.js';
@@ -43,6 +49,7 @@ export type AcpSessionFactory = (request: NewSessionRequest | LoadSessionRequest
 interface SessionEntry extends AcpSessionRuntime {
   models: { modelId: string; name: string }[];
   state: PromptState | null;
+  continuationState?: PromptState;
   queue: Promise<void>;
   turns: Set<{ cancelled: boolean }>;
   unsubscribe: () => void;
@@ -90,6 +97,11 @@ export class MastraCodeAcpAgent implements Agent {
       Promise.allSettled([...this.pendingCreations]),
       ...entries.map(async entry => {
         for (const turn of entry.turns) turn.cancelled = true;
+        if (entry.continuationState) {
+          entry.continuationState.cancelled = true;
+          entry.continuationState.resolve('aborted');
+          entry.session.abort();
+        }
         if (entry.state) {
           entry.state.cancelled = true;
           entry.session.abort();
@@ -216,6 +228,7 @@ export class MastraCodeAcpAgent implements Agent {
     this.pendingLoads.add(request.sessionId);
     let runtime: AcpSessionRuntime | undefined;
     let entry: SessionEntry | undefined;
+    let stopCapture: (() => void) | undefined;
     try {
       runtime = await this.createSession(request);
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
@@ -223,13 +236,103 @@ export class MastraCodeAcpAgent implements Agent {
       if (runtime.session.thread.getId() !== request.sessionId) {
         throw RequestError.invalidParams(undefined, 'ACP session not found');
       }
+      const captured: AgentControllerEvent[] = [];
+      stopCapture = runtime.session.subscribe(event => {
+        captured.push(event.type === 'message_start' ? { ...event, message: structuredClone(event.message) } : event);
+      });
+      // This synchronous snapshot and subscription share one event-loop boundary.
+      // Stored history can include later deltas; use the captured message identity
+      // instead of replaying that newer row and then duplicating its live deltas.
+      const display = runtime.session.displayState?.get();
+      const current = display?.currentMessage;
+      const initialMessage = current ? structuredClone(current) : undefined;
+      const pendingInteractions: AgentControllerEvent[] = [
+        ...[...(display?.pendingApprovals?.values() ?? [])].map(approval => ({
+          type: 'tool_approval_required' as const,
+          ...structuredClone(approval),
+        })),
+        ...[...(display?.pendingSuspensions?.values() ?? [])].map(suspension => ({
+          type: 'tool_suspended' as const,
+          ...structuredClone(suspension),
+        })),
+      ];
       const messages = await runtime.session.thread.listMessages({ threadId: request.sessionId });
-      await this.replayHistory(request.sessionId, messages);
-      entry = await this.registerSession(request.sessionId, runtime);
+      const capturedIds = new Set(
+        captured.flatMap(event => (event.type === 'message_start' ? [event.message.id] : [])),
+      );
+      if (initialMessage) capturedIds.add(initialMessage.id);
+      const replayedIds = new Set<string>();
+      for (const message of messages) {
+        if (capturedIds.has(message.id)) continue;
+        await this.replayHistory(request.sessionId, [message]);
+        replayedIds.add(message.id);
+      }
+      entry = await this.registerSession(request.sessionId, runtime, false);
+      if (initialMessage) {
+        await this.replayHistory(request.sessionId, [initialMessage]);
+        replayedIds.add(initialMessage.id);
+        this.handleSessionEvent(request.sessionId, entry, { type: 'message_start', message: initialMessage });
+      }
+      const deliveredInteractions = new Set<string>();
+      const obsoleteInteraction = (toolCallId: string, after: number): boolean =>
+        captured
+          .slice(after + 1)
+          .some(
+            next =>
+              (next.type === 'agent_end' && next.reason !== 'suspended') ||
+              ((next.type === 'tool_end' || next.type === 'tool_suspension_cancelled') &&
+                next.toolCallId === toolCallId),
+          );
+      for (const event of pendingInteractions) {
+        if (event.type !== 'tool_approval_required' && event.type !== 'tool_suspended') continue;
+        if (obsoleteInteraction(event.toolCallId, -1)) continue;
+        // A captured transition is newer than the initial parked snapshot.
+        if (captured.some(next => 'toolCallId' in next && next.toolCallId === event.toolCallId)) continue;
+        deliveredInteractions.add(`${event.type}:${event.toolCallId}`);
+        this.handleSessionEvent(request.sessionId, entry, event);
+      }
+      for (let index = 0; index < captured.length; index++) {
+        if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
+        const event = captured[index]!;
+        if (event.type === 'message_start' && !replayedIds.has(event.message.id)) {
+          await this.replayHistory(request.sessionId, [event.message]);
+          replayedIds.add(event.message.id);
+        }
+        if (event.type === 'tool_approval_required' || event.type === 'tool_suspended') {
+          if (obsoleteInteraction(event.toolCallId, index)) continue;
+          const key = `${event.type}:${event.toolCallId}`;
+          if (deliveredInteractions.has(key)) continue;
+          deliveredInteractions.add(key);
+        }
+        this.handleSessionEvent(request.sessionId, entry, event);
+      }
+      if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
+      // Handoff is synchronous: there is no await or unobserved event between
+      // the private capture and the public subscription.
+      const unsubscribeCapture = stopCapture;
+      stopCapture = undefined;
+      unsubscribeCapture();
+      entry.unsubscribe = runtime.session.subscribe(event => this.handleSessionEvent(request.sessionId, entry!, event));
+      this.sessions.set(request.sessionId, entry);
       const response = this.sessionInfo(entry);
       this.scheduleCommandRefresh(request.sessionId, entry);
       return response;
     } catch (error) {
+      // Revoke private callbacks before attempting any cleanup, including an
+      // unsubscribe implementation which itself throws.
+      if (entry?.continuationState) {
+        entry.continuationState.cancelled = true;
+        entry.continuationState.resolve('aborted');
+      }
+      if (stopCapture) {
+        try {
+          stopCapture();
+        } catch (unsubscribeError) {
+          if (this.disposed) this.startupCleanupFailures.push(unsubscribeError);
+          else error = withCleanupFailure(error, unsubscribeError);
+        }
+        stopCapture = undefined;
+      }
       if (entry) {
         this.sessions.delete(request.sessionId);
         try {
@@ -256,7 +359,7 @@ export class MastraCodeAcpAgent implements Agent {
     }
   }
 
-  private async registerSession(sessionId: string, runtime: AcpSessionRuntime): Promise<SessionEntry> {
+  private async registerSession(sessionId: string, runtime: AcpSessionRuntime, publish = true): Promise<SessionEntry> {
     if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
     let models: NewSessionResponse['models'];
     try {
@@ -294,31 +397,57 @@ export class MastraCodeAcpAgent implements Agent {
       unsubscribe: () => {},
       commands: [],
     };
-    entry.unsubscribe = runtime.session.subscribe(event => {
-      handleAgentControllerEvent(event, entry.state, this.connection, entry.session);
-      if (event.type === 'mode_changed') {
-        void this.connection
-          .sessionUpdate({
-            sessionId,
-            update: { sessionUpdate: 'current_mode_update', currentModeId: entry.session.mode.get() },
-          })
-          .catch(() => process.stderr.write('[acp] Mode update delivery failed.\n'));
-      }
-      if (
-        event.type === 'mode_changed' ||
-        event.type === 'model_changed' ||
-        (event.type === 'state_changed' && event.changedKeys.includes('thinkingLevel'))
-      ) {
-        void this.connection
-          .sessionUpdate({
-            sessionId,
-            update: { sessionUpdate: 'config_option_update', configOptions: this.configOptions(entry) },
-          })
-          .catch(() => process.stderr.write('[acp] Configuration update delivery failed.\n'));
-      }
-    });
-    this.sessions.set(sessionId, entry);
+    if (publish) {
+      entry.unsubscribe = runtime.session.subscribe(event => this.handleSessionEvent(sessionId, entry, event));
+      this.sessions.set(sessionId, entry);
+    }
     return entry;
+  }
+
+  private handleSessionEvent(sessionId: string, entry: SessionEntry, event: AgentControllerEvent): void {
+    // Durable continuations emit outside an ACP prompt request. They still
+    // require a mapper state, but must not resolve or overwrite a prompt.
+    if (
+      !entry.state &&
+      (event.type === 'agent_start' ||
+        event.type === 'message_start' ||
+        event.type === 'tool_approval_required' ||
+        event.type === 'tool_suspended')
+    ) {
+      if (!entry.continuationState || entry.continuationState.finished) {
+        const state: PromptState = {
+          sessionId,
+          supportsElicitation: this.supportsElicitation,
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          isActive: () => !this.disposed && entry.continuationState === state && !state.finished,
+          resolve: () => {
+            state.finished = true;
+          },
+        };
+        entry.continuationState = state;
+      }
+    }
+    handleAgentControllerEvent(event, entry.state ?? entry.continuationState ?? null, this.connection, entry.session);
+    if (event.type === 'mode_changed') {
+      void this.connection
+        .sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'current_mode_update', currentModeId: entry.session.mode.get() },
+        })
+        .catch(() => process.stderr.write('[acp] Mode update delivery failed.\n'));
+    }
+    if (
+      event.type === 'mode_changed' ||
+      event.type === 'model_changed' ||
+      (event.type === 'state_changed' && event.changedKeys.includes('thinkingLevel'))
+    ) {
+      void this.connection
+        .sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'config_option_update', configOptions: this.configOptions(entry) },
+        })
+        .catch(() => process.stderr.write('[acp] Configuration update delivery failed.\n'));
+    }
   }
 
   private scheduleCommandRefresh(sessionId: string, entry: SessionEntry): void {
@@ -349,10 +478,12 @@ export class MastraCodeAcpAgent implements Agent {
 
   private async replayHistory(sessionId: string, messages: MastraDBMessage[]): Promise<void> {
     for (const message of messages) {
+      if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
       if (message.role !== 'user' && message.role !== 'assistant') continue;
       const sessionUpdate: 'user_message_chunk' | 'agent_message_chunk' =
         message.role === 'user' ? 'user_message_chunk' : 'agent_message_chunk';
       for (const replayPart of getReplayParts(message)) {
+        if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
         const update =
           replayPart.kind === 'tool'
             ? { sessionUpdate: 'tool_call' as const, ...replayPart.toolCall }
@@ -510,8 +641,8 @@ export class MastraCodeAcpAgent implements Agent {
     const entry = this.sessions.get(notification.sessionId);
     if (!entry) return;
     for (const turn of entry.turns) turn.cancelled = true;
-    if (entry.state && !entry.state.finished && !entry.state.cancelled) {
-      const state = entry.state;
+    const state = entry.state ?? entry.continuationState;
+    if (state && !state.finished && !state.cancelled) {
       state.cancelled = true;
       // Persist denial before aborting, otherwise a parked snapshot can replay on the next turn.
       for (const deny of state.cancelSuspensions?.values() ?? []) {
@@ -522,12 +653,12 @@ export class MastraCodeAcpAgent implements Agent {
         }
       }
       state.cancelSuspensions?.clear();
-      if (entry.state !== state) return;
+      if ((entry.state ?? entry.continuationState) !== state) return;
       entry.session.abort();
       // A suspended run has already ended and will not emit another agent_end.
-      if (entry.state?.suspended) {
+      if (state.suspended) {
         entry.session.stream.detach();
-        entry.state.resolve('aborted');
+        state.resolve('aborted');
       }
     }
   }

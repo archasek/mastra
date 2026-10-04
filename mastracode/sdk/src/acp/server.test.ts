@@ -33,15 +33,17 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('ACP server shutdown', () => {
-  it('waits for cleanup once when multiple signals arrive', async () => {
+  it.each(['SIGINT', 'SIGTERM', 'SIGHUP'] as const)('waits for cleanup once when %s arrives first', async signal => {
     const closed = Promise.withResolvers<void>();
     const cleanup = Promise.withResolvers<void>();
     state.closed = closed.promise;
     state.dispose.mockReturnValue(cleanup.promise);
     const server = runAcpServer(vi.fn());
     try {
+      process.emit(signal, signal);
       process.emit('SIGINT', 'SIGINT');
       process.emit('SIGTERM', 'SIGTERM');
+      process.emit('SIGHUP', 'SIGHUP');
       await Promise.resolve();
       expect(state.dispose).toHaveBeenCalledTimes(1);
       expect(process.exit).not.toHaveBeenCalled();
@@ -54,28 +56,31 @@ describe('ACP server shutdown', () => {
     }
   });
 
-  it('keeps signal handling installed while EOF cleanup is pending', async () => {
-    const closed = Promise.withResolvers<void>();
-    const cleanup = Promise.withResolvers<void>();
-    state.closed = closed.promise;
-    state.dispose.mockReturnValue(cleanup.promise);
-    const initialListeners = process.listenerCount('SIGTERM');
-    const server = runAcpServer(vi.fn());
-    try {
-      closed.resolve();
-      await vi.waitFor(() => expect(state.dispose).toHaveBeenCalledOnce());
-      expect(process.listenerCount('SIGTERM')).toBe(initialListeners + 1);
-      process.emit('SIGTERM', 'SIGTERM');
-      expect(process.exit).not.toHaveBeenCalled();
-      cleanup.resolve();
-      await server;
-      await vi.waitFor(() => expect(process.exit).toHaveBeenCalledExactlyOnceWith(0));
-      expect(process.listenerCount('SIGTERM')).toBe(initialListeners);
-    } finally {
-      cleanup.resolve();
-      await server;
-    }
-  });
+  it.each(['SIGINT', 'SIGTERM', 'SIGHUP'] as const)(
+    'keeps %s handling installed while EOF cleanup is pending',
+    async signal => {
+      const closed = Promise.withResolvers<void>();
+      const cleanup = Promise.withResolvers<void>();
+      state.closed = closed.promise;
+      state.dispose.mockReturnValue(cleanup.promise);
+      const initialListeners = process.listenerCount(signal);
+      const server = runAcpServer(vi.fn());
+      try {
+        closed.resolve();
+        await vi.waitFor(() => expect(state.dispose).toHaveBeenCalledOnce());
+        expect(process.listenerCount(signal)).toBe(initialListeners + 1);
+        process.emit(signal, signal);
+        expect(process.exit).not.toHaveBeenCalled();
+        cleanup.resolve();
+        await server;
+        await vi.waitFor(() => expect(process.exit).toHaveBeenCalledExactlyOnceWith(0));
+        expect(process.listenerCount(signal)).toBe(initialListeners);
+      } finally {
+        cleanup.resolve();
+        await server;
+      }
+    },
+  );
 
   it('exits when a signal arrives before the agent is assigned', async () => {
     state.closed = Promise.resolve();

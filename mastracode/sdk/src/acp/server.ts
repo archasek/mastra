@@ -23,6 +23,7 @@ export async function runAcpServer(createSession: AcpSessionFactory, version?: s
   };
   process.on('SIGINT', handleSignal);
   process.on('SIGTERM', handleSignal);
+  process.on('SIGHUP', handleSignal);
   try {
     const connection = new AgentSideConnection(
       conn => {
@@ -38,6 +39,7 @@ export async function runAcpServer(createSession: AcpSessionFactory, version?: s
     } finally {
       process.off('SIGINT', handleSignal);
       process.off('SIGTERM', handleSignal);
+      process.off('SIGHUP', handleSignal);
     }
   }
 }

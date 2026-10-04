@@ -208,7 +208,7 @@ async function handleToolApproval(
 
   try {
     const resp = await connection.requestPermission(req);
-    if (state.finished || state.cancelled) return;
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
     if (resp.outcome.outcome === 'selected') {
       const decision = resp.outcome.optionId === 'approve' ? 'approve' : 'decline';
       session.respondToToolApproval({ decision, toolCallId: event.toolCallId });
@@ -216,7 +216,7 @@ async function handleToolApproval(
       session.respondToToolApproval({ decision: 'decline', toolCallId: event.toolCallId });
     }
   } catch {
-    if (state.finished || state.cancelled) return;
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
     process.stderr.write('[acp] Permission request failed; denying the tool call.\n');
     session.respondToToolApproval({ decision: 'decline', toolCallId: event.toolCallId });
   }
@@ -275,7 +275,7 @@ async function handleToolSuspended(
         approved = false;
       }
     }
-    if (state.finished || state.cancelled) return;
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
     state.cancelSuspensions?.delete(toolCallId);
     await session.respondToToolSuspension({ toolCallId, resumeData: approved ? 'Yes' : 'No' });
     return;
@@ -303,7 +303,7 @@ async function handleToolSuspended(
     } catch {
       // A missing answer never grants permission.
     }
-    if (state.finished || state.cancelled) return;
+    if (state.finished || state.cancelled || state.isActive?.() === false) return;
     state.cancelSuspensions?.delete(toolCallId);
     await session.respondToToolSuspension({ toolCallId, resumeData: { action } });
     return;

@@ -253,7 +253,7 @@ const asyncCleanup = (): Promise<void> => {
 const shutdownAndExit = createShutdownCoordinator(asyncCleanup, exitCode => process.exit(exitCode));
 
 process.on('beforeExit', () => {
-  void asyncCleanup();
+  if (!process.argv.includes('--acp')) void asyncCleanup();
 });
 process.on('exit', () => {
   if (!process.argv.includes('--acp')) {
@@ -300,9 +300,13 @@ const handleTermSignal = () => {
   }
   void shutdownAndExit(0);
 };
-process.on('SIGINT', handleTermSignal);
-process.on('SIGTERM', handleTermSignal);
-process.on('SIGHUP', handleTermSignal);
+// ACP owns its runtime and signal-driven drain. TUI cleanup has no references
+// to that runtime and must not release its leases or exit ahead of its disposer.
+if (!process.argv.includes('--acp')) {
+  process.on('SIGINT', handleTermSignal);
+  process.on('SIGTERM', handleTermSignal);
+  process.on('SIGHUP', handleTermSignal);
+}
 
 function hasEconnrefused(err: unknown, depth = 0): boolean {
   if (!err || depth > 5) return false;

@@ -9,3 +9,5 @@ Fixed shutdown to drain notification delivery and active sessions before stoppin
 Fixed thread ownership during shutdown and synchronous cleanup when a process exits. Lock acquisition preserves errors other than contention. Client-provided HTTP MCP servers cannot redirect requests or send their headers outside the validated origin.
 
 Fixed failed shutdown cleanup to retain thread ownership until storage and transports close. Restored sessions accept new requests only after saved history finishes replaying.
+
+Fixed restored sessions to capture live output during history replay and restore pending tool permissions without duplicate requests. Cancellation and failed restoration invalidate late permission responses. ACP shutdown handles hangup signals without competing terminal cleanup.
