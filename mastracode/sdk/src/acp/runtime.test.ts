@@ -1,5 +1,5 @@
 import type { LoadSessionRequest, McpServer, NewSessionRequest } from '@agentclientprotocol/sdk';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { bootLocalAgentController } from '../index.js';
 import { loadSettings, resolveDefaultThinkingLevel } from '../onboarding/settings.js';
 import { createAcpSession, mapAcpMcpServers } from './runtime.js';
@@ -42,6 +42,7 @@ function bootResult() {
     mcpManager,
     githubSignals: { stopAllPolling: vi.fn() },
     stopPluginSignalProviders: vi.fn(),
+    threadScheduler: { stop: vi.fn() },
     stopNotificationDispatch: vi.fn(async () => {}),
     signalsPubSub: pubsub,
     storageMaintenance: { closeStorage },
@@ -158,6 +159,7 @@ describe('ACP HTTP MCP mapping', () => {
 });
 
 describe('ACP runtime factory', () => {
+  afterEach(() => vi.useRealTimers());
   it('creates an isolated runtime with only the request MCP servers and disables ambient execution/config', async () => {
     const boot = bootResult();
     vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
@@ -204,6 +206,7 @@ describe('ACP runtime factory', () => {
     expect(boot.stopWorkers).toHaveBeenCalledOnce();
     expect(boot.shutdown).toHaveBeenCalledOnce();
     expect(boot.stopPluginSignalProviders).toHaveBeenCalledOnce();
+    expect(boot.threadScheduler.stop).toHaveBeenCalledOnce();
     expect(boot.stopNotificationDispatch).toHaveBeenCalledOnce();
     expect(boot.stopNotificationDispatch.mock.invocationCallOrder[0]).toBeLessThan(
       boot.controller.getMastra().shutdown.mock.invocationCallOrder[0]!,
@@ -252,6 +255,48 @@ describe('ACP runtime factory', () => {
     expect(boot.closePubSub).toHaveBeenCalledOnce();
     expect(boot.session.thread.clearAndReleaseLock).toHaveBeenCalledOnce();
   });
+
+  it.each(['resolve', 'reject'] as const)(
+    'retains ownership beyond the upstream dispatch grace when dispatch later %ss',
+    async late => {
+      vi.useFakeTimers();
+      const boot = bootResult();
+      let finish!: () => void;
+      let fail!: (error: Error) => void;
+      let dispatchStarted!: () => void;
+      const started = new Promise<void>(resolve => {
+        dispatchStarted = resolve;
+      });
+      const dispatch = new Promise<void>((resolve, reject) => {
+        finish = resolve;
+        fail = reject;
+      });
+      boot.stopNotificationDispatch.mockImplementationOnce(() => {
+        expect(boot.threadScheduler.stop).toHaveBeenCalledOnce();
+        expect(boot.stopPluginSignalProviders).toHaveBeenCalledOnce();
+        expect(boot.githubSignals.stopAllPolling).toHaveBeenCalledOnce();
+        dispatchStarted();
+        return dispatch;
+      });
+      vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+      const runtime = await createAcpSession(newRequest());
+      const cleanup = runtime.cleanup!();
+      expect(runtime.cleanup!()).toBe(cleanup);
+      const completed =
+        late === 'reject' ? expect(cleanup).rejects.toMatchObject({ errors: [expect.any(Error)] }) : cleanup;
+      await started;
+      await vi.advanceTimersByTimeAsync(2_001);
+      expect(boot.shutdown).not.toHaveBeenCalled();
+      expect(boot.closeStorage).not.toHaveBeenCalled();
+      expect(boot.session.thread.clearAndReleaseLock).not.toHaveBeenCalled();
+      if (late === 'resolve') finish();
+      else fail(new Error('late dispatch failure'));
+      await completed;
+      expect(boot.shutdown).toHaveBeenCalledOnce();
+      expect(boot.closeStorage).toHaveBeenCalledOnce();
+      expect(boot.session.thread.clearAndReleaseLock).toHaveBeenCalledOnce();
+    },
+  );
 
   it('binds resume to the exact existing thread and refuses to create a replacement', async () => {
     const boot = bootResult();

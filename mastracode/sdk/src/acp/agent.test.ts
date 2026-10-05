@@ -197,7 +197,9 @@ describe('ACP Agent - Sessions and turns', () => {
       currentThreadId =
         options.runtimeThreadId ?? ('sessionId' in request && request.sessionId ? request.sessionId : currentThreadId);
       return {
-        controller: { listAvailableModels: async () => [] } as unknown as AgentController,
+        controller: {
+          listAvailableModels: async () => [{ id: 'test-model', name: 'Test model', hasApiKey: true }],
+        } as unknown as AgentController,
         session,
         modes: [],
         ...(options.getSkills ? { getSkills: options.getSkills } : {}),
@@ -1075,5 +1077,127 @@ describe('ACP Agent - Sessions and turns', () => {
       }),
     ).rejects.toMatchObject({ code: -32602 });
     expect(harness.createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('ACP Agent - Provider authentication', () => {
+  function newSession(models: { id: string; hasApiKey: boolean }[] | Error, currentModelId: string) {
+    const createThread = vi.fn(async () => ({ id: 'thread-1' }));
+    const cleanup = vi.fn().mockResolvedValue(undefined);
+    let modelId = currentModelId;
+    const switchModel = vi.fn(async ({ modelId: next }: { modelId: string }) => {
+      modelId = next;
+    });
+    const session = {
+      subscribe: () => () => {},
+      thread: { getId: () => 'thread-1', create: createThread, switch: async () => {} },
+      mode: { get: () => 'default' },
+      model: { get: () => modelId, switch: switchModel },
+    } as unknown as Session;
+    const agent = new MastraCodeAcpAgent(
+      { sessionUpdate: vi.fn().mockResolvedValue(undefined) } as unknown as AgentSideConnection,
+      async () => ({
+        controller: {
+          listAvailableModels: async () => {
+            if (models instanceof Error) throw models;
+            return models;
+          },
+        } as unknown as AgentController,
+        session,
+        modes: [],
+        cleanup,
+      }),
+    );
+    return { created: agent.newSession({ cwd: '/tmp', mcpServers: [] }), createThread, cleanup, switchModel };
+  }
+
+  it.each([
+    ['no model is selected', ''],
+    ['the selected model has no credentials', 'openai/gpt-5'],
+  ])('requires authentication when no provider is configured and %s', async (_case, currentModelId) => {
+    const { created, createThread, cleanup } = newSession([{ id: 'openai/gpt-5', hasApiKey: false }], currentModelId);
+    await expect(created).rejects.toMatchObject({ code: -32000 });
+    expect(createThread).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['a provider has credentials', [{ id: 'openai/gpt-5', hasApiKey: true }], ''],
+    [
+      'the selected model is a custom model outside the catalog',
+      [{ id: 'openai/gpt-5', hasApiKey: false }],
+      'local/llama',
+    ],
+  ])('starts the session when %s', async (_case, models, currentModelId) => {
+    const { created, createThread } = newSession(models, currentModelId);
+    await expect(created).resolves.toMatchObject({ sessionId: 'thread-1' });
+    expect(createThread).not.toHaveBeenCalled();
+  });
+
+  it('fails session creation when model discovery fails instead of hiding the catalog', async () => {
+    const { created, createThread, cleanup } = newSession(new Error('catalog unavailable'), 'openai/gpt-5');
+    await expect(created).rejects.toThrow('catalog unavailable');
+    expect(createThread).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('moves a new session off a default model without credentials to a signed-in provider default', async () => {
+    const { created, switchModel } = newSession(
+      [
+        { id: 'openai/gpt-5.5', hasApiKey: false },
+        { id: 'anthropic/claude-haiku-4-5', hasApiKey: true },
+        { id: 'xai/grok-4.5', hasApiKey: true },
+      ],
+      'openai/gpt-5.5',
+    );
+    await expect(created).resolves.toMatchObject({ models: { currentModelId: 'xai/grok-4.5' } });
+    expect(switchModel).toHaveBeenCalledWith({ modelId: 'xai/grok-4.5' });
+  });
+
+  it.each([
+    [
+      'the current model has credentials',
+      [
+        { id: 'openai/gpt-5.5', hasApiKey: true },
+        { id: 'xai/grok-4.5', hasApiKey: true },
+      ],
+      'openai/gpt-5.5',
+    ],
+    [
+      'the current model is a custom model outside the catalog',
+      [{ id: 'xai/grok-4.5', hasApiKey: true }],
+      'local/llama',
+    ],
+    [
+      'no provider default has credentials',
+      [
+        { id: 'openai/gpt-5.5', hasApiKey: false },
+        { id: 'groq/llama', hasApiKey: true },
+      ],
+      'openai/gpt-5.5',
+    ],
+  ])('keeps the current model when %s', async (_case, models, currentModelId) => {
+    const { created, switchModel } = newSession(models, currentModelId);
+    await expect(created).resolves.toMatchObject({ models: { currentModelId } });
+    expect(switchModel).not.toHaveBeenCalled();
+  });
+});
+
+describe('ACP Agent - Authentication capabilities', () => {
+  it.each([
+    [undefined, false],
+    [{ auth: { terminal: true } }, true],
+    [{ _meta: { 'terminal-auth': true } }, true],
+  ] as const)('advertises terminal login only when supported: %j', async (clientCapabilities, terminal) => {
+    const agent = new MastraCodeAcpAgent({} as AgentSideConnection, vi.fn());
+    const response = await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities });
+    expect(response.authMethods?.map(method => method.id)).toEqual(
+      terminal
+        ? ['openai-codex', 'kimi-for-coding', 'xai', 'anthropic', 'github-copilot', 'mastracode-login']
+        : ['openai-codex', 'kimi-for-coding', 'xai'],
+    );
+    const login = response.authMethods?.find(method => method.id === 'mastracode-login');
+    if (terminal) expect(login).toMatchObject({ type: 'terminal', args: ['login'] });
+    expect(response.agentCapabilities?.loadSession).toBe(true);
   });
 });

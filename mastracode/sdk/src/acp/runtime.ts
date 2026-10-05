@@ -184,6 +184,8 @@ async function cleanupRuntime(result: Awaited<ReturnType<typeof bootLocalAgentCo
   await attempt(() => result.session.thread.detachFromCurrent());
   await attempt(() => result.stopPluginSignalProviders());
   await attempt(() => result.githubSignals?.stopAllPolling());
+  await attempt(() => result.threadScheduler.stop());
+  // The upstream dispatch grace is not cancellation: retain owned drain before shutdown/release.
   await attempt(() => result.stopNotificationDispatch());
 
   const signalsPubSub = result.signalsPubSub as { close?: () => Promise<void> | void } | undefined;
