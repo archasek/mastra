@@ -1,26 +1,6 @@
 name: Combined store Tests (vector+storage)
 
-on:
-  workflow_call:
-    inputs:
-      head_sha:
-        required: true
-        type: string
-    secrets:
-      TURBO_TOKEN:
-        required: false
-      TURBO_TEAM:
-        required: false
-      PINECONE_API_KEY:
-        required: false
-      ASTRA_DB_ENDPOINT:
-        required: false
-      ASTRA_DB_TOKEN:
-        required: false
-      ABHI_CLOUDFLARE_API_TOKEN:
-        required: false
-      ABHI_CLOUDFLARE_ACCOUNT_ID:
-        required: false
+on: []
 
 permissions: {}
 

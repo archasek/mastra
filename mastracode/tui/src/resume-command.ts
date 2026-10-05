@@ -23,6 +23,11 @@ export function resolveEntrypointMode(
   originalArgv: string[] = argv,
 ): 'command' | 'headless' | 'acp' | 'tui' {
   if (originalArgv[2] === 'plugin' || originalArgv[2] === 'prune') return 'command';
+  // Login dispatch precedes prompt normalization and headless/ACP selection in main.
+  const loginIndex = originalArgv.findIndex(
+    (arg, index) => index >= 2 && arg !== '--acp' && arg !== '--dangerous-auto-approve',
+  );
+  if (originalArgv[loginIndex] === 'login') return 'command';
   let resumeThreadId: string | undefined;
   try {
     resumeThreadId = parseResumeThreadId(argv.slice(2));

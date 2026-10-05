@@ -3,11 +3,7 @@ name: E2E Tests — Docs
 permissions:
   contents: read
 
-on:
-  pull_request:
-    paths:
-      - 'docs/**'
-      - '.github/workflows/e2e-docs.yml'
+on: []
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}

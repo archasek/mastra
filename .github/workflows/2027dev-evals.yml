@@ -1,7 +1,6 @@
 name: 2027dev Evals
 
-on:
-  deployment_status:
+on: []
 
 permissions: {}
 

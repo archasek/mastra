@@ -1,11 +1,6 @@
 name: Changed Test Gate Labeler
 
-on:
-  workflow_run:
-    workflows:
-      - Changed Test Gate
-    types:
-      - completed
+on: []
 
 permissions:
   contents: read

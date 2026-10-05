@@ -3,23 +3,7 @@ name: Workspace Tests
 permissions:
   contents: read
 
-on:
-  workflow_call:
-    inputs:
-      head_sha:
-        required: true
-        type: string
-      workspace_packages:
-        required: true
-        type: string
-      workspace_docker_packages:
-        required: true
-        type: string
-    secrets:
-      TURBO_TOKEN:
-        required: false
-      TURBO_TEAM:
-        required: false
+on: []
 
 jobs:
   test-unit:

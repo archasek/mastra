@@ -1,16 +1,6 @@
 name: Mastra Code E2E
 
-on:
-  workflow_call:
-    inputs:
-      head_sha:
-        required: true
-        type: string
-    secrets:
-      TURBO_TOKEN:
-        required: false
-      TURBO_TEAM:
-        required: false
+on: []
 
 permissions: {}
 

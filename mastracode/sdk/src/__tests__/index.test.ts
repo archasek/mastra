@@ -377,9 +377,10 @@ vi.mock('../onboarding/om-settings.js', () => ({
   hasExplicitOMConfiguration: vi.fn(() => false),
 }));
 
-vi.mock('../onboarding/settings.js', () => ({
+vi.mock('../onboarding/settings.js', async importOriginal => ({
   getCustomProviderId: vi.fn(),
-  parseExperimentalAgentSetting: vi.fn(value => value ?? null),
+  parseExperimentalAgentSetting: (await importOriginal<typeof import('../onboarding/settings.js')>())
+    .parseExperimentalAgentSetting,
   loadSettings: loadSettingsMock,
   MASTRA_GATEWAY_PROVIDER: 'mastra',
   resolveModelDefaults: vi.fn(() => ({ build: '', plan: '', fast: '' })),
@@ -610,6 +611,73 @@ describe('createMastraCode', () => {
 
     expect(createEventedAgentMock).toHaveBeenCalledOnce();
     expect(createDurableAgentMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['durable environment', 'durable', null],
+    ['evented environment', 'evented', null],
+    ['durable native setting', undefined, 'durable'],
+    ['evented native setting', undefined, 'evented'],
+    ['environment over native setting', 'evented', 'durable'],
+    ['environment over malformed native setting', 'durable', 'invalid'],
+    ['empty environment falls back to native setting', '', 'evented'],
+  ] as const)('rejects ACP %s before creating runtime resources', async (_label, environment, setting) => {
+    if (environment !== undefined) process.env.MASTRACODE_EXPERIMENTAL_AGENT = environment;
+    loadSettingsMock.mockReturnValue({ ...createMockSettings(), experimentalAgent: setting });
+    const { AgentController } = await import('@mastra/core/agent-controller');
+    const createSession = vi.spyOn(AgentController.prototype, 'createSession');
+    const { acquireThreadLock } = await import('../utils/thread-lock.js');
+    vi.mocked(acquireThreadLock).mockClear();
+    createSignalsPubSubMock.mockClear();
+    const { bootLocalAgentController } = await import('../index.js');
+
+    try {
+      await expect(bootLocalAgentController({ disallowExperimentalAgent: true })).rejects.toThrow(
+        'Experimental agent mode is not supported by ACP; use the regular agent.',
+      );
+      expect(agentConstructorMock).not.toHaveBeenCalled();
+      expect(controllerConstructorMock).not.toHaveBeenCalled();
+      expect(createDurableAgentMock).not.toHaveBeenCalled();
+      expect(createEventedAgentMock).not.toHaveBeenCalled();
+      expect(createSession).not.toHaveBeenCalled();
+      expect(createdSessionMock).toBeUndefined();
+      expect(createStorageMock).not.toHaveBeenCalled();
+      expect(createSignalsPubSubMock).not.toHaveBeenCalled();
+      expect(acquireThreadLock).not.toHaveBeenCalled();
+      expect(claimThreadOwnershipMock).not.toHaveBeenCalled();
+    } finally {
+      createSession.mockRestore();
+    }
+  });
+
+  it.each([
+    ['malformed environment', 'invalid', 'durable', 'Invalid MASTRACODE_EXPERIMENTAL_AGENT value'],
+    ['malformed native setting', undefined, 'invalid', 'Invalid "experimentalAgent" setting'],
+    ['empty environment with malformed native setting', '', 'invalid', 'Invalid "experimentalAgent" setting'],
+  ] as const)('preserves ACP resolver validation for %s', async (_label, environment, setting, message) => {
+    if (environment !== undefined) process.env.MASTRACODE_EXPERIMENTAL_AGENT = environment;
+    loadSettingsMock.mockReturnValue({ ...createMockSettings(), experimentalAgent: setting });
+    const { bootLocalAgentController } = await import('../index.js');
+
+    await expect(bootLocalAgentController({ disallowExperimentalAgent: true })).rejects.toThrow(message);
+    expect(agentConstructorMock).not.toHaveBeenCalled();
+    expect(controllerConstructorMock).not.toHaveBeenCalled();
+    expect(createdSessionMock).toBeUndefined();
+    expect(claimThreadOwnershipMock).not.toHaveBeenCalled();
+  });
+
+  it('boots the regular ACP agent and restores native thread settings when the experiment is unset', async () => {
+    controllerGetCurrentThreadIdMock.mockReturnValue('thread-1');
+    controllerListThreadsMock.mockResolvedValue([{ id: 'thread-1', metadata: { cavemanObservations: true } }]);
+    const { bootLocalAgentController } = await import('../index.js');
+
+    const result = await bootLocalAgentController({ disallowExperimentalAgent: true });
+
+    expect(result.session).toBe(createdSessionMock);
+    expect(controllerConstructorMock.mock.calls[0]![0].agent).toBe(result.codeAgent);
+    expect(createDurableAgentMock).not.toHaveBeenCalled();
+    expect(createEventedAgentMock).not.toHaveBeenCalled();
+    expect(controllerSetStateMock).toHaveBeenCalledWith({ cavemanObservations: true });
   });
 
   it('drains Mastra shutdown before stopping workers after a failed local boot', async () => {

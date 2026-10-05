@@ -5,15 +5,7 @@ name: Sync Software Factory Template
 # The only difference is a generation step — the Software Factory template is
 # derived from the mastracode/web server scaffold by sync-template.mjs rather
 # than checked in. Its Factory UI is bundled by the Mastra CLI.
-on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'mastracode/web/**'
-      - 'mastracode/mastra-factory/scripts/sync-template.mjs'
-      - 'mastracode/mastra-factory/template/**'
-  workflow_dispatch: # Allow manual triggers
+on: []
 
 jobs:
   sync-template:

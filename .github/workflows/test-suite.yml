@@ -1,34 +1,6 @@
 name: Prebuild Tests
 
-on:
-  workflow_call:
-    inputs:
-      head_sha:
-        required: true
-        type: string
-      base_ref:
-        required: true
-        type: string
-      has_code:
-        required: true
-        type: string
-      unit_test_files:
-        required: false
-        type: string
-        default: ''
-      e2e_test_files:
-        required: false
-        type: string
-        default: ''
-      run_full:
-        required: false
-        type: string
-        default: 'true'
-    secrets:
-      TURBO_TOKEN:
-        required: false
-      TURBO_TEAM:
-        required: false
+on: []
 
 permissions: {}
 

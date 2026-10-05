@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
   acpMain: vi.fn(),
+  login: vi.fn(),
   runMCCli: vi.fn(),
   releaseLocks: vi.fn(),
   diagnostics: vi.fn(),
@@ -13,6 +14,7 @@ vi.mock('@mastra/code-sdk/headless/index', async importOriginal => {
   const original = await importOriginal<Record<string, unknown>>();
   return { ...original, runMCCli: state.runMCCli };
 });
+vi.mock('./login-command.js', () => ({ runLoginCommand: state.login }));
 vi.mock('@mastra/code-sdk/acp/index', () => ({ acpMain: state.acpMain }));
 vi.mock('@mastra/code-sdk/onboarding/settings', () => ({
   loadSettings: () => ({ browser: {}, preferences: {} }),
@@ -49,12 +51,16 @@ describe('main entrypoint cleanup ownership', () => {
     [['--acp', '--help'], 'headless'],
     [['--tui-prompt', '--acp'], 'tui'],
     [['--acp'], 'acp'],
+    [['login'], 'command'],
+    [['--acp', 'login'], 'command'],
+    [['--dangerous-auto-approve', '--acp', 'login', '--help'], 'command'],
     [['--tui-prompt', 'hello', 'plugin'], 'headless'],
     [['--tui-prompt', 'hello', 'prune', '--acp'], 'headless'],
   ] as const)(
     'executes matching lifecycle ownership for %j',
     async (args, mode) => {
       vi.resetModules();
+      state.login.mockReset().mockResolvedValue(0);
       state.acpMain.mockReset().mockResolvedValue(undefined);
       state.runMCCli.mockReset().mockResolvedValue(undefined);
       state.diagnostics.mockReset().mockResolvedValue(undefined);
@@ -64,6 +70,11 @@ describe('main entrypoint cleanup ownership', () => {
       const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       await import('./main.js');
       if (mode === 'acp') await vi.waitFor(() => expect(state.acpMain).toHaveBeenCalledOnce());
+      if (mode === 'command') {
+        await vi.waitFor(() => expect(state.login).toHaveBeenCalledOnce());
+        expect(state.acpMain).not.toHaveBeenCalled();
+        expect(state.runMCCli).not.toHaveBeenCalled();
+      }
       if (mode === 'headless') expect(state.runMCCli).toHaveBeenCalledOnce();
       if (args[0] === '--tui-prompt' && args[1] === 'hello') {
         expect(exit).toHaveBeenCalledWith(1);

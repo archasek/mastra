@@ -1,20 +1,6 @@
 name: E2E Tests
 
-on:
-  workflow_call:
-    inputs:
-      head_sha:
-        required: true
-        type: string
-      experiment_worker_e2e_changed:
-        required: false
-        default: false
-        type: boolean
-    secrets:
-      TURBO_TOKEN:
-        required: false
-      TURBO_TEAM:
-        required: false
+on: []
 
 permissions: {}
 

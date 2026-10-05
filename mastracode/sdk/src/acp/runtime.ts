@@ -46,6 +46,7 @@ export async function createAcpSession(
       disableHooks: true,
       disablePlugins: true,
       disableEnvFile: true,
+      disallowExperimentalAgent: true,
       disableGithubSignals: true,
       disableSettingsOmSeed: true,
       unixSocketPubSub: false,
@@ -56,6 +57,15 @@ export async function createAcpSession(
       },
     });
   } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === 'Experimental agent mode is not supported by ACP; use the regular agent.'
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Experimental agent mode is not supported by ACP; use the regular agent.',
+      );
+    }
     if (error instanceof Error && /thread not found/i.test(error.message)) {
       throw RequestError.invalidParams(undefined, 'ACP session not found');
     }
@@ -184,6 +194,8 @@ async function cleanupRuntime(result: Awaited<ReturnType<typeof bootLocalAgentCo
   await attempt(() => result.session.thread.detachFromCurrent());
   await attempt(() => result.stopPluginSignalProviders());
   await attempt(() => result.githubSignals?.stopAllPolling());
+  await attempt(() => result.threadScheduler.stop());
+  // The upstream dispatch grace is not cancellation: retain owned drain before shutdown/release.
   await attempt(() => result.stopNotificationDispatch());
 
   const signalsPubSub = result.signalsPubSub as { close?: () => Promise<void> | void } | undefined;

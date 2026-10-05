@@ -3,10 +3,7 @@ name: Backport PRs
 permissions:
   contents: read
 
-on:
-  pull_request_target:
-    types: [closed]
-    branches: [main]
+on: []
 
 jobs:
   backport:

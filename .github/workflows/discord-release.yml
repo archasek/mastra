@@ -1,37 +1,6 @@
 name: Announce GitHub Release on Discord
 
-on:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      release_name:
-        description: 'Release name shown in the test notification'
-        required: true
-        type: string
-        default: 'Mastra test release'
-      release_tag:
-        description: 'Release tag shown in the test notification'
-        required: true
-        type: string
-        default: 'v0.0.0-test'
-      release_url:
-        description: 'Optional URL opened from the notification title'
-        required: false
-        type: string
-      release_notes:
-        description: 'Release notes shown in the test notification'
-        required: true
-        type: string
-        default: |-
-          ## Test release
-
-          This is a preview of a Mastra release announcement.
-      deliver:
-        description: 'Send this test notification to Discord instead of only previewing its payload'
-        required: true
-        type: boolean
-        default: false
+on: []
 
 permissions:
   contents: read

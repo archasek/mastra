@@ -1,12 +1,5 @@
 name: Sync Renovate changeset
-on:
-  pull_request:
-    paths:
-      - '.github/workflows/sync_renovate-changesets.yml'
-      - '**/pnpm-lock.yaml'
-      - 'examples/**/package.json'
-      - 'e2e-tests/**/package.json'
-      - 'packages/**/integration-tests/package.json'
+on: []
 
 jobs:
   changeset:

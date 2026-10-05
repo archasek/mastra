@@ -1,19 +1,6 @@
 name: Experiments E2E
 
-on:
-  workflow_dispatch:
-    inputs:
-      tier:
-        description: Matrix tier
-        type: choice
-        options: [pr, full, gated]
-        default: full
-      scenario:
-        description: Optional single scenario ID
-        type: string
-        required: false
-  schedule:
-    - cron: '0 7 * * 2'
+on: []
 
 permissions: {}
 

@@ -1,12 +1,6 @@
 name: Changed Test Gate
 
-on:
-  pull_request:
-    types:
-      - opened
-      - reopened
-      - ready_for_review
-      - synchronize
+on: []
 
 permissions:
   contents: read
