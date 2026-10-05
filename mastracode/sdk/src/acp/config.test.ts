@@ -4,7 +4,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ThinkingLevelSetting } from '../thinking.js';
 import { MastraCodeAcpAgent } from './agent.js';
 
-async function setup(modelIds = ['openai/gpt-5.5', 'openai/gpt-5.6-sol'], unavailable: string[] = []) {
+async function setup(
+  modelIds = ['openai/gpt-5.5', 'openai/gpt-5.6-sol'],
+  unavailable: string[] = [],
+  credentialsRemovedAfterPreflight = false,
+) {
+  let discoveryCount = 0;
   let emit: (event: AgentControllerEvent) => void = () => {};
   const sessionUpdate = vi.fn().mockResolvedValue(undefined);
   let modelId = 'openai/gpt-5.5';
@@ -36,8 +41,14 @@ async function setup(modelIds = ['openai/gpt-5.5', 'openai/gpt-5.6-sol'], unavai
   const agent = new MastraCodeAcpAgent({ sessionUpdate } as unknown as AgentSideConnection, async () => ({
     session,
     controller: {
-      listAvailableModels: async () =>
-        modelIds.map(id => ({ id, modelName: id.slice(id.indexOf('/') + 1), hasApiKey: !unavailable.includes(id) })),
+      listAvailableModels: async () => {
+        discoveryCount += 1;
+        return modelIds.map(id => ({
+          id,
+          modelName: id.slice(id.indexOf('/') + 1),
+          hasApiKey: (credentialsRemovedAfterPreflight && discoveryCount === 1) || !unavailable.includes(id),
+        }));
+      },
     } as unknown as AgentController,
     modes: [{ id: 'build' }, { id: 'plan' }],
     getThinkingLevel: () => state.thinkingLevel ?? 'medium',
@@ -186,10 +197,16 @@ describe('ACP model routing catalog', () => {
   });
 });
 
-it('labels a saved selection whose provider is not configured', async () => {
-  const { initial } = await setup(['openai/gpt-5.5', 'openrouter/openai/gpt-4.1-mini'], ['openai/gpt-5.5']);
+it('labels a selected provider whose credentials disappear after the new-session preflight', async () => {
+  const { agent, initial } = await setup(
+    ['openai/gpt-5.5', 'openrouter/openai/gpt-4.1-mini'],
+    ['openai/gpt-5.5'],
+    true,
+  );
+  expect(initial.models?.currentModelId).toBe('openai/gpt-5.5');
   expect(initial.models?.availableModels).toContainEqual({
     modelId: 'openai/gpt-5.5',
     name: 'openai/gpt-5.5 (provider not configured)',
   });
+  await agent.dispose();
 });

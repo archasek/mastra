@@ -125,7 +125,10 @@ function credentialedDefaultModel(
   const current = available.find(model => model.id === currentModelId);
   if (!current || current.hasApiKey) return undefined;
   const credentialed = new Set(available.filter(model => model.hasApiKey).map(model => model.id));
-  return Object.values(PROVIDER_DEFAULT_MODELS).find(modelId => credentialed.has(modelId));
+  return (
+    Object.values(PROVIDER_DEFAULT_MODELS).find(modelId => credentialed.has(modelId)) ??
+    available.find(model => model.hasApiKey)?.id
+  );
 }
 
 /** One ACP connection, with an independent Mastra Code runtime for each conversation. */
@@ -360,6 +363,15 @@ export class MastraCodeAcpAgent implements Agent {
           ...structuredClone(suspension),
         })),
       ];
+      // Keep capture and the initial snapshot ahead of asynchronous discovery,
+      // but authorize the saved selection before any history or live publication.
+      const available = await runtime.controller.listAvailableModels();
+      if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
+      const currentModelId = runtime.session.model.get() ?? '';
+      const currentModel = available.find(model => model.id === currentModelId);
+      if (currentModel?.hasApiKey === false || !hasUsableModel(available, currentModelId)) {
+        throw RequestError.authRequired(undefined, 'Sign in to a model provider or add an API key to use Mastra Code');
+      }
       const messages = await runtime.session.thread.listMessages({ threadId: request.sessionId });
       const capturedIds = new Set(
         captured.flatMap(event => (event.type === 'message_start' ? [event.message.id] : [])),

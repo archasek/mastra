@@ -4,7 +4,7 @@ import type {
   LoadSessionRequest,
   NewSessionRequest,
 } from '@agentclientprotocol/sdk';
-import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
+import { PROTOCOL_VERSION, RequestError } from '@agentclientprotocol/sdk';
 import type { AgentController, AgentControllerEvent, Session } from '@mastra/core/agent-controller';
 
 import { describe, it, expect, vi } from 'vitest';
@@ -132,6 +132,8 @@ describe('ACP Agent - Sessions and turns', () => {
       getSkills?: () => Promise<AcpSkills | undefined>;
       sessionUpdate?: AgentSideConnection['sessionUpdate'];
       getMode?: () => string;
+      getModel?: () => string;
+      listAvailableModels?: () => Promise<{ id: string; hasApiKey: boolean }[]>;
       runtimeThreadId?: string;
       unsubscribe?: () => void;
       cleanup?: () => Promise<void>;
@@ -161,6 +163,10 @@ describe('ACP Agent - Sessions and turns', () => {
       currentThreadId = threadId;
     });
     const listMessages = vi.fn().mockResolvedValue(messages);
+    const listAvailableModels = vi.fn(
+      options.listAvailableModels ?? (async () => [{ id: 'test-model', name: 'Test model', hasApiKey: true }]),
+    );
+    const switchModel = vi.fn(async () => {});
     const session = {
       displayState: {
         get: () => ({
@@ -180,7 +186,7 @@ describe('ACP Agent - Sessions and turns', () => {
         listMessages,
       },
       mode: { get: options.getMode ?? (() => 'default') },
-      model: { get: () => 'test-model' },
+      model: { get: options.getModel ?? (() => 'test-model'), switch: switchModel },
       sendMessage,
       abort,
       resumeToolCall,
@@ -198,7 +204,7 @@ describe('ACP Agent - Sessions and turns', () => {
         options.runtimeThreadId ?? ('sessionId' in request && request.sessionId ? request.sessionId : currentThreadId);
       return {
         controller: {
-          listAvailableModels: async () => [{ id: 'test-model', name: 'Test model', hasApiKey: true }],
+          listAvailableModels,
         } as unknown as AgentController,
         session,
         modes: [],
@@ -220,6 +226,8 @@ describe('ACP Agent - Sessions and turns', () => {
       createThread,
       switchThread,
       listMessages,
+      listAvailableModels,
+      switchModel,
       getThreadId: () => currentThreadId,
       emit: (event: AgentControllerEvent) => listener(event),
     };
@@ -321,7 +329,11 @@ describe('ACP Agent - Sessions and turns', () => {
       { role: 'user', content: { parts: [{ type: 'text', text: 'Earlier request' }] } },
       { role: 'assistant', content: { parts: [{ type: 'text', text: 'Earlier answer' }] } },
     ];
-    const harness = setup(priorMessages);
+    const harness = setup(priorMessages, {
+      getMode: () => 'plan',
+      getModel: () => 'openai/gpt-5.5',
+      listAvailableModels: async () => [{ id: 'openai/gpt-5.5', hasApiKey: true }],
+    });
     const initialized = await harness.agent.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: { elicitation: { form: {} } },
@@ -331,7 +343,9 @@ describe('ACP Agent - Sessions and turns', () => {
 
     const request: LoadSessionRequest = { cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' };
     const response = await harness.agent.loadSession(request);
-    expect(response.modes).toEqual({ currentModeId: 'default', availableModes: [] });
+    expect(response.modes).toEqual({ currentModeId: 'plan', availableModes: [] });
+    expect(response.models?.currentModelId).toBe('openai/gpt-5.5');
+    expect(harness.switchModel).not.toHaveBeenCalled();
     expect(harness.createSession).toHaveBeenCalledWith(request);
     expect(harness.createThread).not.toHaveBeenCalled();
     expect(harness.getThreadId()).toBe('existing-thread');
@@ -351,6 +365,158 @@ describe('ACP Agent - Sessions and turns', () => {
         update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Earlier answer' } },
       }),
     );
+  });
+
+  it.each([false, true])(
+    'rejects removed restore credentials even with another credentialed model=%s',
+    async otherKey => {
+      const unsubscribe = vi.fn();
+      const cleanup = vi.fn(async () => {});
+      let hasApiKey = false;
+      const harness = setup([{ role: 'user', content: { parts: [{ type: 'text', text: 'Private history' }] } }], {
+        getModel: () => 'openai/gpt-5.5',
+        listAvailableModels: async () => [
+          { id: 'openai/gpt-5.5', hasApiKey },
+          { id: 'xai/grok-4.5', hasApiKey: otherKey },
+        ],
+        unsubscribe,
+        cleanup,
+      });
+      const request = { cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' };
+
+      const load = harness.agent.loadSession(request);
+      await expect(load).rejects.toBeInstanceOf(RequestError);
+      await expect(load).rejects.toMatchObject({ code: -32000 });
+      expect(harness.connection.sessionUpdate).not.toHaveBeenCalled();
+      expect(harness.listMessages).not.toHaveBeenCalled();
+      expect(harness.switchModel).not.toHaveBeenCalled();
+      expect(unsubscribe).toHaveBeenCalledOnce();
+      expect(cleanup).toHaveBeenCalledOnce();
+      await expect(harness.agent.prompt({ sessionId: request.sessionId, prompt: [] })).rejects.toMatchObject({
+        code: -32602,
+      });
+
+      hasApiKey = true;
+      const restored = await harness.agent.loadSession(request);
+      expect(restored.models?.currentModelId).toBe('openai/gpt-5.5');
+      expect(harness.getThreadId()).toBe(request.sessionId);
+      expect(harness.createThread).not.toHaveBeenCalled();
+      expect(harness.switchThread).not.toHaveBeenCalled();
+      expect(harness.switchModel).not.toHaveBeenCalled();
+      expect(cleanup).toHaveBeenCalledOnce();
+      await harness.agent.dispose();
+      expect(cleanup).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    ['no selection', '', false, false],
+    ['catalog selection without credentials', 'openai/gpt-5.5', false, false],
+    ['custom selection outside the catalog', 'local/llama', false, true],
+    ['no selection with a credentialed provider', '', true, true],
+  ] as const)('preserves restore authentication semantics for %s', async (_label, modelId, hasApiKey, allowed) => {
+    const cleanup = vi.fn(async () => {});
+    const harness = setup([], {
+      getModel: () => modelId,
+      listAvailableModels: async () => [{ id: 'openai/gpt-5.5', hasApiKey }],
+      cleanup,
+    });
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    if (allowed) {
+      await expect(load).resolves.toMatchObject({ modes: { currentModeId: 'default' } });
+      expect(harness.switchModel).not.toHaveBeenCalled();
+    } else {
+      await expect(load).rejects.toMatchObject({ code: -32000 });
+      expect(harness.connection.sessionUpdate).not.toHaveBeenCalled();
+      expect(harness.listMessages).not.toHaveBeenCalled();
+      expect(cleanup).toHaveBeenCalledOnce();
+    }
+    await harness.agent.dispose();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('tears down private capture before cleanup when restore discovery rejects, then permits retry', async () => {
+    const discovery = Promise.withResolvers<{ id: string; hasApiKey: boolean }[]>();
+    const started = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const unsubscribe = vi.fn(() => {
+      order.push('unsubscribe');
+    });
+    const cleanup = vi.fn(async () => {
+      order.push('cleanup');
+    });
+    const harness = setup([], { unsubscribe, cleanup });
+    harness.listAvailableModels.mockImplementationOnce(() => {
+      started.resolve();
+      return discovery.promise;
+    });
+    const request = { cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' };
+    const load = harness.agent.loadSession(request);
+    const failure = new Error('catalog unavailable');
+    const rejected = expect(load).rejects.toBe(failure);
+    await started.promise;
+    expect(harness.connection.sessionUpdate).not.toHaveBeenCalled();
+    expect(harness.listMessages).not.toHaveBeenCalled();
+    await expect(harness.agent.loadSession(request)).rejects.toMatchObject({ code: -32602 });
+    discovery.reject(failure);
+    await rejected;
+    expect(order).toEqual(['unsubscribe', 'cleanup']);
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+    await harness.agent.loadSession(request);
+    await harness.agent.dispose();
+  });
+
+  it('disposes a private restore during model discovery without replay or publication', async () => {
+    const discovery = Promise.withResolvers<{ id: string; hasApiKey: boolean }[]>();
+    const started = Promise.withResolvers<void>();
+    const unsubscribe = vi.fn();
+    const cleanup = vi.fn(async () => {});
+    const harness = setup([], { unsubscribe, cleanup });
+    harness.listAvailableModels.mockImplementationOnce(() => {
+      started.resolve();
+      return discovery.promise;
+    });
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    const rejected = expect(load).rejects.toMatchObject({ code: -32603 });
+    await started.promise;
+    const disposal = harness.agent.dispose();
+    expect(cleanup).not.toHaveBeenCalled();
+    discovery.resolve([{ id: 'test-model', hasApiKey: true }]);
+    await rejected;
+    await disposal;
+    expect(harness.connection.sessionUpdate).not.toHaveBeenCalled();
+    expect(harness.listMessages).not.toHaveBeenCalled();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('preserves the restore auth error when capture teardown and runtime cleanup both fail', async () => {
+    const unsubscribeError = new Error('unsubscribe failed');
+    const cleanupError = new Error('cleanup failed');
+    const unsubscribe = vi.fn(() => {
+      throw unsubscribeError;
+    });
+    const cleanup = vi.fn(async () => {
+      throw cleanupError;
+    });
+    const harness = setup([], {
+      listAvailableModels: async () => [{ id: 'test-model', hasApiKey: false }],
+      unsubscribe,
+      cleanup,
+    });
+    await expect(
+      harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' }),
+    ).rejects.toMatchObject({
+      code: -32000,
+      cause: { errors: [expect.objectContaining({ errors: [unsubscribeError] }), cleanupError] },
+    });
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(harness.connection.sessionUpdate).not.toHaveBeenCalled();
+    expect(harness.listMessages).not.toHaveBeenCalled();
+    await harness.agent.dispose();
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 
   it('replays remote images as resource links and inline images as base64', async () => {
@@ -727,17 +893,57 @@ describe('ACP Agent - Sessions and turns', () => {
     expect(cleanup).toHaveBeenCalledOnce();
   });
 
-  it('seeds an already-streaming message before captured deltas without replaying its newer stored row', async () => {
+  it('snapshots a streaming message and parked approval before deferred discovery, then captures live deltas once', async () => {
+    const discovery = Promise.withResolvers<{ id: string; hasApiKey: boolean }[]>();
+    const started = Promise.withResolvers<void>();
+    const currentMessage = {
+      id: 'stream',
+      role: 'assistant',
+      content: { parts: [{ type: 'text', text: 'Prefix' }] },
+    };
+    const approval = { toolCallId: 'approval', toolName: 'write_file', args: { path: 'file' } };
+    const pendingApprovals = new Map([['approval', approval]]);
+    const requestPermission = vi.fn(async () => ({ outcome: { outcome: 'selected' as const, optionId: 'approve' } }));
     const sessionUpdate = vi.fn(async (_notification: unknown) => {});
     const harness = setup([], {
-      currentMessage: { id: 'stream', role: 'assistant', content: { parts: [{ type: 'text', text: 'Prefix' }] } },
+      currentMessage,
+      pendingApprovals,
+      requestPermission,
       sessionUpdate: sessionUpdate as unknown as AgentSideConnection['sessionUpdate'],
     });
-    harness.listMessages.mockImplementationOnce(async () => {
-      harness.emit({ type: 'message_update', id: 'stream', event: { type: 'text-delta', delta: ' suffix' } });
-      return [{ id: 'stream', role: 'assistant', content: { parts: [{ type: 'text', text: 'Prefix suffix' }] } }];
+    harness.listAvailableModels.mockImplementationOnce(() => {
+      started.resolve();
+      return discovery.promise;
     });
-    await harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    const load = harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'existing-thread' });
+    await started.promise;
+    currentMessage.content.parts[0]!.text = 'Prefix suffix';
+    pendingApprovals.clear();
+    approval.args.path = 'newer-file';
+    harness.emit({ type: 'message_update', id: 'stream', event: { type: 'text-delta', delta: ' suffix' } });
+    harness.emit({ type: 'message_end', id: 'stream' });
+    harness.emit({
+      type: 'message_start',
+      message: {
+        id: 'next',
+        role: 'assistant',
+        content: { format: 2, parts: [] },
+      } as never,
+    });
+    harness.emit({ type: 'message_update', id: 'next', event: { type: 'text-delta', delta: 'Next message' } });
+    harness.listMessages.mockResolvedValueOnce([
+      { id: 'stream', role: 'assistant', content: { parts: [{ type: 'text', text: 'Prefix suffix' }] } },
+      { id: 'next', role: 'assistant', content: { parts: [{ type: 'text', text: 'Next message' }] } },
+    ]);
+    expect(sessionUpdate).not.toHaveBeenCalled();
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(harness.listMessages).not.toHaveBeenCalled();
+    await expect(harness.agent.prompt({ sessionId: 'existing-thread', prompt: [] })).rejects.toMatchObject({
+      code: -32602,
+    });
+    discovery.resolve([{ id: 'test-model', hasApiKey: true }]);
+    await load;
+    harness.emit({ type: 'message_update', id: 'next', event: { type: 'text-delta', delta: ' after load' } });
     const chunks = sessionUpdate.mock.calls
       .map(
         ([notification]) =>
@@ -746,7 +952,13 @@ describe('ACP Agent - Sessions and turns', () => {
           },
       )
       .flatMap(notification => (notification.update.content?.text ? [notification.update.content.text] : []));
-    expect(chunks).toEqual(['Prefix', ' suffix']);
+    expect(chunks).toEqual(['Prefix', ' suffix', 'Next message', ' after load']);
+    expect(requestPermission).toHaveBeenCalledOnce();
+    expect(requestPermission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCall: expect.objectContaining({ rawInput: JSON.stringify({ path: 'file' }) }),
+      }),
+    );
     await harness.agent.dispose();
   });
 
@@ -1088,27 +1300,34 @@ describe('ACP Agent - Provider authentication', () => {
     const switchModel = vi.fn(async ({ modelId: next }: { modelId: string }) => {
       modelId = next;
     });
+    const subscribe = vi.fn(() => () => {});
+    const sessionUpdate = vi.fn().mockResolvedValue(undefined);
     const session = {
-      subscribe: () => () => {},
+      subscribe,
       thread: { getId: () => 'thread-1', create: createThread, switch: async () => {} },
       mode: { get: () => 'default' },
       model: { get: () => modelId, switch: switchModel },
     } as unknown as Session;
-    const agent = new MastraCodeAcpAgent(
-      { sessionUpdate: vi.fn().mockResolvedValue(undefined) } as unknown as AgentSideConnection,
-      async () => ({
-        controller: {
-          listAvailableModels: async () => {
-            if (models instanceof Error) throw models;
-            return models;
-          },
-        } as unknown as AgentController,
-        session,
-        modes: [],
-        cleanup,
-      }),
-    );
-    return { created: agent.newSession({ cwd: '/tmp', mcpServers: [] }), createThread, cleanup, switchModel };
+    const agent = new MastraCodeAcpAgent({ sessionUpdate } as unknown as AgentSideConnection, async () => ({
+      controller: {
+        listAvailableModels: async () => {
+          if (models instanceof Error) throw models;
+          return models;
+        },
+      } as unknown as AgentController,
+      session,
+      modes: [],
+      cleanup,
+    }));
+    return {
+      created: agent.newSession({ cwd: '/tmp', mcpServers: [] }),
+      agent,
+      createThread,
+      cleanup,
+      switchModel,
+      subscribe,
+      sessionUpdate,
+    };
   }
 
   it.each([
@@ -1135,16 +1354,22 @@ describe('ACP Agent - Provider authentication', () => {
   });
 
   it('fails session creation when model discovery fails instead of hiding the catalog', async () => {
-    const { created, createThread, cleanup } = newSession(new Error('catalog unavailable'), 'openai/gpt-5');
+    const { created, createThread, cleanup, subscribe, sessionUpdate } = newSession(
+      new Error('catalog unavailable'),
+      'openai/gpt-5',
+    );
     await expect(created).rejects.toThrow('catalog unavailable');
     expect(createThread).not.toHaveBeenCalled();
     expect(cleanup).toHaveBeenCalledOnce();
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(sessionUpdate).not.toHaveBeenCalled();
   });
 
   it('moves a new session off a default model without credentials to a signed-in provider default', async () => {
     const { created, switchModel } = newSession(
       [
         { id: 'openai/gpt-5.5', hasApiKey: false },
+        { id: 'groq/llama', hasApiKey: true },
         { id: 'anthropic/claude-haiku-4-5', hasApiKey: true },
         { id: 'xai/grok-4.5', hasApiKey: true },
       ],
@@ -1168,18 +1393,62 @@ describe('ACP Agent - Provider authentication', () => {
       [{ id: 'xai/grok-4.5', hasApiKey: true }],
       'local/llama',
     ],
-    [
-      'no provider default has credentials',
+  ])('keeps the current model when %s', async (_case, models, currentModelId) => {
+    const { created, switchModel } = newSession(models, currentModelId);
+    await expect(created).resolves.toMatchObject({ models: { currentModelId } });
+    expect(switchModel).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the first credentialed native catalog model when no provider default qualifies', async () => {
+    const { created, switchModel } = newSession(
+      [
+        { id: 'openai/gpt-5.5', hasApiKey: false },
+        { id: 'groq/llama', hasApiKey: true },
+        { id: 'anthropic/claude-haiku-4-5', hasApiKey: true },
+      ],
+      'openai/gpt-5.5',
+    );
+    await expect(created).resolves.toMatchObject({ models: { currentModelId: 'groq/llama' } });
+    expect(switchModel).toHaveBeenCalledExactlyOnceWith({ modelId: 'groq/llama' });
+  });
+
+  it.each([false, true])('keeps a fallback switch private until it settles (reject: %s)', async reject => {
+    const switching = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const harness = newSession(
       [
         { id: 'openai/gpt-5.5', hasApiKey: false },
         { id: 'groq/llama', hasApiKey: true },
       ],
       'openai/gpt-5.5',
-    ],
-  ])('keeps the current model when %s', async (_case, models, currentModelId) => {
-    const { created, switchModel } = newSession(models, currentModelId);
-    await expect(created).resolves.toMatchObject({ models: { currentModelId } });
-    expect(switchModel).not.toHaveBeenCalled();
+    );
+    const switchModel = harness.switchModel.getMockImplementation()!;
+    harness.switchModel.mockImplementationOnce(async selection => {
+      started.resolve();
+      await switching.promise;
+      await switchModel(selection);
+    });
+    const failure = new Error('model switch failed');
+    const result = reject ? expect(harness.created).rejects.toBe(failure) : harness.created;
+    await started.promise;
+    expect(harness.subscribe).not.toHaveBeenCalled();
+    expect(harness.sessionUpdate).not.toHaveBeenCalled();
+    expect(harness.cleanup).not.toHaveBeenCalled();
+    await expect(harness.agent.prompt({ sessionId: 'thread-1', prompt: [] })).rejects.toMatchObject({ code: -32602 });
+    if (reject) switching.reject(failure);
+    else switching.resolve();
+    const response = await result;
+    if (reject) {
+      expect(harness.subscribe).not.toHaveBeenCalled();
+      expect(harness.sessionUpdate).not.toHaveBeenCalled();
+      expect(harness.cleanup).toHaveBeenCalledOnce();
+    } else {
+      expect(response).toMatchObject({ sessionId: 'thread-1', models: { currentModelId: 'groq/llama' } });
+      expect(harness.subscribe).toHaveBeenCalledOnce();
+      expect(harness.cleanup).not.toHaveBeenCalled();
+    }
+    await harness.agent.dispose();
+    expect(harness.cleanup).toHaveBeenCalledOnce();
   });
 });
 
