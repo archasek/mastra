@@ -4,6 +4,7 @@ import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { readOAuthStatusFile } from '@mastra/code-sdk/auth/storage';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
 import { getAppDataDir } from '@mastra/code-sdk/utils/project';
+import { getProviderConfig } from '@mastra/core/llm';
 import { getCurrentVersion } from './version.js';
 
 export interface InfoCliOptions {
@@ -38,6 +39,15 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
   for (const [mode, modelId] of Object.entries(openaiPack?.models ?? {})) {
     if (!modelId) continue;
     modelModes.set(modelId, [...(modelModes.get(modelId) ?? []), mode]);
+  }
+  // Mode packs choose defaults; they are not the native model inventory.
+  // Use the bundled registry without fetching, booting a harness or reading keys.
+  if (openaiAccess === 'oauth') {
+    for (const name of getProviderConfig('openai')?.models ?? []) {
+      if (!/^gpt-\d/.test(name) || /(?:image|audio|realtime)/i.test(name)) continue;
+      const id = `openai/${name}`;
+      if (!modelModes.has(id)) modelModes.set(id, ['build', 'plan', 'fast']);
+    }
   }
 
   emit(options, {

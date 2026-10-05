@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
+import { getProviderConfig } from '@mastra/core/llm';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { runInfoCli } from './info-cli.js';
@@ -44,7 +45,7 @@ describe('mastracode info --json', () => {
     expect(existsSync(appDataDir)).toBe(false);
   });
 
-  it('uses the canonical Codex mode pack and never emits credential material', () => {
+  it('includes native registry models beyond mode-pack defaults without emitting credentials', () => {
     const appDataDir = makeTempDirectory();
     const account = {
       type: 'oauth-account',
@@ -84,9 +85,17 @@ describe('mastracode info --json', () => {
     for (const [mode, id] of Object.entries(pack?.models ?? {})) {
       expectedModels.set(id, [...(expectedModels.get(id) ?? []), mode]);
     }
+    for (const name of getProviderConfig('openai')?.models ?? []) {
+      if (!/^gpt-\d/.test(name) || /(?:image|audio|realtime)/i.test(name)) continue;
+      const id = `openai/${name}`;
+      if (!expectedModels.has(id)) expectedModels.set(id, ['build', 'plan', 'fast']);
+    }
 
     expect(exitCode).toBe(0);
     expect(info.models).toEqual([...expectedModels].map(([id, modes]) => ({ id, modes })));
+    expect(info.models).toContainEqual({ id: 'openai/gpt-6.1-sol', modes: ['build', 'plan', 'fast'] });
+    expect(info.models).toContainEqual({ id: 'openai/gpt-5.4-mini', modes: ['fast'] });
+    expect(info.models.some((model: { id: string }) => /image|audio|realtime/.test(model.id))).toBe(false);
     expect(info.auth).toEqual({ provider: 'openai-codex', status: 'authenticated' });
     expect(output.join('')).not.toContain('refresh-secret-marker');
     expect(output.join('')).not.toContain('access-secret-marker');
