@@ -346,6 +346,8 @@ export interface MastraCodeConfig {
   disableHooks?: boolean;
   /** Skip loading cwd/.env into the process environment. Useful for multi-session hosts. */
   disableEnvFile?: boolean;
+  /** @internal ACP supports only the regular agent. Default: false. */
+  disallowExperimentalAgent?: boolean;
   /** Disable plugin discovery/loading. Default: false */
   disablePlugins?: boolean;
   /** Disable the polling-based GitHub signal provider even when enabled in global settings. Default: false */
@@ -541,6 +543,9 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   const authStorage = createAuthStorage();
   const globalSettings = loadSettings(config?.settingsPath);
   const experimentalAgent = resolveExperimentalAgent(globalSettings);
+  if (config?.disallowExperimentalAgent && (experimentalAgent === 'durable' || experimentalAgent === 'evented')) {
+    throw new Error('Experimental agent mode is not supported by ACP; use the regular agent.');
+  }
   const backgroundToolsEnabled = globalSettings.backgroundTools?.enabled ?? false;
   const storedGatewayKey = authStorage.getStoredApiKey(MASTRA_GATEWAY_PROVIDER);
   const storedGatewayUrl = globalSettings.memoryGateway?.baseUrl;

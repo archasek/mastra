@@ -19,6 +19,7 @@ function run(
   isTTY = false,
   typedKey?: string,
   args: string[] = [],
+  storeApiKey?: (providerId: string, key: string) => Promise<void>,
 ) {
   const input = Object.assign(new PassThrough(), { isTTY });
   const piped = answers.map(answer => `${answer}\n`).join('');
@@ -34,7 +35,7 @@ function run(
   });
   const authStorage = {
     login: vi.fn(login ?? (async () => {})),
-    setStoredApiKey: vi.fn(),
+    setStoredApiKey: vi.fn(storeApiKey),
   };
   const openUrl = vi.fn();
   const exitCode = runLoginCommand({
@@ -92,6 +93,35 @@ describe('runLoginCommand', () => {
     await expect(exitCode).resolves.toBe(0);
     expect(authStorage.setStoredApiKey).toHaveBeenCalledWith('anthropic', 'sk-ant-secret');
     expect(output()).not.toContain('sk-ant-secret');
+  });
+
+  it('waits for the credential write before reporting success or allowing CLI exit', async () => {
+    let release!: () => void;
+    const pendingWrite = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const add = String(getOAuthProviders().length + 1);
+    const result = run([add, 'anthropic', 'test-key'], undefined, false, undefined, [], () => pendingWrite);
+    const completed = vi.fn();
+    void result.exitCode.then(completed);
+    await vi.waitFor(() => expect(result.authStorage.setStoredApiKey).toHaveBeenCalledOnce());
+    expect(result.output()).not.toContain('Saved');
+    expect(completed).not.toHaveBeenCalled();
+    release();
+    await expect(result.exitCode).resolves.toBe(0);
+    expect(result.output()).toContain('Saved the anthropic API key');
+    expect(result.output()).not.toContain('test-key');
+  });
+
+  it('reports a failed credential write instead of reporting success', async () => {
+    const add = String(getOAuthProviders().length + 1);
+    const result = run([add, 'anthropic', 'test-key'], undefined, false, undefined, [], async () => {
+      throw new Error('credential write failed');
+    });
+    await expect(result.exitCode).resolves.toBe(1);
+    expect(result.output()).toContain('Sign-in failed: credential write failed');
+    expect(result.output()).not.toContain('Saved');
+    expect(result.output()).not.toContain('test-key');
   });
 
   it.each([

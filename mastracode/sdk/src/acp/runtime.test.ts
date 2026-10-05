@@ -186,6 +186,7 @@ describe('ACP runtime factory', () => {
       disableHooks: true,
       disablePlugins: true,
       disableEnvFile: true,
+      disallowExperimentalAgent: true,
       disableGithubSignals: true,
       disableSettingsOmSeed: true,
       unixSocketPubSub: false,
@@ -306,6 +307,7 @@ describe('ACP runtime factory', () => {
     expect(vi.mocked(bootLocalAgentController).mock.lastCall?.[0]).toMatchObject({
       initialThreadId: 'existing-thread',
       requireExistingThread: true,
+      disallowExperimentalAgent: true,
     });
     await runtime.cleanup?.();
   });
@@ -326,6 +328,21 @@ describe('ACP runtime factory', () => {
     });
     expect(boot.mcpManager.disconnect).toHaveBeenCalledOnce();
     expect(boot.closeStorage).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('explains unsupported experimental mode for ACP boot (resume: %s)', async isResume => {
+    vi.mocked(bootLocalAgentController).mockRejectedValueOnce(
+      new Error('Experimental agent mode is not supported by ACP; use the regular agent.'),
+    );
+    await expect(
+      createAcpSession({ cwd: '/project', mcpServers: [], ...(isResume ? { sessionId: 'existing-thread' } : {}) }),
+    ).rejects.toMatchObject({
+      code: -32602,
+      message: 'Invalid params: Experimental agent mode is not supported by ACP; use the regular agent.',
+    });
+    expect(vi.mocked(bootLocalAgentController).mock.lastCall?.[0]).toMatchObject({
+      disallowExperimentalAgent: true,
+    });
   });
 
   it('maps a missing resumed thread to a generic not-found response', async () => {

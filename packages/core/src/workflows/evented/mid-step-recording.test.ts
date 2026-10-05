@@ -65,6 +65,92 @@ async function makeHost(workflow: ReturnType<typeof makeWorkflow>, storage: Inst
 }
 
 describe('evented mid-step recording (issue #22636)', () => {
+  it('recovers normal loop re-entry with its input after a previous iteration resumed', async () => {
+    const schema = z.object({ count: z.number() });
+    const buildLoop = (execute: any) => {
+      const body = createStep({
+        id: 'body',
+        inputSchema: schema,
+        outputSchema: schema,
+        resumeSchema: z.object({ approved: z.boolean() }),
+        suspendSchema: z.object({}),
+        execute,
+      });
+      return createWorkflow({ id: 'resumed-loop-reentry', inputSchema: schema, outputSchema: schema })
+        .dountil(body, async ({ inputData }) => inputData.count >= 2)
+        .commit();
+    };
+    const storageA = new MockStore();
+    let resumeStarted!: () => void;
+    const resumed = new Promise<void>(resolve => (resumeStarted = resolve));
+    let releaseResume!: () => void;
+    const resumeGate = new Promise<void>(resolve => (releaseResume = resolve));
+    let normalStarted!: () => void;
+    const normal = new Promise<void>(resolve => (normalStarted = resolve));
+    const workflowA = buildLoop(async ({ inputData, resumeData, suspend }: any) => {
+      if (resumeData !== undefined) {
+        resumeStarted();
+        await resumeGate;
+        return { count: 1 };
+      }
+      if (inputData.count === 0) return suspend({});
+      normalStarted();
+      await new Promise<never>(() => {}); // Simulated crash in the normal iteration.
+    });
+    const mastraA = await makeHost(workflowA as any, storageA);
+    let mastraB: Mastra | undefined;
+    try {
+      const runA = await workflowA.createRun();
+      expect((await runA.start({ inputData: { count: 0 } })).status).toBe('suspended');
+      const resumePayload = { approved: false };
+      void runA.resume({ step: 'body', resumeData: resumePayload }).catch(() => {});
+      await resumed;
+
+      const storeA = (await storageA.getStore('workflows'))!;
+      const resumedSnapshot = JSON.parse(
+        JSON.stringify(await storeA.loadWorkflowSnapshot({ workflowName: workflowA.id, runId: runA.runId })),
+      );
+      expect(resumedSnapshot.context.body).toMatchObject({ status: 'running', resumePayload });
+      expect(typeof resumedSnapshot.context.body.resumedAt).toBe('number');
+
+      releaseResume();
+      await normal;
+      const snapshot = JSON.parse(
+        JSON.stringify(await storeA.loadWorkflowSnapshot({ workflowName: workflowA.id, runId: runA.runId })),
+      );
+      expect(snapshot.context.body).toMatchObject({
+        status: 'running',
+        payload: { count: 1 },
+        metadata: { iterationCount: 1 },
+      });
+      for (const field of ['resumePayload', 'resumedAt', 'resumedNestedSteps', 'resumedNestedPaths']) {
+        expect(snapshot.context.body).not.toHaveProperty(field);
+      }
+      await mastraA.stopWorkers();
+
+      // Reload serialized bytes into a fresh store and host: no live result
+      // objects or old workers can supply the recovered execution's input.
+      const storageB = new MockStore();
+      const storeB = (await storageB.getStore('workflows'))!;
+      await storeB.persistWorkflowSnapshot({ workflowName: workflowA.id, runId: runA.runId, snapshot });
+      const recoveredBody = vi.fn(async ({ inputData, resumeData }: any) => {
+        expect(inputData).toEqual({ count: 1 });
+        expect(resumeData).toBeUndefined();
+        return { count: 2 };
+      });
+      const workflowB = buildLoop(recoveredBody);
+      mastraB = await makeHost(workflowB as any, storageB);
+      const result = await (await workflowB.createRun({ runId: runA.runId })).restart();
+      expect(result.status).toBe('success');
+      expect(result.status === 'success' && result.result).toEqual({ count: 2 });
+      expect(recoveredBody).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseResume();
+      await mastraB?.stopWorkers();
+      await mastraA.stopWorkers();
+    }
+  });
+
   it('persists the running step record and routing state before executing the step', async () => {
     const storage = new MockStore();
 

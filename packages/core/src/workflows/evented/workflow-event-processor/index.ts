@@ -1528,7 +1528,8 @@ export class WorkflowEventProcessor extends EventProcessor {
       // here would clobber sibling iterations' results.
       const isResumedEntry =
         ((resumeSteps?.length ?? 0) > 0 && resumeSteps?.[0] === leafId) ||
-        timeTravel?.stepResults?.[leafId]?.status === 'suspended';
+        timeTravel?.stepResults?.[leafId]?.status === 'suspended' ||
+        (restart?.activeStepsPath?.[leafId] && isResumedRunningRecord(stepResults?.[leafId]));
       // Record first, then routing state: if the process dies between the two
       // writes recovery still routes through the old path, whereas the reverse
       // order would point restart at a step whose input was never recorded.
@@ -1550,6 +1551,14 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (snapshot?.status === 'suspended' && (snapshot.context as any)?.[leafId]?.status === 'suspended') {
           return;
         }
+        const runningResult = omitPriorCompletionFields((stepResults?.[leafId] ?? {}) as Record<string, unknown>);
+        // A fresh loop iteration owns its normal input. Resume markers belong
+        // only to the resumed execution; leaving them here makes restart replay
+        // the previous iteration's resume data. Keep nested-run metadata intact.
+        delete runningResult.resumePayload;
+        delete runningResult.resumedAt;
+        delete runningResult.resumedNestedSteps;
+        delete runningResult.resumedNestedPaths;
         await workflowsStore.updateWorkflowResults({
           workflowName: workflowId,
           runId,
@@ -1558,7 +1567,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             // Loop re-entries overwrite the previous iteration's completion
             // fields (like the default engine's stepInfo) while preserving
             // e.g. metadata.nestedRunId for nested-run recovery.
-            ...omitPriorCompletionFields((stepResults?.[leafId] ?? {}) as Record<string, unknown>),
+            ...runningResult,
             payload: prevResult.status === 'success' ? prevResult.output : undefined,
             startedAt: Date.now(),
             status: 'running',

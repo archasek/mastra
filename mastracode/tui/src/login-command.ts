@@ -62,7 +62,7 @@ async function addApiKey(ask: Ask, authStorage: AuthStorage, say: (line: string)
   const key = (await ask('API key: ', { secret: true })).trim();
   say('');
   if (!key) throw new Error('No API key entered');
-  authStorage.setStoredApiKey(providerId, key);
+  await authStorage.setStoredApiKey(providerId, key);
   say(`Saved the ${providerId} API key`);
 }
 
