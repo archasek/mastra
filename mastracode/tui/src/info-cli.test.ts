@@ -1,9 +1,10 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
-import { getProviderConfig } from '@mastra/core/llm';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { runInfoCli } from './info-cli.js';
@@ -85,7 +86,9 @@ describe('mastracode info --json', () => {
     for (const [mode, id] of Object.entries(pack?.models ?? {})) {
       expectedModels.set(id, [...(expectedModels.get(id) ?? []), mode]);
     }
-    for (const name of getProviderConfig('openai')?.models ?? []) {
+    const coreRoot = dirname(createRequire(import.meta.url).resolve('@mastra/core/package.json'));
+    const registry = JSON.parse(readFileSync(join(coreRoot, 'dist/provider-registry.json'), 'utf8'));
+    for (const name of registry.providers.openai.models as string[]) {
       if (!/^gpt-\d/.test(name) || /(?:image|audio|realtime)/i.test(name)) continue;
       const id = `openai/${name}`;
       if (!expectedModels.has(id)) expectedModels.set(id, ['build', 'plan', 'fast']);
@@ -100,6 +103,31 @@ describe('mastracode info --json', () => {
     expect(output.join('')).not.toContain('refresh-secret-marker');
     expect(output.join('')).not.toContain('access-secret-marker');
     expect(output.join('')).not.toContain('codex@example.test');
+    // Fresh module evaluation must stay offline even with runtime refresh enabled.
+    const childOutput = execFileSync(
+      process.execPath,
+      [
+        '--import',
+        createRequire(import.meta.url).resolve('tsx'),
+        '--input-type=module',
+        '-e',
+        `let fetches = 0;
+         globalThis.fetch = async () => { fetches++; throw new Error('Unexpected registry network request'); };
+         const { runInfoCli } = await import(${JSON.stringify(new URL('./info-cli.ts', import.meta.url).href)});
+         runInfoCli(['--json'], { appDataDir: ${JSON.stringify(appDataDir)}, version: 'test' });
+         await new Promise(resolve => setTimeout(resolve, 100));
+         if (fetches) throw new Error('Machine info initialized network refresh');`,
+      ],
+      {
+        env: { ...process.env, MASTRA_DEV: 'true', MASTRA_AUTO_REFRESH_PROVIDERS: 'true', MASTRA_OFFLINE: 'false' },
+        encoding: 'utf8',
+        timeout: 10000,
+      },
+    );
+    expect(JSON.parse(childOutput).models).toContainEqual({
+      id: 'openai/gpt-6.1-sol',
+      modes: ['build', 'plan', 'fast'],
+    });
   });
 
   it('reports malformed auth state as unknown without rewriting it', () => {

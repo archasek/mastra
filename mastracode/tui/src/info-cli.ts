@@ -1,10 +1,11 @@
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { readOAuthStatusFile } from '@mastra/code-sdk/auth/storage';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
 import { getAppDataDir } from '@mastra/code-sdk/utils/project';
-import { getProviderConfig } from '@mastra/core/llm';
 import { getCurrentVersion } from './version.js';
 
 export interface InfoCliOptions {
@@ -43,7 +44,12 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
   // Mode packs choose defaults; they are not the native model inventory.
   // Use the bundled registry without fetching, booting a harness or reading keys.
   if (openaiAccess === 'oauth') {
-    for (const name of getProviderConfig('openai')?.models ?? []) {
+    // Do not import the runtime registry: its module can auto-start refresh.
+    const coreRoot = dirname(createRequire(import.meta.url).resolve('@mastra/core/package.json'));
+    const registry = JSON.parse(readFileSync(join(coreRoot, 'dist/provider-registry.json'), 'utf8')) as {
+      providers: { openai?: { models?: string[] } };
+    };
+    for (const name of registry.providers.openai?.models ?? []) {
       if (!/^gpt-\d/.test(name) || /(?:image|audio|realtime)/i.test(name)) continue;
       const id = `openai/${name}`;
       if (!modelModes.has(id)) modelModes.set(id, ['build', 'plan', 'fast']);
