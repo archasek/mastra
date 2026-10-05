@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
+import { getAvailableThinkingLevelsForModel } from '@mastra/code-sdk/thinking';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { runInfoCli } from './info-cli.js';
@@ -95,9 +96,23 @@ describe('mastracode info --json', () => {
     }
 
     expect(exitCode).toBe(0);
-    expect(info.models).toEqual([...expectedModels].map(([id, modes]) => ({ id, modes })));
-    expect(info.models).toContainEqual({ id: 'openai/gpt-6.1-sol', modes: ['build', 'plan', 'fast'] });
-    expect(info.models).toContainEqual({ id: 'openai/gpt-5.4-mini', modes: ['fast'] });
+    expect(info.models).toEqual(
+      [...expectedModels].map(([id, modes]) => ({
+        id,
+        modes,
+        thinkingLevels: getAvailableThinkingLevelsForModel(id),
+      })),
+    );
+    expect(info.models).toContainEqual({
+      id: 'openai/gpt-6.1-sol',
+      modes: ['build', 'plan', 'fast'],
+      thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+    });
+    expect(info.models).toContainEqual({
+      id: 'openai/gpt-5.4-mini',
+      modes: ['fast'],
+      thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh'],
+    });
     expect(info.models.some((model: { id: string }) => /image|audio|realtime/.test(model.id))).toBe(false);
     expect(info.auth).toEqual({ provider: 'openai-codex', status: 'authenticated' });
     expect(output.join('')).not.toContain('refresh-secret-marker');
@@ -127,6 +142,7 @@ describe('mastracode info --json', () => {
     expect(JSON.parse(childOutput).models).toContainEqual({
       id: 'openai/gpt-6.1-sol',
       modes: ['build', 'plan', 'fast'],
+      thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
     });
   });
 

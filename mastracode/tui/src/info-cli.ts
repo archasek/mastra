@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { readOAuthStatusFile } from '@mastra/code-sdk/auth/storage';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
+import { getAvailableThinkingLevelsForModel } from '@mastra/code-sdk/thinking';
 import { getAppDataDir } from '@mastra/code-sdk/utils/project';
 import { getCurrentVersion } from './version.js';
 
@@ -66,7 +67,11 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
       elicitation: true,
       images: true,
     },
-    models: [...modelModes].map(([id, modes]) => ({ id, modes })),
+    models: [...modelModes].map(([id, modes]) => ({
+      id,
+      modes,
+      thinkingLevels: getAvailableThinkingLevelsForModel(id),
+    })),
     auth: { provider: 'openai-codex', status: auth.status },
   });
   return auth.status === 'unknown' ? 1 : 0;
