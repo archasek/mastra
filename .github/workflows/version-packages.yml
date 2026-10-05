@@ -3,10 +3,7 @@ name: Version Packages
 permissions:
   contents: read
 
-on:
-  push:
-    branches:
-      - main
+on: []
 
 jobs:
   version:

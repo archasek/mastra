@@ -1,29 +1,7 @@
 name: Renovate
 permissions:
   contents: read
-on:
-  # This lets you dispatch a renovate job with different cache options if you want to reset or disable the cache manually.
-  workflow_dispatch:
-    inputs:
-      repoCache:
-        description: 'Reset or disable the cache?'
-        type: choice
-        default: enabled
-        options:
-          - enabled
-          - disabled
-          - reset
-      logLevel:
-        description: 'Set logLevel'
-        type: choice
-        default: INFO
-        options:
-          - INFO
-          - DEBUG
-  schedule:
-    # The "*" (#42, asterisk) character has special semantics in YAML, so this
-    # string has to be quoted.
-    - cron: '0 */6 * * *'
+on: []
 # Adding these as env variables makes it easy to re-use them in different steps and in bash.
 env:
   cache_archive: renovate_cache.tar.gz

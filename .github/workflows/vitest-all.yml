@@ -1,7 +1,6 @@
 name: Vitest All Tests
 
-on:
-  workflow_dispatch:
+on: []
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}

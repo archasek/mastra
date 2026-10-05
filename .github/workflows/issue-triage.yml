@@ -1,7 +1,5 @@
 name: GH_Issue_Triage
-on:
-  issues:
-    types: [opened, reopened]
+on: []
 
 jobs:
   issue_created:

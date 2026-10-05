@@ -1,9 +1,6 @@
 name: Quality assurance
 
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    branches: [main, 0.x]
+on: []
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}

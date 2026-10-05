@@ -1,8 +1,6 @@
 name: Issue Pending Release
 
-on:
-  pull_request_target:
-    types: [closed]
+on: []
 
 permissions:
   contents: read

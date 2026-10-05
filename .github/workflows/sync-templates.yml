@@ -1,12 +1,6 @@
 name: Sync Template Repositories
 
-on:
-  push:
-    branches:
-      - main # Or your default branch
-    paths:
-      - 'templates/**' # Only trigger when templates change
-  workflow_dispatch: # Allow manual triggers
+on: []
 
 jobs:
   sync-templates:
