@@ -1380,6 +1380,15 @@ describe('ACP Agent - Provider authentication', () => {
   });
 
   it.each([
+    ['provider default', [{ id: 'xai/grok-4.5', hasApiKey: true }], 'xai/grok-4.5'],
+    ['catalog fallback', [{ id: 'groq/llama', hasApiKey: true }], 'groq/llama'],
+  ])('selects a credentialed %s when the new session has no model', async (_case, models, expected) => {
+    const { created, switchModel } = newSession(models, '');
+    await expect(created).resolves.toMatchObject({ models: { currentModelId: expected } });
+    expect(switchModel).toHaveBeenCalledExactlyOnceWith({ modelId: expected });
+  });
+
+  it.each([
     [
       'the current model has credentials',
       [

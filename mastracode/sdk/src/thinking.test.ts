@@ -2,10 +2,31 @@ import { describe, expect, it } from 'vitest';
 
 import {
   getAvailableThinkingLevelsForModel,
+  normalizeThinkingLevelForModel,
   parseThinkCommand,
+  parseThinkingLevel,
+  parseModeThinkingDefaults,
   resolveDefaultThinkingLevel,
   supportsMaxReasoningEffort,
 } from './thinking.js';
+
+describe('thinking settings parsing', () => {
+  it('shares native default and filters invalid mode defaults', () => {
+    expect(parseThinkingLevel(undefined)).toBe('off');
+    expect(parseThinkingLevel('invalid')).toBe('off');
+    expect(parseThinkingLevel('low')).toBe('low');
+    expect(parseModeThinkingDefaults({ build: 'high', plan: 'invalid', fast: 2 })).toEqual({ build: 'high' });
+    expect(
+      resolveDefaultThinkingLevel(
+        {
+          globalDefault: parseThinkingLevel('low'),
+          modeDefaults: parseModeThinkingDefaults({ build: 'high' }),
+        },
+        'build',
+      ).level,
+    ).toBe('high');
+  });
+});
 
 describe('parseThinkCommand', () => {
   it.each(['', 'status'])('parses %j as a status request', input => {
@@ -32,6 +53,11 @@ describe('parseThinkCommand', () => {
 });
 
 describe('thinking model capabilities', () => {
+  it('normalizes defaults using the same available levels as ACP', () => {
+    expect(normalizeThinkingLevelForModel('max', 'openai/gpt-5.4-mini')).toBe('xhigh');
+    expect(normalizeThinkingLevelForModel('max', 'openai/gpt-6.1-sol')).toBe('max');
+    expect(normalizeThinkingLevelForModel('low', 'openai/gpt-5.4-mini')).toBe('low');
+  });
   it('supports max reasoning from GPT-5.6 onward', () => {
     expect(supportsMaxReasoningEffort('gpt-5.6')).toBe(true);
     expect(supportsMaxReasoningEffort('openai/gpt-6')).toBe(true);

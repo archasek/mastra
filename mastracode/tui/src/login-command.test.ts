@@ -70,6 +70,19 @@ describe('runLoginCommand', () => {
     expect(authStorage.login).toHaveBeenCalledWith('openai-codex', expect.objectContaining({ authMode: 'device' }));
   });
 
+  it('preserves successful login when saving the default memory model fails', async () => {
+    vi.mocked(seedProviderOMDefault).mockImplementationOnce(() => {
+      throw new Error('settings write failed');
+    });
+    const { exitCode, authStorage, output } = run([optionFor('openai-codex'), '2']);
+    await expect(exitCode).resolves.toBe(0);
+    expect(authStorage.login).toHaveBeenCalledOnce();
+    expect(output()).toContain('default memory model could not be saved');
+    expect(output()).toContain('Signed in to');
+    expect(output()).not.toContain('Sign-in failed');
+    expect(output()).not.toContain('settings write failed');
+  });
+
   it('answers provider prompts from the terminal', async () => {
     let pasted = '';
     const { exitCode } = run([optionFor('anthropic'), 'code#state'], async (_id, callbacks) => {
