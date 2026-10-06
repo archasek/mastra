@@ -52,7 +52,11 @@ async function signIn(
     onPrompt: ({ message, placeholder }) => ask(`${message}${placeholder ? ` (${placeholder})` : ''} `),
     onProgress: say,
   });
-  seedProviderOMDefault(provider.id);
+  try {
+    seedProviderOMDefault(provider.id);
+  } catch {
+    say('Signed in, but the default memory model could not be saved. Configure it in settings.');
+  }
   say(`Signed in to ${provider.name}`);
 }
 

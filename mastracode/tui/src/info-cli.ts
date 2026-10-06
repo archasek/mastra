@@ -5,7 +5,14 @@ import { dirname, join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { readOAuthStatusFile } from '@mastra/code-sdk/auth/storage';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
-import { getAvailableThinkingLevelsForModel } from '@mastra/code-sdk/thinking';
+import {
+  getAvailableThinkingLevelsForModel,
+  normalizeThinkingLevelForModel,
+  parseThinkingLevel,
+  parseModeThinkingDefaults,
+  resolveDefaultThinkingLevel,
+  THINKING_LEVEL_DESCRIPTION,
+} from '@mastra/code-sdk/thinking';
 import { getAppDataDir } from '@mastra/code-sdk/utils/project';
 import { getCurrentVersion } from './version.js';
 
@@ -27,6 +34,17 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
   }
 
   const appDataDir = options.appDataDir ?? getAppDataDir({ create: false });
+  // Metadata must not invoke loadSettings, which can migrate and write files.
+  let settings: { preferences?: { thinkingLevel?: unknown }; models?: { modeThinkingDefaults?: unknown } } = {};
+  try {
+    settings = JSON.parse(readFileSync(join(appDataDir, 'settings.json'), 'utf8')) ?? {};
+  } catch {
+    // Native settings loading also falls back to defaults for absent/invalid JSON.
+  }
+  const thinkingDefaults = {
+    globalDefault: parseThinkingLevel(settings.preferences?.thinkingLevel),
+    modeDefaults: parseModeThinkingDefaults(settings.models?.modeThinkingDefaults),
+  };
   const auth = readOAuthStatusFile(join(appDataDir, 'auth.json'), 'openai-codex');
   const openaiAccess = auth.status === 'authenticated' ? 'oauth' : false;
   const openaiPack = getAvailableModePacks({
@@ -61,17 +79,28 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
     schemaVersion: 1,
     version: options.version ?? getCurrentVersion(),
     acpProtocolVersion: ACP_PROTOCOL_VERSION,
+    thinkingLevelDescription: THINKING_LEVEL_DESCRIPTION,
     capabilities: {
       loadSession: true,
       permissions: true,
       elicitation: true,
       images: true,
     },
-    models: [...modelModes].map(([id, modes]) => ({
-      id,
-      modes,
-      thinkingLevels: getAvailableThinkingLevelsForModel(id),
-    })),
+    models: [...modelModes].map(([id, modes]) => {
+      const defaults = new Set(
+        ['build', 'plan', 'fast'].map(mode =>
+          normalizeThinkingLevelForModel(resolveDefaultThinkingLevel(thinkingDefaults, mode).level, id),
+        ),
+      );
+      // A model-wide catalog default is truthful only when native modes agree.
+      // Active-session effort is reported separately through ACP configuration.
+      return {
+        id,
+        modes,
+        thinkingLevels: getAvailableThinkingLevelsForModel(id),
+        ...(defaults.size === 1 ? { defaultThinkingLevel: [...defaults][0] } : {}),
+      };
+    }),
     auth: { provider: 'openai-codex', status: auth.status },
   });
   return auth.status === 'unknown' ? 1 : 0;

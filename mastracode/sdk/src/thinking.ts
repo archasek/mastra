@@ -8,6 +8,20 @@ export interface ThinkingDefaults {
 }
 
 export const THINKING_LEVEL_VALUES: ThinkingLevelSetting[] = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
+export const DEFAULT_THINKING_LEVEL: ThinkingLevelSetting = 'off';
+export const THINKING_LEVEL_DESCRIPTION =
+  'MC requested levels, not verified backend capabilities. Default uses native model routing; GPT-5 maps it to Low. Other levels may be adjusted or rejected by the provider.';
+
+export function parseThinkingLevel(value: unknown): ThinkingLevelSetting {
+  return isThinkingLevelSetting(value) ? value : DEFAULT_THINKING_LEVEL;
+}
+
+export function parseModeThinkingDefaults(value: unknown): Record<string, ThinkingLevelSetting> {
+  if (!value || typeof value !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, ThinkingLevelSetting] => isThinkingLevelSetting(entry[1])),
+  );
+}
 
 export const THINK_COMMAND_DESCRIPTOR = {
   name: 'think',
@@ -41,6 +55,10 @@ export function getAvailableThinkingLevelsForModel(modelId: string): ThinkingLev
     return [...THINKING_LEVEL_VALUES];
   }
   return THINKING_LEVEL_VALUES.filter(level => level !== 'max');
+}
+
+export function normalizeThinkingLevelForModel(level: ThinkingLevelSetting, modelId: string): ThinkingLevelSetting {
+  return getAvailableThinkingLevelsForModel(modelId).includes(level) ? level : 'xhigh';
 }
 
 export function parseThinkCommand(

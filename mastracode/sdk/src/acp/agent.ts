@@ -30,7 +30,12 @@ import type {
 } from '@mastra/core/agent-controller';
 import { AuthStorage, getOAuthProviders, PROVIDER_DEFAULT_MODELS } from '../auth/storage.js';
 import { seedProviderOMDefault } from '../onboarding/om-settings.js';
-import { getAvailableThinkingLevelsForModel, isThinkingLevelSetting } from '../thinking.js';
+import {
+  getAvailableThinkingLevelsForModel,
+  isThinkingLevelSetting,
+  normalizeThinkingLevelForModel,
+  THINKING_LEVEL_DESCRIPTION,
+} from '../thinking.js';
 import type { ThinkingLevelSetting } from '../thinking.js';
 import { openUrlInBrowser } from '../utils/open-url.js';
 import { getCurrentVersion } from '../utils/update-check.js';
@@ -123,7 +128,7 @@ function credentialedDefaultModel(
   currentModelId: string,
 ): string | undefined {
   const current = available.find(model => model.id === currentModelId);
-  if (!current || current.hasApiKey) return undefined;
+  if (currentModelId !== '' && (!current || current.hasApiKey)) return undefined;
   const credentialed = new Set(available.filter(model => model.hasApiKey).map(model => model.id));
   return (
     Object.values(PROVIDER_DEFAULT_MODELS).find(modelId => credentialed.has(modelId)) ??
@@ -672,11 +677,11 @@ export class MastraCodeAcpAgent implements Agent {
         name: 'Reasoning effort',
         category: 'thought_level',
         type: 'select',
-        description: 'Requested reasoning level. The provider may adjust it for the selected model.',
+        description: THINKING_LEVEL_DESCRIPTION,
         currentValue: this.thinkingLevel(entry),
         options: getAvailableThinkingLevelsForModel(modelId).map(value => ({
           value,
-          name: value[0]!.toUpperCase() + value.slice(1),
+          name: value === 'off' ? 'Default' : value[0]!.toUpperCase() + value.slice(1),
         })),
       });
     return options;
@@ -684,8 +689,7 @@ export class MastraCodeAcpAgent implements Agent {
 
   private thinkingLevel(entry: SessionEntry): ThinkingLevelSetting {
     const level = entry.getThinkingLevel?.() ?? 'off';
-    const levels = getAvailableThinkingLevelsForModel(entry.session.model.get() ?? '');
-    return levels.includes(level) ? level : 'xhigh';
+    return normalizeThinkingLevelForModel(level, entry.session.model.get() ?? '');
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {

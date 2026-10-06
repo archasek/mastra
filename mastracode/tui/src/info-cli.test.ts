@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
-import { getAvailableThinkingLevelsForModel } from '@mastra/code-sdk/thinking';
+import { getAvailableThinkingLevelsForModel, THINKING_LEVEL_DESCRIPTION } from '@mastra/code-sdk/thinking';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { runInfoCli } from './info-cli.js';
@@ -23,6 +23,24 @@ afterEach(() => {
 });
 
 describe('mastracode info --json', () => {
+  it('omits a model-wide default when native mode defaults disagree', () => {
+    const appDataDir = makeTempDirectory();
+    writeFileSync(
+      join(appDataDir, 'auth.json'),
+      JSON.stringify({ 'openai-codex': { type: 'oauth', refresh: 'test', access: 'test', expires: 1 } }),
+    );
+    const settings = JSON.stringify({
+      preferences: { thinkingLevel: 'low' },
+      models: { modeThinkingDefaults: { build: 'high' } },
+    });
+    writeFileSync(join(appDataDir, 'settings.json'), settings);
+    const output: string[] = [];
+    expect(runInfoCli(['--json'], { appDataDir, version: 'test', writeStdout: line => output.push(line) })).toBe(0);
+    const info = JSON.parse(output.join(''));
+    expect(info.models.length).toBeGreaterThan(0);
+    for (const model of info.models) expect(model).not.toHaveProperty('defaultThinkingLevel');
+    expect(readFileSync(join(appDataDir, 'settings.json'), 'utf8')).toBe(settings);
+  });
   it('returns unauthenticated metadata without creating data or starting the harness', () => {
     const root = makeTempDirectory();
     const appDataDir = join(root, 'not-created');
@@ -36,8 +54,10 @@ describe('mastracode info --json', () => {
 
     const info = JSON.parse(output.join(''));
     expect(exitCode).toBe(0);
+    expect(info.thinkingLevelDescription).toBe(THINKING_LEVEL_DESCRIPTION);
     expect(info).toEqual({
       schemaVersion: 1,
+      thinkingLevelDescription: THINKING_LEVEL_DESCRIPTION,
       version: '1.2.3-test',
       acpProtocolVersion: ACP_PROTOCOL_VERSION,
       capabilities: { loadSession: true, permissions: true, elicitation: true, images: true },
@@ -49,6 +69,12 @@ describe('mastracode info --json', () => {
 
   it('includes native registry models beyond mode-pack defaults without emitting credentials', () => {
     const appDataDir = makeTempDirectory();
+    const settingsPath = join(appDataDir, 'settings.json');
+    const settingsText = JSON.stringify({
+      preferences: { thinkingLevel: 'high' },
+      models: { modeThinkingDefaults: { build: 'high' } },
+    });
+    writeFileSync(settingsPath, settingsText);
     const account = {
       type: 'oauth-account',
       id: 'openai-codex:account-123',
@@ -101,20 +127,24 @@ describe('mastracode info --json', () => {
         id,
         modes,
         thinkingLevels: getAvailableThinkingLevelsForModel(id),
+        defaultThinkingLevel: 'high',
       })),
     );
     expect(info.models).toContainEqual({
       id: 'openai/gpt-6.1-sol',
       modes: ['build', 'plan', 'fast'],
       thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+      defaultThinkingLevel: 'high',
     });
     expect(info.models).toContainEqual({
       id: 'openai/gpt-5.4-mini',
       modes: ['fast'],
       thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh'],
+      defaultThinkingLevel: 'high',
     });
     expect(info.models.some((model: { id: string }) => /image|audio|realtime/.test(model.id))).toBe(false);
     expect(info.auth).toEqual({ provider: 'openai-codex', status: 'authenticated' });
+    expect(readFileSync(settingsPath, 'utf8')).toBe(settingsText);
     expect(output.join('')).not.toContain('refresh-secret-marker');
     expect(output.join('')).not.toContain('access-secret-marker');
     expect(output.join('')).not.toContain('codex@example.test');
@@ -143,6 +173,7 @@ describe('mastracode info --json', () => {
       id: 'openai/gpt-6.1-sol',
       modes: ['build', 'plan', 'fast'],
       thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+      defaultThinkingLevel: 'high',
     });
   });
 

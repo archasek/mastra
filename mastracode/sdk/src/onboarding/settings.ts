@@ -18,7 +18,9 @@ import {
 } from '../providers/model-ids.js';
 import { buildCodexStagehandFetch, createCodexMiddleware } from '../providers/openai-codex.js';
 import {
-  isThinkingLevelSetting,
+  DEFAULT_THINKING_LEVEL,
+  parseThinkingLevel,
+  parseModeThinkingDefaults,
   resolveDefaultThinkingLevel as resolveThinkingDefault,
   THINKING_LEVEL_VALUES,
 } from '../thinking.js';
@@ -467,7 +469,7 @@ const DEFAULTS: GlobalSettings = {
   preferences: {
     yolo: null,
     theme: 'auto',
-    thinkingLevel: 'off',
+    thinkingLevel: DEFAULT_THINKING_LEVEL,
     subagentsEnabled: false,
     quietMode: false,
     quietModeMaxToolPreviewLines: 2,
@@ -529,21 +531,6 @@ function parseWebSearchProvider(value: unknown): WebSearchProviderSetting {
   return typeof value === 'string' && WEB_SEARCH_PROVIDER_VALUES.includes(value as WebSearchProviderSetting)
     ? (value as WebSearchProviderSetting)
     : DEFAULTS.preferences.webSearchProvider;
-}
-
-function parseThinkingLevel(value: unknown): ThinkingLevelSetting {
-  return isThinkingLevelSetting(value) ? value : DEFAULTS.preferences.thinkingLevel;
-}
-
-function parseModeThinkingDefaults(value: unknown): Record<string, ThinkingLevelSetting> {
-  if (!value || typeof value !== 'object') return {};
-  const result: Record<string, ThinkingLevelSetting> = {};
-  for (const [mode, level] of Object.entries(value as Record<string, unknown>)) {
-    if (isThinkingLevelSetting(level)) {
-      result[mode] = level;
-    }
-  }
-  return result;
 }
 
 function parseModePackOverrides(value: unknown): Record<string, Record<string, string>> {
