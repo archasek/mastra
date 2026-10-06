@@ -64,6 +64,8 @@ export interface MastraCodeState {
   omScope?: 'thread' | 'resource';
   /** Explicit model-pack identity for the current thread. */
   activeModelPackId?: string | null;
+  /** Native OpenAI route ownership survives logout and conversation restore. */
+  openaiAuthRoute?: 'oauth' | 'api-key';
   /**
    * Pending pack hop written by the account-rotation processor on a cascade
    * hop; cleared back to null once the TUI applies it. Declared here so
@@ -139,6 +141,7 @@ export const stateSchema = z.object({
   currentModelId: z.string().optional(),
   modeId: z.string().optional(),
   activeModelPackId: z.string().nullable().optional(),
+  openaiAuthRoute: z.enum(['oauth', 'api-key']).optional(),
   subagentModelId: z.string().optional(),
   projectPath: z.string().optional(),
   projectName: z.string().optional(),

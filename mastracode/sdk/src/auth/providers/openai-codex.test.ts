@@ -183,6 +183,33 @@ describe('OpenAI Codex OAuth account id extraction', () => {
     vi.unstubAllGlobals();
   });
 
+  it('cancels the native token request using its command owner signal', async () => {
+    const controller = new AbortController();
+    let started!: () => void;
+    const began = new Promise<void>(resolve => {
+      started = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_url, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+            started();
+          }),
+      ),
+    );
+    try {
+      const { refreshOpenAICodexToken } = await import('./openai-codex.js');
+      const pending = refreshOpenAICodexToken('synthetic-refresh', 'synthetic-account', undefined, controller.signal);
+      await began;
+      controller.abort(new Error('catalog deadline'));
+      await expect(pending).rejects.toThrow('catalog deadline');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('rejects refreshed tokens when no current or previous account id is available', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

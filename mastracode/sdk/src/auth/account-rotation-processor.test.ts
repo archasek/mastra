@@ -21,7 +21,7 @@ vi.hoisted(() => {
 });
 
 import { setCredentialStoreProvider } from '../agents/credential-resolver.js';
-import { createRequestScopedCredentialStore } from '../agents/model.js';
+import { createRequestScopedCredentialStore, requestPackAccess } from '../agents/model.js';
 import {
   ACCOUNT_SWITCH_PART_TYPE,
   PACK_FALLBACK_PART_TYPE,
@@ -49,6 +49,56 @@ const PROVIDER = 'anthropic';
 const KIMI_PROVIDER = 'kimi-for-coding';
 const FUTURE = Date.now() + 60 * 60 * 1000;
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+
+function makeInputArgs(overrides: Partial<Record<string, any>> = {}) {
+  return {
+    state: {} as Record<string, unknown>,
+    messages: [],
+    messageList: { marker: 'message-list' },
+    systemMessages: [],
+    writer: { custom: vi.fn(async () => {}) },
+    requestContext: {
+      get: (key: string) =>
+        key === 'controller' ? { session: { modelId: 'mastracode/anthropic/claude-fable-5' } } : undefined,
+    },
+    ...overrides,
+  };
+}
+
+describe('OAuth fast account binding', () => {
+  it('selects the saved Luna account rather than the active account and never spills after removal', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oauth-fast-binding-'));
+    tempDirs.push(dir);
+    const storage = new AuthStorage(join(dir, 'auth.json'));
+    await storage.addAccount('openai-codex', { access: 'a', refresh: 'ra', expires: FUTURE, accountId: 'a' });
+    await storage.addAccount('openai-codex', { access: 'b', refresh: 'rb', expires: FUTURE, accountId: 'b' });
+    const [a, b] = storage.listAccounts('openai-codex');
+    await storage.activateAccount('openai-codex', a!.id);
+    const settingsPath = join(dir, 'settings.json');
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        models: { activeModelPackId: 'openai', packAccountPreferences: { openai: { 'openai/gpt-6-luna': b!.id } } },
+      }),
+    );
+    const requestContext = new RequestContext();
+    requestContext.set('controller', {
+      session: { modelId: 'openai/gpt-6-luna', modeId: 'fast' },
+      getState: () => ({ activeModelPackId: 'openai' }),
+    });
+    const processor = new AccountStartNoticeProcessor({ credentialStore: storage, settingsPath });
+    await processor.processInput(makeInputArgs({ requestContext }) as any);
+    expect(getRequestAccountSelection(requestContext, 'openai-codex')).toBe(b!.id);
+    expect(requestPackAccess(requestContext, storage).openai).toBe('oauth');
+    await storage.removeAccount('openai-codex', b!.id);
+    const freshContext = new RequestContext();
+    freshContext.set('controller', requestContext.get('controller'));
+    await processor.processInput(makeInputArgs({ requestContext: freshContext }) as any);
+    expect(getRequestAccountSelection(freshContext, 'openai-codex')).not.toBe(a!.id);
+    expect(isRequestAccountRoutingExhausted(freshContext, 'openai-codex')).toBe(true);
+    expect(requestPackAccess(freshContext, storage).openai).toBe('oauth');
+  });
+});
 
 interface FabricatedAPIError extends Error {
   statusCode?: number;
@@ -613,21 +663,6 @@ describe('AccountRotationProcessor.processAPIError', () => {
 });
 
 describe('AccountStartNoticeProcessor.processInput', () => {
-  function makeInputArgs(overrides: Partial<Record<string, any>> = {}) {
-    return {
-      state: {} as Record<string, unknown>,
-      messages: [],
-      messageList: { marker: 'message-list' },
-      systemMessages: [],
-      writer: { custom: vi.fn(async () => {}) },
-      requestContext: {
-        get: (key: string) =>
-          key === 'controller' ? { session: { modelId: 'mastracode/anthropic/claude-fable-5' } } : undefined,
-      },
-      ...overrides,
-    };
-  }
-
   function makeSharedFileRoute(seeded: SeededStorage, targetAccountId?: string) {
     const settingsPath = join(dirname(seeded.authPath), 'settings.json');
     writeFileSync(

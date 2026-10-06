@@ -1,7 +1,23 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { LoadSessionRequest, McpServer, NewSessionRequest } from '@agentclientprotocol/sdk';
+import { Agent } from '@mastra/core/agent';
+import { AgentController } from '@mastra/core/agent-controller';
+import { InMemoryStore } from '@mastra/core/storage';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MastraCodeGateway } from '../agents/mastracode-gateway.js';
+import { AuthStorage } from '../auth/storage.js';
+import type { CredentialStore } from '../auth/types.js';
 import { bootLocalAgentController } from '../index.js';
 import { loadSettings, resolveDefaultThinkingLevel } from '../onboarding/settings.js';
+import {
+  CODEX_CATALOG_CLIENT_VERSION,
+  CODEX_CATALOG_ENDPOINT,
+  CODEX_CATALOG_FILENAME,
+  CODEX_CATALOG_TTL_MS,
+  readCodexCatalog,
+} from '../providers/openai-codex-catalog.js';
 import { createAcpSession, mapAcpMcpServers } from './runtime.js';
 
 vi.mock('../onboarding/settings.js', () => ({
@@ -13,11 +29,17 @@ vi.mock('../index.js', () => ({ bootLocalAgentController: vi.fn() }));
 
 function bootResult() {
   const session = {
+    model: { get: vi.fn(() => 'openai/gpt-6-luna') },
     abort: vi.fn(),
     mode: { get: vi.fn(() => 'build') },
-    state: { get: vi.fn(() => ({})) },
+    state: {
+      get: vi.fn<() => { openaiAuthRoute?: 'oauth' | 'api-key' }>(() => ({})),
+      set: vi.fn().mockResolvedValue(undefined),
+    },
     thread: {
       getId: vi.fn(() => 'boot-thread'),
+      getSetting: vi.fn().mockResolvedValue(undefined),
+      setSetting: vi.fn().mockResolvedValue(undefined),
       detachFromCurrent: vi.fn().mockResolvedValue(undefined),
       clearAndReleaseLock: vi.fn().mockResolvedValue(undefined),
     },
@@ -34,6 +56,7 @@ function bootResult() {
   };
   return {
     session,
+    authStorage: { get: vi.fn<CredentialStore['get']>(() => undefined), reload: vi.fn() },
     controller: {
       listModes: () => [{ id: 'build' }],
       getMastra: () => ({ stopWorkers, shutdown }),
@@ -56,6 +79,203 @@ function bootResult() {
 function newRequest(mcpServers: McpServer[] = []): NewSessionRequest {
   return { cwd: '/project', mcpServers };
 }
+
+describe('ACP native OAuth catalog ownership', () => {
+  it('persists ownership through native thread storage and a fresh controller after logout', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hq-mc-native-route-'));
+    const oldDir = process.env.MASTRA_APP_DATA_DIR;
+    process.env.MASTRA_APP_DATA_DIR = dir;
+    const storage = new InMemoryStore();
+    const makeController = () =>
+      new AgentController({
+        id: 'native-route-controller',
+        storage,
+        modes: [
+          {
+            id: 'build',
+            name: 'Build',
+            default: true,
+            agent: new Agent({
+              id: 'native-route-agent',
+              name: 'Native route',
+              instructions: 'Test only; never invoked.',
+              model: 'openai/gpt-6-luna',
+            }),
+          },
+        ],
+      });
+    const credential = {
+      type: 'oauth' as const,
+      access: 'synthetic',
+      refresh: 'synthetic',
+      expires: Date.now() + 60_000,
+      accountId: 'a',
+    };
+    writeFileSync(
+      join(dir, 'auth.json'),
+      JSON.stringify({ 'apikey:openai-codex': { type: 'api_key', key: 'synthetic-key' } }),
+    );
+    try {
+      const first = makeController();
+      await first.init();
+      const firstSession = await first.createSession({ id: 'first', ownerId: 'owner' });
+      const thread = await firstSession.thread.create();
+      const firstBoot = bootResult();
+      const nativeAuth = new AuthStorage(join(dir, 'auth.json'));
+      vi.mocked(bootLocalAgentController).mockResolvedValueOnce({
+        ...firstBoot,
+        authStorage: nativeAuth,
+        session: firstSession,
+      } as never);
+      const firstRuntime = await createAcpSession(newRequest());
+      const memory = await storage.getStore('memory');
+      expect((await memory!.getThreadById({ threadId: thread.id }))?.metadata?.openaiAuthRoute).toBeUndefined();
+      writeFileSync(join(dir, 'auth.json'), JSON.stringify({ 'openai-codex': credential }));
+      writeFileSync(
+        join(dir, CODEX_CATALOG_FILENAME),
+        JSON.stringify({
+          schemaVersion: 1,
+          provider: 'openai-codex',
+          scope: { kind: 'legacy', accountId: 'a' },
+          endpoint: CODEX_CATALOG_ENDPOINT,
+          clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+          fetchedAt: Date.now(),
+          expiresAt: Date.now() + CODEX_CATALOG_TTL_MS,
+          slugs: ['gpt-6-luna'],
+        }),
+      );
+      await firstRuntime.modelCatalog!.admitModel!('openai/gpt-6-luna');
+      expect((await memory!.getThreadById({ threadId: thread.id }))?.metadata?.openaiAuthRoute).toBe('oauth');
+      await firstRuntime.cleanup?.();
+      writeFileSync(
+        join(dir, 'auth.json'),
+        JSON.stringify({ 'apikey:openai-codex': { type: 'api_key', key: 'synthetic-key' } }),
+      );
+      const restarted = makeController();
+      await restarted.init();
+      const restoredSession = await restarted.createSession({ id: 'restored', ownerId: 'owner' });
+      await restoredSession.thread.switch({ threadId: thread.id });
+      const restoredBoot = bootResult();
+      const restoredAuth = new AuthStorage(join(dir, 'auth.json'));
+      expect(restoredAuth.getStoredApiKey('openai-codex')).toBe('synthetic-key');
+      vi.mocked(bootLocalAgentController).mockResolvedValueOnce({
+        ...restoredBoot,
+        authStorage: restoredAuth,
+        session: restoredSession,
+      } as never);
+      const restored = await createAcpSession({ ...newRequest(), sessionId: thread.id });
+      expect(restored.modelCatalog!.isOAuthModel('openai/gpt-6-luna')).toBe(true);
+      const gatewayKey = vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+      try {
+        expect(restored.modelCatalog!.isOAuthModel('mastra/openai/gpt-6-luna')).toBe(true);
+        expect(() => restored.modelCatalog!.assertModel('mastra/openai/gpt-6-luna')).toThrow('Refresh');
+        gatewayKey.mockReturnValue('synthetic-gateway-key');
+        expect(restored.modelCatalog!.isOAuthModel('mastra/openai/gpt-6-luna')).toBe(false);
+        expect(() => restored.modelCatalog!.assertModel('mastra/openai/gpt-6-luna')).not.toThrow();
+      } finally {
+        gatewayKey.mockRestore();
+      }
+      expect(() => restored.modelCatalog!.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      await restored.cleanup?.();
+    } finally {
+      if (oldDir === undefined) delete process.env.MASTRA_APP_DATA_DIR;
+      else process.env.MASTRA_APP_DATA_DIR = oldDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the shared offline member set and rejects account change, expiry and sign-out', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hq-mc-runtime-catalog-'));
+    const oldDir = process.env.MASTRA_APP_DATA_DIR;
+    process.env.MASTRA_APP_DATA_DIR = dir;
+    const now = Date.now();
+    const auth = {
+      'openai-codex': {
+        type: 'oauth' as const,
+        access: 'synthetic',
+        refresh: 'synthetic',
+        expires: now + 60_000,
+        accountId: 'account-a',
+      },
+    };
+    const cache = {
+      schemaVersion: 1,
+      provider: 'openai-codex',
+      scope: { kind: 'legacy', accountId: 'account-a' },
+      endpoint: CODEX_CATALOG_ENDPOINT,
+      clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+      fetchedAt: now,
+      expiresAt: now + CODEX_CATALOG_TTL_MS,
+      slugs: ['gpt-6.1-sol', 'gpt-6-luna'],
+    };
+    const publish = () => {
+      writeFileSync(join(dir, 'auth.json'), JSON.stringify(auth));
+      writeFileSync(join(dir, CODEX_CATALOG_FILENAME), JSON.stringify(cache));
+    };
+    publish();
+    const boot = bootResult();
+    boot.authStorage.get.mockImplementation(provider =>
+      provider === 'openai-codex' ? JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))[provider] : undefined,
+    );
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    try {
+      const runtime = await createAcpSession(newRequest());
+      expect(boot.session.state.set).toHaveBeenCalledWith({ openaiAuthRoute: 'oauth' });
+      const catalog = runtime.modelCatalog!;
+      const generic = [
+        { id: 'openai/gpt-5.4-mini', hasApiKey: true },
+        { id: 'other/model', hasApiKey: true },
+      ];
+      expect(catalog.filterModels(generic).map(model => model.id)).toEqual([
+        'other/model',
+        ...readCodexCatalog(dir).models,
+      ]);
+      expect(() => catalog.assertModel('openai/gpt-6-luna')).not.toThrow();
+      expect(() => catalog.assertModel('openai/gpt-5.4-mini')).toThrow('Refresh');
+      auth['openai-codex'].accountId = 'account-b';
+      publish();
+      expect(() => catalog.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      auth['openai-codex'].accountId = 'account-a';
+      cache.fetchedAt = now - CODEX_CATALOG_TTL_MS;
+      cache.expiresAt = now;
+      publish();
+      expect(catalog.filterModels(generic)).toEqual([{ id: 'other/model', hasApiKey: true }]);
+      writeFileSync(join(dir, 'auth.json'), '{}');
+      expect(catalog.isOAuthModel('openai/gpt-6-luna')).toBe(true);
+      expect(() => catalog.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      expect(() => catalog.assertModel('other/model')).not.toThrow();
+      await runtime.cleanup?.();
+      // A fresh controller must hydrate persisted ownership, not decide its
+      // route from the currently signed-out credential slot.
+      const restored = bootResult();
+      restored.session.thread.getSetting.mockResolvedValue('oauth');
+      restored.authStorage.get.mockImplementation(provider =>
+        provider === 'openai' ? { type: 'api_key', key: 'synthetic-key' } : undefined,
+      );
+      vi.mocked(bootLocalAgentController).mockResolvedValueOnce(restored as never);
+      const restoredRuntime = await createAcpSession({ ...newRequest(), sessionId: 'boot-thread' });
+      expect(() => restoredRuntime.modelCatalog!.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      expect(restored.session.state.set).toHaveBeenCalledWith({ openaiAuthRoute: 'oauth' });
+      await restoredRuntime.cleanup?.();
+    } finally {
+      if (oldDir === undefined) delete process.env.MASTRA_APP_DATA_DIR;
+      else process.env.MASTRA_APP_DATA_DIR = oldDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-OAuth OpenAI and other-provider inventory', async () => {
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(bootResult() as never);
+    const runtime = await createAcpSession(newRequest());
+    const models = [
+      { id: 'openai/gpt-5.4-mini', hasApiKey: true },
+      { id: 'other/custom', hasApiKey: true },
+    ];
+    expect(runtime.modelCatalog!.filterModels(models)).toEqual(models);
+    expect(() => runtime.modelCatalog!.assertModel('openai/gpt-5.4-mini')).not.toThrow();
+    await runtime.cleanup?.();
+  });
+});
 
 describe('ACP HTTP MCP mapping', () => {
   it('accepts HTTPS with caller-provided headers and local loopback HTTP', () => {

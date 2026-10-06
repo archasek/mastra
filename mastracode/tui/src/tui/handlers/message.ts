@@ -352,7 +352,7 @@ export async function handlePackFallbackState(
   if (!isOriginThreadActive()) return;
 
   const settings = loadSettings();
-  const packs = listResolvableModePacks(settings);
+  const packs = listResolvableModePacks(settings, pending.openaiAccess ? { openai: pending.openaiAccess } : {});
   const pack = packs.find(candidate => candidate.id === pending.toPackId);
   if (!pack) {
     await clearPending();
@@ -363,7 +363,9 @@ export async function handlePackFallbackState(
     usingPack: pack.name,
     failedPack: failedPack?.name ?? pending.fromPackId,
   };
-  const packModels = resolveModePackModels(settings, pack) as Record<string, string>;
+  const packModels = { ...resolveModePackModels(settings, pack) } as Record<string, string>;
+  // The queued hop is the selected model, not a newly recomputed default.
+  packModels[pending.modeId ?? ectx.state.session.mode.get()] = pending.toModelId;
 
   // Persist the complete landed-pack identity to the originating thread before
   // touching live session state. Every write remains bound to that thread even

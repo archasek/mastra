@@ -6,6 +6,8 @@ import {
   getAvailableOmPacks,
   resolveProviderOMDefault,
   selectPreferredOMPack,
+  listBuiltinModePacks,
+  pruneUnknownPackAccountPreferences,
   type ProviderAccess,
 } from '../packs.js';
 
@@ -22,7 +24,7 @@ function providerAccess(overrides: Partial<ProviderAccess> = {}): ProviderAccess
 }
 
 describe('getAvailableModePacks', () => {
-  it('uses GPT-5.6 for OpenAI plan and build modes while keeping fast on GPT-5.4 mini', () => {
+  it('uses the catalog-backed OAuth fast default without changing build and plan', () => {
     const packs = getAvailableModePacks({
       anthropic: false,
       openai: 'oauth',
@@ -35,8 +37,28 @@ describe('getAvailableModePacks', () => {
     expect(packs.find(pack => pack.id === 'openai')?.models).toEqual({
       plan: 'openai/gpt-5.6-sol',
       build: 'openai/gpt-5.6-sol',
-      fast: 'openai/gpt-5.4-mini',
+      fast: 'openai/gpt-6-luna',
     });
+  });
+
+  it('preserves API-key mini and uses the same OAuth defaults for fallback resolution', () => {
+    expect(getAvailableModePacks(providerAccess({ openai: 'apikey' })).find(p => p.id === 'openai')?.models.fast).toBe(
+      'openai/gpt-5.4-mini',
+    );
+    expect(listBuiltinModePacks({ openai: 'oauth' }).find(p => p.id === 'openai')?.models.fast).toBe(
+      'openai/gpt-6-luna',
+    );
+    expect(listBuiltinModePacks().find(p => p.id === 'openai')?.models.fast).toBe('openai/gpt-5.4-mini');
+  });
+
+  it('retains both access-specific account bindings and never rewrites custom mini', () => {
+    const preferences = {
+      openai: { 'openai/gpt-5.4-mini': 'api', 'openai/gpt-6-luna': 'oauth' },
+      'custom:saved': { 'openai/gpt-5.4-mini': 'saved' },
+    };
+    expect(
+      pruneUnknownPackAccountPreferences(preferences, [{ name: 'saved', models: { fast: 'openai/gpt-5.4-mini' } }]),
+    ).toEqual(preferences);
   });
 
   it('keeps the OpenAI OAuth post-login default aligned with the build model', () => {
@@ -103,7 +125,7 @@ describe('getAvailableModePacks', () => {
 describe('OM packs', () => {
   it.each([
     ['anthropic', 'anthropic', 'anthropic/claude-haiku-4-5'],
-    ['openai-codex', 'openai', 'openai/gpt-5.4-mini'],
+    ['openai-codex', 'openai', 'openai/gpt-6-luna'],
     ['openai', 'openai', 'openai/gpt-5.4-mini'],
     ['google', 'gemini', 'google/gemini-3.5-flash'],
   ])('maps %s to the %s OM pack', (providerId, packId, modelId) => {
@@ -144,7 +166,7 @@ describe('selectPreferredOMPack', () => {
   it('prefers the matching reachable provider over earlier packs', () => {
     const pack = selectPreferredOMPack(providerAccess({ anthropic: 'oauth', openai: 'oauth' }), 'openai-codex');
 
-    expect(pack).toMatchObject({ id: 'openai', modelId: 'openai/gpt-5.4-mini' });
+    expect(pack).toMatchObject({ id: 'openai', modelId: 'openai/gpt-6-luna' });
   });
 
   it('ignores a selected provider that is not reachable', () => {

@@ -4,6 +4,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { listBuiltinModePacks } from '../../../../sdk/src/onboarding/packs.js';
 
 const mocks = vi.hoisted(() => ({
   loadSettings: vi.fn(),
@@ -63,6 +64,31 @@ function makeContext() {
 }
 
 describe('handlePackFallbackState', () => {
+  it('retains OAuth fast hop identity in mode and Explore persistence', async () => {
+    const { ectx, threadSetSetting, modelSwitch } = makeContext();
+    vi.mocked(ectx.state.session.mode.get).mockReturnValue('fast');
+    vi.mocked(ectx.state.controller.listModes).mockReturnValue([{ id: 'fast' }] as never);
+    mocks.listResolvableModePacks.mockImplementation((_settings, access) => listBuiltinModePacks(access));
+    await handlePackFallbackState(ectx, {
+      changedKeys: [KEY],
+      state: {
+        [KEY]: {
+          fromPackId: 'anthropic',
+          toPackId: 'openai',
+          toModelId: 'openai/gpt-6-luna',
+          openaiAccess: 'oauth',
+          threadId: 'thread-1',
+          reason: 'pool-exhausted',
+          at: '2026-10-06',
+        },
+      },
+    });
+    expect(mocks.listResolvableModePacks).toHaveBeenCalledWith(expect.anything(), { openai: 'oauth' });
+    for (const key of ['modeModelId_fast', 'subagentModelId_explore']) {
+      expect(threadSetSetting).toHaveBeenCalledWith({ threadId: 'thread-1', key, value: 'openai/gpt-6-luna' });
+    }
+    expect(modelSwitch).toHaveBeenCalledWith({ modelId: 'openai/gpt-6-luna' });
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.loadSettings.mockReturnValue({

@@ -6,6 +6,7 @@ import { getRequestAccountSelection, isRequestAccountRoutingExhausted } from '..
 import { ProviderAuthRequiredError } from '../auth/provider-auth-error.js';
 import type { CredentialStore, OAuthAccountRecord } from '../auth/types.js';
 import { listBuiltinModePacks, resolveModePackFallbackChain } from '../onboarding/packs.js';
+import type { ProviderAccess } from '../onboarding/packs.js';
 import {
   findModePackForModel,
   loadSettings,
@@ -15,8 +16,11 @@ import {
 } from '../onboarding/settings.js';
 import { AMAZON_BEDROCK_GATEWAY_ID, createAmazonBedrockGateway } from '../providers/amazon-bedrock-gateway.js';
 import type { AnthropicPromptCacheScope } from '../providers/anthropic-prompt-cache.js';
+import { remapOpenAIModelForCodexOAuth } from '../providers/model-ids.js';
+import { readCodexCatalog } from '../providers/openai-codex-catalog.js';
 import { isThinkingLevelSetting } from '../thinking.js';
 import type { ThinkingLevelSetting } from '../thinking.js';
+import { getAppDataDir } from '../utils/project.js';
 import { resolveCredentialStore } from './credential-resolver.js';
 import { resolveCustomProviders } from './custom-provider-source.js';
 import {
@@ -219,8 +223,63 @@ export function resolveModel(
   // Deployed web registers a per-tenant credential store provider; when the
   // request carries an authenticated tenant, resolve credentials through the
   // caller's own store (user > org > env). Undefined = global AuthStorage.
-  const baseCredentialStore = resolveCredentialStore(options?.requestContext) ?? getGlobalAuthStorage();
-  const credentialStore = createRequestScopedCredentialStore(baseCredentialStore, options?.requestContext);
+  const tenantCredentialStore = resolveCredentialStore(options?.requestContext);
+  const baseCredentialStore = tenantCredentialStore ?? getGlobalAuthStorage();
+  let credentialStore = createRequestScopedCredentialStore(baseCredentialStore, options?.requestContext);
+  const ownsOAuthRoute =
+    getRequestAccountSelection(options?.requestContext, 'openai-codex') !== undefined ||
+    isRequestAccountRoutingExhausted(options?.requestContext, 'openai-codex');
+  if (
+    !tenantCredentialStore &&
+    providerId === 'openai' &&
+    !(mgApiKey && isMastraGatewayModel) &&
+    ownsOAuthRoute &&
+    credentialStore.get('openai-codex')?.type !== 'oauth'
+  ) {
+    // A missing selected account is not permission to spend an environment key.
+    throw new ProviderAuthRequiredError('OpenAI Codex OAuth is required for the selected account.');
+  }
+  // Only the local native OAuth route owns this account-scoped cache. Tenant
+  // stores and an explicitly selected gateway retain their existing contract.
+  if (
+    !tenantCredentialStore &&
+    providerId === 'openai' &&
+    !(mgApiKey && isMastraGatewayModel) &&
+    credentialStore.get('openai-codex')?.type === 'oauth'
+  ) {
+    const scoped = credentialStore;
+    const assertAdmission = (accountId: unknown, accountInstanceId: string | undefined) => {
+      const appDataDir = getAppDataDir({ create: false });
+      const catalog = readCodexCatalog(appDataDir);
+      const nativeId = stripMastraGatewayPrefix(remapOpenAIModelForCodexOAuth(normalizedModelId));
+      if (
+        catalog.status !== 'ready' ||
+        !catalog.models.includes(nativeId) ||
+        catalog.scope.accountId !== accountId ||
+        (catalog.scope.kind === 'registered' && catalog.scope.accountInstanceId !== accountInstanceId)
+      ) {
+        throw new ProviderAuthRequiredError(
+          'OpenAI Codex model is unavailable for the selected account. Refresh the Mastra Code model catalog.',
+        );
+      }
+    };
+    const selected =
+      getRequestAccountSelection(options?.requestContext, 'openai-codex') ??
+      baseCredentialStore.getActiveAccount?.('openai-codex')?.id;
+    const credential = scoped.get('openai-codex');
+    if (credential?.type === 'oauth') assertAdmission(credential.accountId, selected);
+    credentialStore = {
+      ...scoped,
+      getOAuthCredential: async provider => {
+        const snapshot = await scoped.getOAuthCredential?.(provider);
+        if (provider === 'openai-codex') {
+          if (!snapshot) throw new ProviderAuthRequiredError('OpenAI Codex OAuth is required for this request.');
+          assertAdmission(snapshot.accountId, snapshot.accountInstanceId);
+        }
+        return snapshot;
+      },
+    };
+  }
   const gateway = createMastraCodeGateway({
     mastraGatewayBaseUrl: rawGatewayBase.replace(/\/+$/, '').replace(/\/v1$/, ''),
     mastraGatewayApiKey: mgApiKey,
@@ -288,15 +347,34 @@ export interface ResolvableModePack {
 }
 
 /** All packs a fallback chain may reference: every builtin plus saved customs. */
-export function listResolvableModePacks(settings: ReturnType<typeof loadSettings>): ResolvableModePack[] {
+export function listResolvableModePacks(
+  settings: ReturnType<typeof loadSettings>,
+  access: Partial<ProviderAccess> = {},
+): ResolvableModePack[] {
   return [
-    ...listBuiltinModePacks(),
+    ...listBuiltinModePacks(access),
     ...settings.customModelPacks.map(pack => ({
       id: `custom:${pack.name}`,
       name: pack.name,
       models: { ...pack.models },
     })),
   ];
+}
+
+export function requestPackAccess(
+  requestContext?: RequestContext,
+  fallbackStore?: CredentialStore,
+): Partial<ProviderAccess> {
+  const base = resolveCredentialStore(requestContext) ?? fallbackStore ?? getGlobalAuthStorage();
+  base.reload();
+  const credentials = createRequestScopedCredentialStore(base, requestContext);
+  // Exhaustion/removal denies credentials, not the request's declared route.
+  // Otherwise a fallback built after exhaustion could switch back to API-key
+  // pack defaults even though this request still belongs to OAuth.
+  const routedOAuth =
+    getRequestAccountSelection(requestContext, 'openai-codex') !== undefined ||
+    isRequestAccountRoutingExhausted(requestContext, 'openai-codex');
+  return { openai: routedOAuth || credentials.get('openai-codex')?.type === 'oauth' ? 'oauth' : 'apikey' };
 }
 
 /**
@@ -359,7 +437,7 @@ export function getDynamicModel(
   if (Object.keys(fallbacks).length === 0) return primary;
 
   const modeId = agentControllerContext?.session?.modeId ?? 'build';
-  const packs = listResolvableModePacks(settings);
+  const packs = listResolvableModePacks(settings, requestPackAccess(requestContext));
   const pendingPackId =
     pendingFallback && typeof pendingFallback.toPackId === 'string' && pendingFallback.toPackId.length > 0
       ? pendingFallback.toPackId
@@ -427,7 +505,7 @@ export function resolvePackMemoryModelChain(
   startPackId: string,
   resolveOptions: Parameters<typeof resolveModel>[1],
 ): GatewayLanguageModel | PackMemoryModelChainEntry[] | undefined {
-  const packs = listResolvableModePacks(settings);
+  const packs = listResolvableModePacks(settings, requestPackAccess(resolveOptions?.requestContext));
   if (!packs.some(pack => pack.id === startPackId)) return undefined;
 
   const chain = resolveModePackFallbackChain(

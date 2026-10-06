@@ -2,9 +2,16 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
+import {
+  CODEX_CATALOG_CLIENT_VERSION,
+  CODEX_CATALOG_ENDPOINT,
+  CODEX_CATALOG_FILENAME,
+  CODEX_CATALOG_TTL_MS,
+  readCodexCatalog,
+} from '@mastra/code-sdk/providers/openai-codex-catalog';
 import { getAvailableThinkingLevelsForModel, THINKING_LEVEL_DESCRIPTION } from '@mastra/code-sdk/thinking';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -18,6 +25,26 @@ function makeTempDirectory(): string {
   return directory;
 }
 
+function writeCatalog(
+  appDataDir: string,
+  scope: { kind: 'legacy' | 'registered'; accountId: string; accountInstanceId?: string },
+) {
+  const fetchedAt = Date.now();
+  writeFileSync(
+    join(appDataDir, CODEX_CATALOG_FILENAME),
+    JSON.stringify({
+      schemaVersion: 1,
+      provider: 'openai-codex',
+      scope,
+      endpoint: CODEX_CATALOG_ENDPOINT,
+      clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+      fetchedAt,
+      expiresAt: fetchedAt + CODEX_CATALOG_TTL_MS,
+      slugs: ['gpt-6.1-sol', 'gpt-6-luna'],
+    }),
+  );
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -27,8 +54,11 @@ describe('mastracode info --json', () => {
     const appDataDir = makeTempDirectory();
     writeFileSync(
       join(appDataDir, 'auth.json'),
-      JSON.stringify({ 'openai-codex': { type: 'oauth', refresh: 'test', access: 'test', expires: 1 } }),
+      JSON.stringify({
+        'openai-codex': { type: 'oauth', refresh: 'test', access: 'test', expires: 1, accountId: 'account-a' },
+      }),
     );
+    writeCatalog(appDataDir, { kind: 'legacy', accountId: 'account-a' });
     const settings = JSON.stringify({
       preferences: { thinkingLevel: 'low' },
       models: { modeThinkingDefaults: { build: 'high' } },
@@ -62,12 +92,13 @@ describe('mastracode info --json', () => {
       acpProtocolVersion: ACP_PROTOCOL_VERSION,
       capabilities: { loadSession: true, permissions: true, elicitation: true, images: true },
       models: [],
+      catalog: { source: 'account-cache', status: 'unbound', clientVersion: CODEX_CATALOG_CLIENT_VERSION },
       auth: { provider: 'openai-codex', status: 'unauthenticated' },
     });
     expect(existsSync(appDataDir)).toBe(false);
   });
 
-  it('includes native registry models beyond mode-pack defaults without emitting credentials', () => {
+  it('includes only dated account members, in backend order, without emitting credentials', () => {
     const appDataDir = makeTempDirectory();
     const settingsPath = join(appDataDir, 'settings.json');
     const settingsText = JSON.stringify({
@@ -84,14 +115,24 @@ describe('mastracode info --json', () => {
       refresh: 'refresh-secret-marker',
       access: 'access-secret-marker',
       expires: 1,
+      accountId: 'account-a',
     };
     writeFileSync(
       join(appDataDir, 'auth.json'),
       JSON.stringify({
-        'openai-codex': { type: 'oauth', refresh: account.refresh, access: account.access, expires: account.expires },
+        'openai-codex': {
+          type: 'oauth',
+          refresh: account.refresh,
+          access: account.access,
+          expires: account.expires,
+          accountId: account.accountId,
+        },
         'accounts:openai-codex:account-123': account,
       }),
     );
+    writeCatalog(appDataDir, { kind: 'registered', accountId: account.accountId, accountInstanceId: account.id });
+    const authBefore = readFileSync(join(appDataDir, 'auth.json'), 'utf8');
+    const cacheBefore = readFileSync(join(appDataDir, CODEX_CATALOG_FILENAME), 'utf8');
     const output: string[] = [];
 
     const exitCode = runInfoCli(['--json'], {
@@ -111,21 +152,18 @@ describe('mastracode info --json', () => {
     }).find(item => item.id === 'openai');
     const expectedModels = new Map<string, string[]>();
     for (const [mode, id] of Object.entries(pack?.models ?? {})) {
+      if (!readCodexCatalog(appDataDir).models.includes(id)) continue;
       expectedModels.set(id, [...(expectedModels.get(id) ?? []), mode]);
     }
-    const coreRoot = dirname(createRequire(import.meta.url).resolve('@mastra/core/package.json'));
-    const registry = JSON.parse(readFileSync(join(coreRoot, 'dist/provider-registry.json'), 'utf8'));
-    for (const name of registry.providers.openai.models as string[]) {
-      if (!/^gpt-\d/.test(name) || /(?:image|audio|realtime)/i.test(name)) continue;
-      const id = `openai/${name}`;
+    for (const id of readCodexCatalog(appDataDir).models) {
       if (!expectedModels.has(id)) expectedModels.set(id, ['build', 'plan', 'fast']);
     }
 
     expect(exitCode).toBe(0);
     expect(info.models).toEqual(
-      [...expectedModels].map(([id, modes]) => ({
+      readCodexCatalog(appDataDir).models.map(id => ({
         id,
-        modes,
+        modes: expectedModels.get(id),
         thinkingLevels: getAvailableThinkingLevelsForModel(id),
         defaultThinkingLevel: 'high',
       })),
@@ -136,15 +174,13 @@ describe('mastracode info --json', () => {
       thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
       defaultThinkingLevel: 'high',
     });
-    expect(info.models).toContainEqual({
-      id: 'openai/gpt-5.4-mini',
-      modes: ['fast'],
-      thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh'],
-      defaultThinkingLevel: 'high',
-    });
+    expect(info.models.some((model: { id: string }) => model.id === 'openai/gpt-5.4-mini')).toBe(false);
+    expect(info.models.map((model: { id: string }) => model.id)).toEqual(readCodexCatalog(appDataDir).models);
     expect(info.models.some((model: { id: string }) => /image|audio|realtime/.test(model.id))).toBe(false);
     expect(info.auth).toEqual({ provider: 'openai-codex', status: 'authenticated' });
     expect(readFileSync(settingsPath, 'utf8')).toBe(settingsText);
+    expect(readFileSync(join(appDataDir, 'auth.json'), 'utf8')).toBe(authBefore);
+    expect(readFileSync(join(appDataDir, CODEX_CATALOG_FILENAME), 'utf8')).toBe(cacheBefore);
     expect(output.join('')).not.toContain('refresh-secret-marker');
     expect(output.join('')).not.toContain('access-secret-marker');
     expect(output.join('')).not.toContain('codex@example.test');
@@ -175,6 +211,32 @@ describe('mastracode info --json', () => {
       thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
       defaultThinkingLevel: 'high',
     });
+    expect(readFileSync(settingsPath, 'utf8')).toBe(settingsText);
+    expect(readFileSync(join(appDataDir, 'auth.json'), 'utf8')).toBe(authBefore);
+    expect(readFileSync(join(appDataDir, CODEX_CATALOG_FILENAME), 'utf8')).toBe(cacheBefore);
+  });
+
+  it('reports authenticated without inventing models when the catalog is missing', () => {
+    const appDataDir = makeTempDirectory();
+    writeFileSync(
+      join(appDataDir, 'auth.json'),
+      JSON.stringify({
+        'openai-codex': {
+          type: 'oauth',
+          refresh: 'test',
+          access: 'test',
+          expires: 1,
+          accountId: 'account-a',
+        },
+      }),
+    );
+    const output: string[] = [];
+    expect(runInfoCli(['--json'], { appDataDir, writeStdout: line => output.push(line) })).toBe(0);
+    const info = JSON.parse(output.join(''));
+    expect(info.auth.status).toBe('authenticated');
+    expect(info.catalog.status).toBe('missing');
+    expect(info.models).toEqual([]);
+    expect(existsSync(join(appDataDir, CODEX_CATALOG_FILENAME))).toBe(false);
   });
 
   it('reports malformed auth state as unknown without rewriting it', () => {

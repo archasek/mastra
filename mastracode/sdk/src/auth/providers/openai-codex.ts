@@ -213,11 +213,11 @@ async function exchangeAuthorizationCode(
   return tokenResponseToResult((await response.json()) as TokenResponseJson, 'token');
 }
 
-async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
+async function refreshAccessToken(refreshToken: string, signal?: AbortSignal): Promise<TokenResult> {
   try {
     const response = await fetch(TOKEN_URL, {
       method: 'POST',
-      signal: requestSignal(),
+      signal: requestSignal(signal),
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'refresh_token',
@@ -233,6 +233,7 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
 
     return tokenResponseToResult((await response.json()) as TokenResponseJson, 'Token refresh');
   } catch {
+    signal?.throwIfAborted();
     console.error('[openai-codex] Token refresh request failed');
     return { type: 'failed' };
   }
@@ -778,8 +779,9 @@ export async function refreshOpenAICodexToken(
   refreshToken: string,
   previousAccountId?: string,
   previousEmail?: string,
+  signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
-  const result = await refreshAccessToken(refreshToken);
+  const result = await refreshAccessToken(refreshToken, signal);
   if (result.type !== 'success') {
     throw new Error('Failed to refresh OpenAI Codex token');
   }
@@ -813,11 +815,12 @@ export const openaiCodexOAuthProvider: OAuthProviderInterface = {
     });
   },
 
-  async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+  async refreshToken(credentials: OAuthCredentials, options?: { signal?: AbortSignal }): Promise<OAuthCredentials> {
     return refreshOpenAICodexToken(
       credentials.refresh,
       credentials.accountId as string | undefined,
       credentials.email as string | undefined,
+      options?.signal,
     );
   },
 

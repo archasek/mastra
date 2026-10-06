@@ -22,6 +22,8 @@ vi.hoisted(() => {
 });
 
 import { anthropicOAuthProvider } from './providers/anthropic.js';
+import { openaiCodexOAuthProvider } from './providers/openai-codex.js';
+import { readOpenAICodexCatalogScope } from './read-only.js';
 import { AuthStorage, readOAuthStatusFile } from './storage.js';
 import type { OAuthAccountRecord, OAuthCredential, OAuthCredentials } from './types.js';
 
@@ -81,7 +83,156 @@ afterEach(() => {
   }
 });
 
+describe('bounded native OpenAI credential acquisition', () => {
+  function expiredStorage() {
+    return makeStorage({ [CODEX]: { ...oauthCred('r-old', 'a-old', PAST), accountId: 'account-a' } });
+  }
+  const fresh = { refresh: 'r-new', access: 'a-new', expires: FUTURE, accountId: 'account-a' };
+
+  it('cancels a joined waiter without cancelling the existing native refresh', async () => {
+    const { storage, authPath } = expiredStorage();
+    let resolveRefresh!: (value: OAuthCredentials) => void;
+    const refresh = vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockImplementation(
+      () =>
+        new Promise(resolve => {
+          resolveRefresh = resolve;
+        }),
+    );
+    const native = storage.getOAuthCredential(CODEX);
+    await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf('function'));
+    const controller = new AbortController();
+    const bounded = storage.getOAuthCredential(CODEX, undefined, { signal: controller.signal });
+    controller.abort(new Error('catalog cancelled'));
+    await expect(bounded).rejects.toThrow('catalog cancelled');
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh.mock.calls[0]).toHaveLength(1);
+    resolveRefresh(fresh);
+    await expect(native).resolves.toMatchObject(fresh);
+    expect(readAuthJson(authPath)[CODEX]).toMatchObject(fresh);
+  });
+
+  it('passes cancellation to its own native refresh and releases its locks', async () => {
+    const { storage, authPath } = expiredStorage();
+    let started!: () => void;
+    const began = new Promise<void>(resolve => {
+      started = resolve;
+    });
+    const refresh = vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockImplementation(
+      (_credential, options) =>
+        new Promise((_resolve, reject) => {
+          expect(options?.signal).toBeDefined();
+          options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+          started();
+        }),
+    );
+    const controller = new AbortController();
+    const bounded = storage.getOAuthCredential(CODEX, undefined, { signal: controller.signal });
+    await began;
+    const ordinaryWaiter = storage.getApiKey(CODEX);
+    controller.abort(new Error('owner request cancelled'));
+    await expect(bounded).rejects.toThrow('owner request cancelled');
+    await expect(ordinaryWaiter).resolves.toBeUndefined();
+    expect(readAuthJson(authPath)[CODEX]).toMatchObject({ access: 'a-old', refresh: 'r-old' });
+    refresh.mockResolvedValue(fresh);
+    // A separate owner must reacquire the same OS-visible refresh lock.
+    await expect(new AuthStorage(authPath).getOAuthCredential(CODEX)).resolves.toMatchObject(fresh);
+  });
+
+  it('bounds auth-file lock waiting without changing the held file', async () => {
+    const { storage, authPath } = expiredStorage();
+    const lockfile = createRequire(import.meta.url)('proper-lockfile');
+    const release = await lockfile.lock(authPath, { realpath: false });
+    const lock = vi.spyOn(lockfile, 'lock');
+    const before = readFileSync(authPath, 'utf8');
+    const refresh = vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockResolvedValue(fresh);
+    const controller = new AbortController();
+    try {
+      const bounded = storage.getOAuthCredential(CODEX, undefined, { signal: controller.signal });
+      await vi.waitFor(() => expect(lock).toHaveBeenCalledWith(authPath, expect.objectContaining({ retries: 0 })));
+      controller.abort(new Error('lock wait cancelled'));
+      await expect(bounded).rejects.toThrow('lock wait cancelled');
+      expect(refresh).not.toHaveBeenCalled();
+      expect(readFileSync(authPath, 'utf8')).toBe(before);
+    } finally {
+      await release();
+    }
+    await expect(new AuthStorage(authPath).getOAuthCredential(CODEX)).resolves.toMatchObject(fresh);
+  });
+
+  it('persists a successful rotation even when the requesting command is cancelled', async () => {
+    const { storage, authPath } = expiredStorage();
+    const controller = new AbortController();
+    const lockfile = createRequire(import.meta.url)('proper-lockfile');
+    const instanceId = storage.getActiveAccount(CODEX)!.id;
+    const refreshLock = `${authPath}.refresh-${createHash('sha256')
+      .update(JSON.stringify([CODEX, instanceId]))
+      .digest('hex')}`;
+    vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockImplementation(async () => {
+      // Commit exclusion must already be owned before the token is spent.
+      await expect(lockfile.lock(authPath, { realpath: false, retries: 0 })).rejects.toMatchObject({ code: 'ELOCKED' });
+      controller.abort(new Error('cancel after successful response'));
+      return fresh;
+    });
+    await expect(storage.getOAuthCredential(CODEX, undefined, { signal: controller.signal })).rejects.toThrow(
+      'cancel after successful response',
+    );
+    expect(readAuthJson(authPath)[CODEX]).toMatchObject(fresh);
+    expect(await lockfile.check(refreshLock, { realpath: false })).toBe(false);
+    const release = await lockfile.lock(authPath, { realpath: false, retries: 0 });
+    await release();
+  });
+});
+
 describe('read-only OAuth status', () => {
+  it('keeps legacy catalog identity stable across token rotation without writing', () => {
+    const authPath = makeRawAuthFile({ [CODEX]: { ...oauthCred('r1', 'a1', PAST), accountId: 'workspace-a' } });
+    const expected = { kind: 'legacy', accountId: 'workspace-a' };
+    const before = readFileSync(authPath, 'utf8');
+    expect(readOpenAICodexCatalogScope(authPath)).toEqual(expected);
+    expect(readFileSync(authPath, 'utf8')).toBe(before);
+    writeFileSync(authPath, JSON.stringify({ [CODEX]: { ...oauthCred('r2', 'a2'), accountId: 'workspace-a' } }));
+    expect(readOpenAICodexCatalogScope(authPath)).toEqual(expected);
+  });
+
+  it.each(['missing-identity', 'foreign-slot', 'duplicate-active', 'wrong-key', 'signed-out'])(
+    'does not bind ambiguous catalog credentials: %s',
+    scenario => {
+      const account = { ...accountRecord('r1', 'a1', { active: true }), id: `${CODEX}:one`, accountId: 'workspace-a' };
+      const data: Record<string, unknown> = {
+        [CODEX]: { ...oauthCred('r1', 'a1'), accountId: 'workspace-a' },
+        [`accounts:${CODEX}:one`]: account,
+      };
+      if (scenario === 'missing-identity') delete (data[CODEX] as Record<string, unknown>).accountId;
+      if (scenario === 'foreign-slot') (data[CODEX] as Record<string, unknown>).accountId = 'workspace-b';
+      if (scenario === 'duplicate-active') data[`accounts:${CODEX}:two`] = { ...account, id: `${CODEX}:two` };
+      if (scenario === 'wrong-key') {
+        delete data[`accounts:${CODEX}:one`];
+        data[`accounts:${CODEX}:wrong`] = account;
+      }
+      if (scenario === 'signed-out') delete data[CODEX];
+      const authPath = makeRawAuthFile(data),
+        before = readFileSync(authPath, 'utf8');
+      expect(readOpenAICodexCatalogScope(authPath)).toBeUndefined();
+      expect(readFileSync(authPath, 'utf8')).toBe(before);
+    },
+  );
+
+  it('binds registered scope without requiring identical rotated access tokens', () => {
+    const account = {
+      ...accountRecord('r1', 'old-access', { active: true }),
+      id: `${CODEX}:one`,
+      accountId: 'workspace-a',
+    };
+    const authPath = makeRawAuthFile({
+      [CODEX]: { ...oauthCred('r1', 'new-access'), accountId: 'workspace-a' },
+      [`accounts:${CODEX}:one`]: account,
+    });
+    expect(readOpenAICodexCatalogScope(authPath)).toEqual({
+      kind: 'registered',
+      accountInstanceId: `${CODEX}:one`,
+      accountId: 'workspace-a',
+    });
+  });
   it('reports malformed legacy OAuth slots as unknown without modifying the auth file', () => {
     const malformedSlots = [
       { type: 'oauth' },

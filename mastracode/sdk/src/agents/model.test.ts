@@ -14,17 +14,97 @@ import { join } from 'node:path';
 import { MastraGateway } from '@mastra/core/llm';
 import { RequestContext } from '@mastra/core/request-context';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { setRequestAccountSelection } from '../auth/account-routing-context.js';
+import { setRequestAccountSelection, markRequestAccountRoutingExhausted } from '../auth/account-routing-context.js';
 import type { CredentialStore } from '../auth/types.js';
 import { loadSettings } from '../onboarding/settings.js';
+import {
+  CODEX_CATALOG_CLIENT_VERSION,
+  CODEX_CATALOG_ENDPOINT,
+  CODEX_CATALOG_FILENAME,
+  CODEX_CATALOG_TTL_MS,
+} from '../providers/openai-codex-catalog.js';
+import * as codexProvider from '../providers/openai-codex.js';
 import { setCredentialStoreProvider } from './credential-resolver.js';
-import { MastraCodeGateway } from './mastracode-gateway.js';
+import { getGlobalAuthStorage, MastraCodeGateway } from './mastracode-gateway.js';
 import {
   createRequestScopedCredentialStore,
   getDynamicModel,
   resolveModel,
   resolvePackMemoryModelChain,
+  requestPackAccess,
 } from './model.js';
+
+describe('native OAuth model admission', () => {
+  it('rejects a deleted selected OAuth account before constructing an environment-key provider', () => {
+    const oldKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'synthetic-never-used';
+    try {
+      const storage = getGlobalAuthStorage();
+      vi.spyOn(storage, 'reload').mockImplementation(() => {});
+      vi.spyOn(storage, 'listAccounts').mockReturnValue([]);
+      vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+      const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth');
+      const context = new RequestContext();
+      setRequestAccountSelection(context, 'openai-codex', 'deleted-b');
+      expect(() => resolveModel('openai/gpt-6-luna', { requestContext: context })).toThrow('OAuth is required');
+      expect(() => resolveModel('mastra/openai/gpt-6-luna', { requestContext: context })).toThrow('OAuth is required');
+      const exhausted = new RequestContext();
+      markRequestAccountRoutingExhausted(exhausted, 'openai-codex');
+      expect(() => resolveModel('openai/gpt-6-luna', { requestContext: exhausted })).toThrow('OAuth is required');
+      expect(() => resolveModel('mastra/openai/gpt-6-luna', { requestContext: exhausted })).toThrow(
+        'OAuth is required',
+      );
+      expect(auth).not.toHaveBeenCalled();
+    } finally {
+      if (oldKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = oldKey;
+    }
+  });
+  it('rejects unlisted background models and rechecks account identity at native acquisition', async () => {
+    mkdirSync(appDataDir, { recursive: true });
+    const storage = getGlobalAuthStorage();
+    const now = Date.now();
+    const credential = {
+      type: 'oauth' as const,
+      access: 'synthetic',
+      refresh: 'synthetic',
+      expires: now + 60_000,
+      accountId: 'account-a',
+    };
+    writeFileSync(join(appDataDir, 'auth.json'), JSON.stringify({ 'openai-codex': credential }));
+    writeFileSync(
+      join(appDataDir, CODEX_CATALOG_FILENAME),
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: 'openai-codex',
+        scope: { kind: 'legacy', accountId: 'account-a' },
+        endpoint: CODEX_CATALOG_ENDPOINT,
+        clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+        fetchedAt: now,
+        expiresAt: now + CODEX_CATALOG_TTL_MS,
+        slugs: ['gpt-6-luna'],
+      }),
+    );
+    vi.spyOn(storage, 'reload').mockImplementation(() => {});
+    vi.spyOn(storage, 'get').mockImplementation(provider => (provider === 'openai-codex' ? credential : undefined));
+    vi.spyOn(storage, 'getActiveAccount').mockReturnValue(undefined);
+    const acquisition = vi.spyOn(storage, 'getOAuthCredential').mockResolvedValue(credential);
+    const native = vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({} as never);
+    const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockImplementation(function () {
+      return { apiKey: 'synthetic' } as never;
+    });
+    expect(() => resolveModel('openai/gpt-5.4-mini')).toThrow('unavailable');
+    expect(auth).not.toHaveBeenCalled();
+    expect(requestPackAccess().openai).toBe('oauth');
+    expect(() => resolveModel('openai/gpt-6-luna')).not.toThrow();
+    const facade = native.mock.calls[0]![1]!.authStorage!;
+    await expect(facade.getOAuthCredential!('openai-codex')).resolves.toMatchObject({ accountId: 'account-a' });
+    acquisition.mockResolvedValue({ ...credential, accountId: 'account-b' });
+    await expect(facade.getOAuthCredential!('openai-codex')).rejects.toThrow('unavailable');
+    writeFileSync(join(appDataDir, 'auth.json'), '{}');
+    expect(() => resolveModel('openai/gpt-6-luna')).toThrow('unavailable');
+  });
+});
 
 afterEach(() => {
   if (previousEnv.kimiApiKey === undefined) delete process.env.KIMI_API_KEY;

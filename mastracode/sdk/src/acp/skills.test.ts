@@ -20,6 +20,7 @@ function skill(name: string, fields: Partial<Skill> = {}): Skill {
 
 function runtime(id: string, catalog: Skill[]) {
   let emit: (event: AgentControllerEvent) => void = () => {};
+  let modelId = '';
   const sent: string[] = [];
   const skills = {
     list: async () => catalog,
@@ -37,7 +38,12 @@ function runtime(id: string, catalog: Skill[]) {
     session: {
       thread: { create: async () => ({ id }), getId: () => id, switch: async () => {} },
       mode: { get: () => 'build' },
-      model: { get: () => '' },
+      model: {
+        get: () => modelId,
+        switch: async (selection: { modelId: string }) => {
+          modelId = selection.modelId;
+        },
+      },
       subscribe: (listener: typeof emit) => {
         emit = listener;
         return () => {};

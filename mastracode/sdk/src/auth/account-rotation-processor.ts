@@ -23,7 +23,12 @@ import { TripWire } from '@mastra/core/agent';
 import type { ProcessAPIErrorArgs, ProcessInputArgs, ProcessInputResult, Processor } from '@mastra/core/processors';
 
 import { resolveCredentialStore } from '../agents/credential-resolver.js';
-import { listResolvableModePacks, resolveModel, resolveRequestThinkingLevel } from '../agents/model.js';
+import {
+  listResolvableModePacks,
+  requestPackAccess,
+  resolveModel,
+  resolveRequestThinkingLevel,
+} from '../agents/model.js';
 import { resolveModePackFallbackChain } from '../onboarding/packs.js';
 import { findModePackForModel, loadSettings, resolveModePackModels } from '../onboarding/settings.js';
 import {
@@ -141,6 +146,9 @@ export interface PendingPackFallback {
   toPackId: string;
   /** Landed pack's model for the mode the cascade is serving. */
   toModelId: string;
+  /** Request-selected access, retained across asynchronous TUI persistence. */
+  openaiAccess?: 'oauth' | 'apikey';
+  modeId?: string;
   /** Originating thread. Absent only on pending hops written by older clients. */
   threadId?: string;
   reason: 'pool-exhausted' | 'persistent-outage';
@@ -511,6 +519,7 @@ function getRequestActiveAccount(
 
 function resolveAccountRoute(
   args: Pick<RoutingProcessorArgs, 'requestContext'>,
+  store: CredentialStore,
   settingsPath?: string,
   explicit?: { packId: string; modelId: string },
 ): AccountRoute | null {
@@ -533,7 +542,7 @@ function resolveAccountRoute(
   const modelId = resolvedModelId;
 
   const settings = loadSettings(settingsPath);
-  const packs = listResolvableModePacks(settings);
+  const packs = listResolvableModePacks(settings, requestPackAccess(args.requestContext, store));
   const modeId =
     typeof controller?.session?.modeId === 'string' && controller.session.modeId.length > 0
       ? controller.session.modeId
@@ -686,8 +695,11 @@ export class AccountRotationProcessor implements Processor {
     const active = getRequestActiveAccount(args, store, providerId);
     const route =
       currentPack && typeof cascadeModelId === 'string'
-        ? resolveAccountRoute(args, this.options.settingsPath, { packId: currentPack.packId, modelId: cascadeModelId })
-        : resolveAccountRoute(args, this.options.settingsPath);
+        ? resolveAccountRoute(args, store, this.options.settingsPath, {
+            packId: currentPack.packId,
+            modelId: cascadeModelId,
+          })
+        : resolveAccountRoute(args, store, this.options.settingsPath);
 
     // Q7 bucket 2: force one refresh of the active instance before rotating.
     // A 401 usually means a fresh-but-rejected token; the forced refresh
@@ -803,7 +815,10 @@ export class AccountRotationProcessor implements Processor {
         ? controller.session.modeId
         : 'build';
     const settings = loadSettings(this.options.settingsPath);
-    const packs = listResolvableModePacks(settings);
+    const packs = listResolvableModePacks(
+      settings,
+      requestPackAccess(args.requestContext, this.options.credentialStore),
+    );
     const controllerState = controller?.getState?.();
     const statePackId = controllerState?.activeModelPackId ?? settings.models.activeModelPackId;
     const activePack = findModePackForModel(
@@ -916,6 +931,9 @@ export class AccountRotationProcessor implements Processor {
       fromPackId: from.packId,
       toPackId: to.packId,
       toModelId,
+      openaiAccess:
+        requestPackAccess(args.requestContext, this.options.credentialStore).openai === 'oauth' ? 'oauth' : 'apikey',
+      ...(typeof controller?.session?.modeId === 'string' ? { modeId: controller.session.modeId } : {}),
       ...(threadId ? { threadId } : {}),
       reason,
       at,
@@ -945,7 +963,10 @@ export class AccountRotationProcessor implements Processor {
     // durable. A failure here must not strand a provider-global account
     // switch with no durable fallback state — the start-notice processor
     // re-applies routing when the retried request begins on the target pack.
-    const targetRoute = resolveAccountRoute(args, this.options.settingsPath, { packId: to.packId, modelId: toModelId });
+    const targetRoute = resolveAccountRoute(args, this.options.credentialStore, this.options.settingsPath, {
+      packId: to.packId,
+      modelId: toModelId,
+    });
     if (targetRoute) {
       // Deployed requests must hop on the tenant store: activating the target
       // pack's preferred account on the host registry would mutate a local
@@ -1025,7 +1046,7 @@ export class AccountStartNoticeProcessor implements Processor {
     // the constructor's storage.
     const store = resolveCredentialStore(args.requestContext) ?? this.options.credentialStore;
 
-    const route = resolveAccountRoute(args, this.options.settingsPath);
+    const route = resolveAccountRoute(args, store, this.options.settingsPath);
     if (route) {
       const switched = await applyPreferredAccountRoute(args, store, this.options.settingsPath, route);
       if (switched || getRouteTargetAccountId(this.options.settingsPath, route) !== undefined) {

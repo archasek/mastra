@@ -121,12 +121,21 @@ export function getBuiltinModePack(packId: string): (ModePack & { providerId: st
  * even when an access probe is stale; actual auth failures surface through
  * the provider call itself.
  */
-export function listBuiltinModePacks(): ModePack[] {
+export const OPENAI_CODEX_FAST_MODEL = 'openai/gpt-6-luna';
+
+function modePackModels(pack: BuiltinModePack, access: ProviderAccessLevel): ModePack['models'] {
+  return {
+    ...pack.models,
+    ...(pack.providerId === 'openai' && access === 'oauth' ? { fast: OPENAI_CODEX_FAST_MODEL } : {}),
+  };
+}
+
+export function listBuiltinModePacks(access: Partial<ProviderAccess> = {}): ModePack[] {
   return BUILTIN_MODE_PACKS.map(pack => ({
     id: pack.id,
     name: pack.name,
     description: pack.description('apikey'),
-    models: { ...pack.models },
+    models: modePackModels(pack, access[pack.providerId] ?? 'apikey'),
   }));
 }
 
@@ -169,6 +178,11 @@ export function pruneUnknownPackAccountPreferences(
   const packModels = new Map<string, Set<string>>();
   for (const pack of listBuiltinModePacks()) {
     packModels.set(pack.id, new Set(Object.values({ ...pack.models, ...modePackOverrides[pack.id] })));
+  }
+  // Bindings are durable account choices, not a snapshot of one access method.
+  for (const pack of listBuiltinModePacks({ openai: 'oauth' })) {
+    const models = packModels.get(pack.id)!;
+    for (const model of Object.values({ ...pack.models, ...modePackOverrides[pack.id] })) models.add(model);
   }
   for (const pack of savedCustomPacks) {
     // Settings files are user-editable: a malformed entry without `models`
@@ -238,7 +252,7 @@ export function getAvailableModePacks(
         id: pack.id,
         name: pack.name,
         description: pack.description(providerAccess),
-        models: { ...pack.models },
+        models: modePackModels(pack, providerAccess),
       },
     ];
   });
@@ -316,9 +330,9 @@ export function resolveProviderOMDefault(providerId: string, fallbackModelId = D
   if (builtin) {
     return {
       id: builtin.id,
-      name: builtin.name,
-      description: builtin.description('apikey'),
-      modelId: builtin.modelId,
+      name: providerId === 'openai-codex' ? 'OpenAI Luna' : builtin.name,
+      description: builtin.description(providerId === 'openai-codex' ? 'oauth' : 'apikey'),
+      modelId: providerId === 'openai-codex' ? OPENAI_CODEX_FAST_MODEL : builtin.modelId,
     };
   }
 
@@ -337,9 +351,9 @@ export function getAvailableOmPacks(access: ProviderAccess): OMPack[] {
     return [
       {
         id: pack.id,
-        name: pack.name,
+        name: pack.providerId === 'openai' && providerAccess === 'oauth' ? 'OpenAI Luna' : pack.name,
         description: pack.description(providerAccess),
-        modelId: pack.modelId,
+        modelId: pack.providerId === 'openai' && providerAccess === 'oauth' ? OPENAI_CODEX_FAST_MODEL : pack.modelId,
       },
     ];
   });
