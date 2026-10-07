@@ -73,11 +73,43 @@ export interface OpenAICodexCatalogScope {
 }
 
 /** Strict stable scope for a catalog; ambiguity never grants model availability. */
-export function readOpenAICodexCatalogScope(authPath: string): OpenAICodexCatalogScope | undefined {
+export function readOpenAICodexCatalogScope(
+  authPath: string,
+  accountInstanceId?: string,
+  expectedCredential?: OAuthCredentials,
+): OpenAICodexCatalogScope | undefined {
   const data = readAuth(authPath);
   if (typeof data === 'string') return undefined;
+  if (accountInstanceId !== undefined) {
+    if (
+      Object.entries(data).some(
+        ([key, value]) =>
+          key.startsWith('accounts:openai-codex:') && (!isOAuthAccountRecord(value) || key !== `accounts:${value.id}`),
+      )
+    )
+      return undefined;
+    const record = data[`accounts:${accountInstanceId}`];
+    if (!isOAuthAccountRecord(record) || record.id !== accountInstanceId || !record.id.startsWith('openai-codex:')) {
+      return undefined;
+    }
+    if (
+      typeof record.accountId !== 'string' ||
+      !record.accountId.trim() ||
+      record.accountId !== record.accountId.trim()
+    ) {
+      return undefined;
+    }
+    if (
+      expectedCredential &&
+      (record.refresh !== expectedCredential.refresh || record.access !== expectedCredential.access)
+    )
+      return undefined;
+    return { kind: 'registered', accountInstanceId, accountId: record.accountId };
+  }
   const slot = data['openai-codex'];
   if (!hasOAuthCredentialFields(slot) || (slot as { type?: unknown }).type !== 'oauth') return undefined;
+  if (expectedCredential && (slot.refresh !== expectedCredential.refresh || slot.access !== expectedCredential.access))
+    return undefined;
   const accountId = slot.accountId;
   if (typeof accountId !== 'string' || !accountId.trim() || accountId !== accountId.trim()) return undefined;
   const entries = Object.entries(data).filter(([key]) => key.startsWith('accounts:openai-codex:'));

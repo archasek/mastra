@@ -11,6 +11,7 @@ import {
   CODEX_CATALOG_FILENAME,
   CODEX_CATALOG_MAX_BYTES,
   readCodexCatalog,
+  codexCatalogPath,
 } from '../openai-codex-catalog.js';
 
 const dirs: string[] = [];
@@ -34,6 +35,124 @@ afterEach(() => {
 });
 
 describe('native catalog publication', () => {
+  it('invalidates rejected pinned A after activating B without changing B evidence', async () => {
+    const { dir, credential } = fixture();
+    const record = (suffix: string, active: boolean) => ({
+      ...credential,
+      type: 'oauth-account',
+      id: `openai-codex:${suffix}`,
+      label: suffix,
+      addedAt: '2026-10-07T00:00:00Z',
+      active,
+      accountId: `account-${suffix}`,
+      access: `access-${suffix}`,
+      refresh: `refresh-${suffix}`,
+    });
+    const a = record('a', true),
+      b = record('b', false);
+    writeFileSync(
+      join(dir, 'auth.json'),
+      JSON.stringify({
+        'openai-codex': { ...credential, accountId: a.accountId, access: a.access, refresh: a.refresh },
+        [`accounts:${a.id}`]: a,
+        [`accounts:${b.id}`]: b,
+      }),
+    );
+    const owner = new AuthStorage(join(dir, 'auth.json'));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ models: [{ slug: 'gpt-6-luna', visibility: 'list' }] })),
+    );
+    await refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+    await owner.activateAccount('openai-codex', b.id);
+    await refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+    const bPath = codexCatalogPath(dir, { kind: 'registered', accountInstanceId: b.id, accountId: b.accountId });
+    const beforeB = readFileSync(bPath, 'utf8');
+    await owner.activateAccount('openai-codex', a.id);
+    let answer!: (value: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        () =>
+          new Promise<Response>(resolve => {
+            answer = resolve;
+          }),
+      ),
+    );
+    const pending = refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'CREDENTIAL_REJECTED' });
+    await vi.waitFor(() => expect(answer).toBeTypeOf('function'));
+    await owner.activateAccount('openai-codex', b.id);
+    answer(new Response('rejected', { status: 401 }));
+    await rejected;
+    expect(readCodexCatalog(dir, Date.now(), a.id).status).toBe('invalid');
+    expect(readCodexCatalog(dir).status).toBe('ready');
+    expect(readFileSync(bPath, 'utf8')).toBe(beforeB);
+    await owner.activateAccount('openai-codex', a.id);
+    expect(readCodexCatalog(dir).status).toBe('invalid');
+  });
+  it('retains separate dated catalogs across native account activation without fetching during reads', async () => {
+    const { dir, credential } = fixture();
+    const record = (suffix: string, active: boolean) => ({
+      ...credential,
+      type: 'oauth-account',
+      id: `openai-codex:${suffix}`,
+      label: suffix,
+      addedAt: '2026-10-06T00:00:00Z',
+      active,
+      accountId: `account-${suffix}`,
+      refresh: `refresh-${suffix}`,
+      access: `access-${suffix}`,
+    });
+    const a = record('a', true);
+    const b = record('b', false);
+    writeFileSync(
+      join(dir, 'auth.json'),
+      JSON.stringify({
+        'openai-codex': { ...credential, accountId: a.accountId, refresh: a.refresh, access: a.access },
+        [`accounts:${a.id}`]: a,
+        [`accounts:${b.id}`]: b,
+      }),
+    );
+    const owner = new AuthStorage(join(dir, 'auth.json'));
+    const fetch = vi.fn(async (request: Request) =>
+      Response.json({
+        models: [
+          {
+            slug: request.headers.get('chatgpt-account-id') === 'account-a' ? 'model-a' : 'model-b',
+            visibility: 'list',
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal('fetch', fetch);
+    await refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+    await owner.activateAccount('openai-codex', b.id);
+    await refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+    await owner.activateAccount('openai-codex', a.id);
+    expect(readCodexCatalog(dir).models).toEqual(['openai/model-a']);
+    expect(readCodexCatalog(dir, Date.now(), b.id).models).toEqual(['openai/model-b']);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const current = JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'));
+    delete current[`accounts:${b.id}`];
+    writeFileSync(join(dir, 'auth.json'), JSON.stringify(current));
+    expect(readCodexCatalog(dir, Date.now(), b.id)).toEqual({ status: 'unbound', models: [] });
+  });
+
+  it.each(['not-json', JSON.stringify({ models: 'invalid' })])(
+    'reports malformed successful responses as invalid catalog without retry: %s',
+    async body => {
+      const { dir, credential } = fixture();
+      const fetch = vi.fn(async () => new Response(body));
+      vi.stubGlobal('fetch', fetch);
+      await expect(fetchCodexCatalogSnapshot({ appDataDir: dir, credential })).rejects.toMatchObject({
+        code: 'CATALOG_INVALID',
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(existsSync(join(dir, CODEX_CATALOG_FILENAME))).toBe(false);
+    },
+  );
+
   it('serializes writers and cancels a waiting command without a second GET', async () => {
     const { dir } = fixture();
     const owner = new AuthStorage(join(dir, 'auth.json'));
@@ -133,7 +252,7 @@ describe('native catalog publication', () => {
     await expect(refreshCodexCatalog({ appDataDir: dir, authStorage: owner })).rejects.toMatchObject({
       code: 'CREDENTIAL_REJECTED',
     });
-    expect(readCodexCatalog(dir)).toEqual({ status: 'missing', models: [] });
+    expect(readCodexCatalog(dir)).toEqual({ status: 'invalid', models: [] });
   });
 });
 

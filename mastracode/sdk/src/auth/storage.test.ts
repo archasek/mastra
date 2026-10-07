@@ -92,7 +92,7 @@ describe('bounded native OpenAI credential acquisition', () => {
   it('cancels a joined waiter without cancelling the existing native refresh', async () => {
     const { storage, authPath } = expiredStorage();
     let resolveRefresh!: (value: OAuthCredentials) => void;
-    const refresh = vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockImplementation(
+    const refresh = vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockImplementationOnce(
       () =>
         new Promise(resolve => {
           resolveRefresh = resolve;
@@ -111,29 +111,33 @@ describe('bounded native OpenAI credential acquisition', () => {
     expect(readAuthJson(authPath)[CODEX]).toMatchObject(fresh);
   });
 
-  it('passes cancellation to its own native refresh and releases its locks', async () => {
+  it('releases a cancelled owner before an ordinary joiner acquires its own refresh', async () => {
     const { storage, authPath } = expiredStorage();
     let started!: () => void;
     const began = new Promise<void>(resolve => {
       started = resolve;
     });
-    const refresh = vi.spyOn(openaiCodexOAuthProvider, 'refreshToken').mockImplementation(
-      (_credential, options) =>
-        new Promise((_resolve, reject) => {
-          expect(options?.signal).toBeDefined();
-          options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
-          started();
-        }),
-    );
+    const refresh = vi
+      .spyOn(openaiCodexOAuthProvider, 'refreshToken')
+      .mockImplementationOnce(
+        (_credential, options) =>
+          new Promise((_resolve, reject) => {
+            expect(options?.signal).toBeDefined();
+            options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+            started();
+          }),
+      )
+      .mockResolvedValue(fresh);
     const controller = new AbortController();
     const bounded = storage.getOAuthCredential(CODEX, undefined, { signal: controller.signal });
     await began;
     const ordinaryWaiter = storage.getApiKey(CODEX);
     controller.abort(new Error('owner request cancelled'));
     await expect(bounded).rejects.toThrow('owner request cancelled');
-    await expect(ordinaryWaiter).resolves.toBeUndefined();
-    expect(readAuthJson(authPath)[CODEX]).toMatchObject({ access: 'a-old', refresh: 'r-old' });
-    refresh.mockResolvedValue(fresh);
+    await expect(ordinaryWaiter).resolves.toBe('a-new');
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(refresh.mock.calls[1]).toHaveLength(1);
+    expect(readAuthJson(authPath)[CODEX]).toMatchObject(fresh);
     // A separate owner must reacquire the same OS-visible refresh lock.
     await expect(new AuthStorage(authPath).getOAuthCredential(CODEX)).resolves.toMatchObject(fresh);
   });

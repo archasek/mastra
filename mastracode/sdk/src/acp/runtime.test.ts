@@ -29,7 +29,7 @@ vi.mock('../index.js', () => ({ bootLocalAgentController: vi.fn() }));
 
 function bootResult() {
   const session = {
-    model: { get: vi.fn(() => 'openai/gpt-6-luna') },
+    model: { get: vi.fn(() => 'openai/gpt-6-luna'), set: vi.fn().mockResolvedValue(undefined) },
     abort: vi.fn(),
     mode: { get: vi.fn(() => 'build') },
     state: {
@@ -81,6 +81,29 @@ function newRequest(mcpServers: McpServer[] = []): NewSessionRequest {
 }
 
 describe('ACP native OAuth catalog ownership', () => {
+  it('hydrates legacy model metadata without rewriting the saved selection', async () => {
+    const boot = bootResult();
+    boot.session.thread.getSetting.mockImplementation(async ({ key }: { key: string }) =>
+      key === 'currentModelId' ? 'openai/gpt-5.5' : undefined,
+    );
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    const runtime = await createAcpSession({ ...newRequest(), sessionId: 'legacy-thread' });
+    expect(boot.session.model.set).toHaveBeenCalledWith({ modelId: 'openai/gpt-5.5' });
+    expect(boot.session.thread.setSetting).not.toHaveBeenCalled();
+    await runtime.cleanup?.();
+  });
+
+  it('preserves modern per-mode metadata over legacy model metadata', async () => {
+    const boot = bootResult();
+    boot.session.thread.getSetting.mockImplementation(async ({ key }: { key: string }) =>
+      key === 'modeModelId_build' ? 'openai/gpt-6-luna' : key === 'currentModelId' ? 'openai/gpt-5.5' : undefined,
+    );
+    vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
+    const runtime = await createAcpSession({ ...newRequest(), sessionId: 'modern-thread' });
+    expect(boot.session.model.set).not.toHaveBeenCalled();
+    await runtime.cleanup?.();
+  });
+
   it('persists ownership through native thread storage and a fresh controller after logout', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hq-mc-native-route-'));
     const oldDir = process.env.MASTRA_APP_DATA_DIR;

@@ -675,9 +675,13 @@ export function fallbackPackCandidates(packs: ModePack[], packId: string): ModeP
   return packs.filter(p => p.id !== packId && p.id !== 'custom');
 }
 
-export function resetBuiltinPackOverrides(settings: GlobalSettings, packId: string): void {
+export function resetBuiltinPackOverrides(
+  settings: GlobalSettings,
+  packId: string,
+  access: Partial<ProviderAccess> = {},
+): void {
   delete settings.models.modePackOverrides?.[packId];
-  const builtinPack = getBuiltinModePack(packId);
+  const builtinPack = getBuiltinModePack(packId, access);
   const accountPreferences = settings.models.packAccountPreferences?.[packId];
   if (builtinPack && accountPreferences) {
     const modelIds = new Set(Object.values(builtinPack.models));
@@ -1479,7 +1483,7 @@ export async function handleModelsPackCommand(ctx: SlashCommandContext): Promise
         // also offer a reset; every pack offers fallback configuration.
         while (true) {
           const modified = modifiedPackIds.has(pack.id);
-          const builtinPack = modified ? getBuiltinModePack(pack.id) : undefined;
+          const builtinPack = modified ? getBuiltinModePack(pack.id, access) : undefined;
           if (modified && !builtinPack) {
             resolve();
             return;
@@ -1502,7 +1506,7 @@ export async function handleModelsPackCommand(ctx: SlashCommandContext): Promise
           }
           if (action === 'reset') {
             const nextSettings = loadSettings();
-            resetBuiltinPackOverrides(nextSettings, pack.id);
+            resetBuiltinPackOverrides(nextSettings, pack.id, access);
             saveSettings(nextSettings);
             pack = builtinPack!;
             resetBuiltinPack = true;

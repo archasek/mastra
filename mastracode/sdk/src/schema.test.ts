@@ -1,8 +1,75 @@
+import { Agent } from '@mastra/core/agent';
+import { AgentController } from '@mastra/core/agent-controller';
+import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
 import { stateSchema } from './schema.js';
 
 describe('stateSchema', () => {
+  it('retains OAuth hop access and original mode through native Session state validation', async () => {
+    const controller = new AgentController({
+      id: 'fallback-state-fixture',
+      storage: new InMemoryStore(),
+      stateSchema,
+      modes: [
+        {
+          id: 'build',
+          name: 'Build',
+          default: true,
+          agent: new Agent({
+            id: 'fallback-state-agent',
+            name: 'State fixture',
+            instructions: 'Never invoked.',
+            model: 'openai/gpt-6-luna',
+          }),
+        },
+      ],
+    });
+    await controller.init();
+    try {
+      const session = await controller.createSession({ id: 'fallback-state-session', ownerId: 'fixture' });
+      await session.state.set({
+        mastracodePendingPackFallback: {
+          fromPackId: 'anthropic',
+          toPackId: 'openai',
+          toModelId: 'openai/gpt-6-luna',
+          openaiAccess: 'oauth',
+          modeId: 'fast',
+          reason: 'pool-exhausted',
+          at: '2026-10-06T00:00:00Z',
+        },
+      });
+      expect(session.state.get().mastracodePendingPackFallback).toMatchObject({
+        openaiAccess: 'oauth',
+        modeId: 'fast',
+        toModelId: 'openai/gpt-6-luna',
+      });
+    } finally {
+      await controller.getMastra()?.shutdown();
+    }
+  });
+
+  it('retains request access and original mode across validated fallback state', () => {
+    const pending = {
+      fromPackId: 'anthropic',
+      toPackId: 'openai',
+      toModelId: 'openai/gpt-6-luna',
+      openaiAccess: 'oauth',
+      modeId: 'fast',
+      threadId: 'native-thread',
+      reason: 'pool-exhausted',
+      at: '2026-10-06T00:00:00Z',
+    };
+    expect(stateSchema.parse({ mastracodePendingPackFallback: pending }).mastracodePendingPackFallback).toEqual(
+      pending,
+    );
+    expect(
+      stateSchema.safeParse({
+        mastracodePendingPackFallback: { ...pending, openaiAccess: 'unknown' },
+      }).success,
+    ).toBe(false);
+  });
+
   it('preserves task ids in controller state', () => {
     const parsed = stateSchema.parse({
       tasks: [

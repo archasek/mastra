@@ -57,6 +57,37 @@ export type { CustomProvidersSource } from './custom-provider-source.js';
 
 type ResolvedModel = GatewayLanguageModel;
 type ModelRequestHeaders = Record<string, string>;
+const admittedNativeOAuth = new WeakSet<RequestContext>();
+
+/** Restore native route authority for every request, including background wakes. */
+export function withNativeOAuthRoute<T>(requestContext: RequestContext, resolve: () => T): T | Promise<T> {
+  const controller = requestContext.get('controller') as AgentControllerRequestContext<any> | undefined;
+  if (!controller?.getThreadSetting) return resolve();
+  return (async () => {
+    const savedRoute = await controller.getThreadSetting!('openaiAuthRoute');
+    if (savedRoute === 'oauth' && controller.getState().openaiAuthRoute !== 'oauth') {
+      await controller.setState({ openaiAuthRoute: 'oauth' });
+    }
+    admittedNativeOAuth.delete(requestContext);
+    let result: T;
+    let admitted = false;
+    try {
+      result = await resolve();
+      admitted = admittedNativeOAuth.has(requestContext);
+    } finally {
+      admittedNativeOAuth.delete(requestContext);
+    }
+    // resolveModel records only successful local OAuth admission, not merely
+    // global login presence or a gateway/tenant model selection.
+    if (admitted && savedRoute !== 'oauth') {
+      if (!controller.setThreadSetting)
+        throw new ProviderAuthRequiredError('Native OAuth requires durable thread ownership.');
+      await controller.setThreadSetting({ key: 'openaiAuthRoute', value: 'oauth' });
+      await controller.setState({ openaiAuthRoute: 'oauth' });
+    }
+    return result;
+  })();
+}
 
 function getAgentControllerHeaders(requestContext?: RequestContext): ModelRequestHeaders | undefined {
   const agentControllerContext = requestContext?.get('controller') as AgentControllerRequestContext<any> | undefined;
@@ -226,7 +257,11 @@ export function resolveModel(
   const tenantCredentialStore = resolveCredentialStore(options?.requestContext);
   const baseCredentialStore = tenantCredentialStore ?? getGlobalAuthStorage();
   let credentialStore = createRequestScopedCredentialStore(baseCredentialStore, options?.requestContext);
+  const controllerContext = options?.requestContext?.get('controller') as
+    | AgentControllerRequestContext<any>
+    | undefined;
   const ownsOAuthRoute =
+    controllerContext?.getState?.().openaiAuthRoute === 'oauth' ||
     getRequestAccountSelection(options?.requestContext, 'openai-codex') !== undefined ||
     isRequestAccountRoutingExhausted(options?.requestContext, 'openai-codex');
   if (
@@ -250,7 +285,18 @@ export function resolveModel(
     const scoped = credentialStore;
     const assertAdmission = (accountId: unknown, accountInstanceId: string | undefined) => {
       const appDataDir = getAppDataDir({ create: false });
-      const catalog = readCodexCatalog(appDataDir);
+      let catalog = readCodexCatalog(appDataDir, Date.now(), accountInstanceId);
+      // Native storage adopts legacy auth in memory without persisting its
+      // provisional ID. Only an unrouted active legacy request may use that
+      // verified legacy scope; a deleted explicit selection never falls back.
+      if (
+        catalog.status !== 'ready' &&
+        getRequestAccountSelection(options?.requestContext, 'openai-codex') === undefined &&
+        baseCredentialStore.getActiveAccount?.('openai-codex')?.id === accountInstanceId
+      ) {
+        const legacy = readCodexCatalog(appDataDir, Date.now());
+        if (legacy.status === 'ready' && legacy.scope.kind === 'legacy') catalog = legacy;
+      }
       const nativeId = stripMastraGatewayPrefix(remapOpenAIModelForCodexOAuth(normalizedModelId));
       if (
         catalog.status !== 'ready' ||
@@ -268,6 +314,7 @@ export function resolveModel(
       baseCredentialStore.getActiveAccount?.('openai-codex')?.id;
     const credential = scoped.get('openai-codex');
     if (credential?.type === 'oauth') assertAdmission(credential.accountId, selected);
+    if (options?.requestContext) admittedNativeOAuth.add(options.requestContext);
     credentialStore = {
       ...scoped,
       getOAuthCredential: async provider => {

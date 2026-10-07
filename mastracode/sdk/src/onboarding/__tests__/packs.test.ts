@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { PROVIDER_DEFAULT_MODELS } from '../../auth/storage.js';
 import {
   getAvailableModePacks,
+  getBuiltinModePack,
   getAvailableOmPacks,
   resolveProviderOMDefault,
   selectPreferredOMPack,
@@ -24,6 +25,11 @@ function providerAccess(overrides: Partial<ProviderAccess> = {}): ProviderAccess
 }
 
 describe('getAvailableModePacks', () => {
+  it('resolves builtin reset and override identities using the same OAuth pack', () => {
+    expect(getBuiltinModePack('openai', { openai: 'oauth' })?.models.fast).toBe('openai/gpt-6-luna');
+    expect(getBuiltinModePack('openai', { openai: 'apikey' })?.models.fast).toBe('openai/gpt-5.4-mini');
+    expect(getBuiltinModePack('openai')?.models.fast).toBe('openai/gpt-5.4-mini');
+  });
   it('uses the catalog-backed OAuth fast default without changing build and plan', () => {
     const packs = getAvailableModePacks({
       anthropic: false,

@@ -206,6 +206,7 @@ function credentialFieldsOf(record: OAuthAccountRecord): OAuthCredentials {
 export class AuthStorage {
   private data: AuthStorageData = {};
   private refreshPromises = new Map<string, Promise<OAuthRefreshResult | undefined>>();
+  private refreshOwnerSignals = new WeakMap<Promise<OAuthRefreshResult | undefined>, AbortSignal>();
 
   constructor(private authPath: string = join(getAppDataDir(), 'auth.json')) {
     this.reload();
@@ -1010,14 +1011,25 @@ export class AuthStorage {
    */
   private async refreshInstance(
     providerId: string,
-    instanceId: string,
+    instanceId?: string,
     signal?: AbortSignal,
+    retryCancelledOwner = true,
   ): Promise<OAuthRefreshResult | undefined> {
     const provider = getOAuthProvider(providerId);
     if (!provider) return undefined;
-    const refreshKey = `${providerId}:${instanceId}`;
+    const refreshKey = instanceId ? `${providerId}:${instanceId}` : providerId;
     const pending = this.refreshPromises.get(refreshKey);
-    if (pending) return waitForAcquisition(pending, signal);
+    if (pending) {
+      const ownerSignal = this.refreshOwnerSignals.get(pending);
+      const result = await waitForAcquisition(pending, signal);
+      // A cancelled command is not this caller's failed inference refresh.
+      // After its producer releases both locks, retry once under our ownership.
+      if (!result && ownerSignal?.aborted && retryCancelledOwner) {
+        signal?.throwIfAborted();
+        return this.refreshInstance(providerId, instanceId, signal, false);
+      }
+      return result;
+    }
     const refresh = (async () => {
       try {
         return await this.refreshCredential(providerId, instanceId, undefined, signal);
@@ -1028,6 +1040,7 @@ export class AuthStorage {
       }
     })();
     this.refreshPromises.set(refreshKey, refresh);
+    if (signal) this.refreshOwnerSignals.set(refresh, signal);
     const cleanup = () => {
       this.refreshPromises.delete(refreshKey);
     };
@@ -1097,29 +1110,7 @@ export class AuthStorage {
 
     if (Date.now() < credential.expires) return toSnapshot(credential);
 
-    if (selectedInstanceId) {
-      const refreshed = await this.refreshInstance(providerId, selectedInstanceId, signal);
-      return refreshed ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId) : undefined;
-    }
-
-    const pendingRefresh = this.refreshPromises.get(providerId);
-    const refresh =
-      pendingRefresh ??
-      (async (): Promise<OAuthRefreshResult | undefined> => {
-        try {
-          return await this.refreshCredential(providerId, undefined, undefined, signal);
-        } catch {
-          // Joined ordinary callers must not inherit the owner's abort reason.
-          return undefined;
-        }
-      })();
-    if (!pendingRefresh) {
-      this.refreshPromises.set(providerId, refresh);
-      const cleanup = () => this.refreshPromises.delete(providerId);
-      void refresh.then(cleanup, cleanup);
-    }
-    const refreshed = pendingRefresh ? await waitForAcquisition(refresh, signal) : await refresh;
-    signal?.throwIfAborted();
+    const refreshed = await this.refreshInstance(providerId, selectedInstanceId, signal);
     return refreshed ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId ?? selectedInstanceId) : undefined;
   }
 

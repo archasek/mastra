@@ -37,7 +37,11 @@ async function switchCurrentModeModel(ctx: SlashCommandContext, selectedModelId:
     | undefined;
   const previousSessionPackId = previousSessionState?.activeModelPackId;
   const activePackId = threadSettings.activeModelPackId ?? nextSettings.models.activeModelPackId;
-  const builtinPack = activePackId ? getBuiltinModePack(activePackId) : undefined;
+  const builtinPack = activePackId
+    ? getBuiltinModePack(activePackId, {
+        openai: ctx.authStorage?.get?.('openai-codex')?.type === 'oauth' ? 'oauth' : 'apikey',
+      })
+    : undefined;
   const customPack = activePackId?.startsWith('custom:')
     ? nextSettings.customModelPacks.find(item => `custom:${item.name}` === activePackId)
     : undefined;
@@ -193,7 +197,11 @@ export async function handleModelCommand(ctx: SlashCommandContext): Promise<void
     const threadId = ctx.state.session.thread.getId?.();
     const thread = threadId ? (await ctx.state.session.thread.list()).find(item => item.id === threadId) : undefined;
     const activePackId = parseThreadSettings(thread?.metadata).activeModelPackId ?? settings.models.activeModelPackId;
-    const builtinPack = activePackId ? getBuiltinModePack(activePackId) : undefined;
+    const builtinPack = activePackId
+      ? getBuiltinModePack(activePackId, {
+          openai: ctx.authStorage?.get?.('openai-codex')?.type === 'oauth' ? 'oauth' : 'apikey',
+        })
+      : undefined;
     const selectableModels = builtinPack
       ? connected.filter(model => model.provider === builtinPack.providerId)
       : connected;

@@ -57,7 +57,13 @@ import { createBackgroundCompletionCallbacks } from './agents/background-complet
 import { hasCredentialStoreProvider } from './agents/credential-resolver.js';
 import { getDynamicInstructions } from './agents/instructions.js';
 import { getDynamicMemory, hasSubconsciousTools } from './agents/memory.js';
-import { createMastraCodeGateway, getDynamicModel, getGoalJudgeModel, resolveModel } from './agents/model.js';
+import {
+  createMastraCodeGateway,
+  getDynamicModel,
+  getGoalJudgeModel,
+  resolveModel,
+  withNativeOAuthRoute,
+} from './agents/model.js';
 import { buildMode } from './agents/modes/build.js';
 import { fastMode } from './agents/modes/explore.js';
 import { planMode } from './agents/modes/plan.js';
@@ -109,6 +115,7 @@ import { createAmazonBedrockGateway } from './providers/amazon-bedrock-gateway.j
 import { setAuthStorage } from './providers/claude-max.js';
 import { setAuthStorage as setGitHubCopilotAuthStorage } from './providers/github-copilot.js';
 import { setAuthStorage as setKimiCodingAuthStorage } from './providers/kimi-coding.js';
+import { readCodexCatalog } from './providers/openai-codex-catalog.js';
 import { setAuthStorage as setOpenAIAuthStorage } from './providers/openai-codex.js';
 import { setAuthStorage as setXAIAuthStorage } from './providers/xai.js';
 
@@ -130,6 +137,7 @@ import { registerSessionAndWaitForMaintenance, UNKNOWN_OWNER, unregisterSession 
 import { createResourceNotificationDispatcher, shouldHoldNotificationDelivery } from './utils/notification-dispatch.js';
 import {
   detectProject,
+  getAppDataDir,
   getObservabilityDatabasePath,
   getStorageConfig,
   getResourceIdOverride,
@@ -245,8 +253,10 @@ function shortHash(input: string): string {
 function applyEffectiveDefaultsToModes(
   modes: AgentControllerMode[],
   effectiveDefaults: Record<string, string>,
+  preserveModeDefaults = false,
 ): AgentControllerMode[] {
   return modes.map(mode => {
+    if (preserveModeDefaults && mode.defaultModelId) return mode;
     const savedModel = effectiveDefaults[mode.id];
     if (!savedModel) {
       return mode;
@@ -1182,7 +1192,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     },
     // `settingsPath` matches the source `createMastraCode()` reads from so the
     // per-mode thinking defaults resolve against the same config file.
-    model: ctx => getDynamicModel(ctx, config?.settingsPath),
+    model: ctx => withNativeOAuthRoute(ctx.requestContext, () => getDynamicModel(ctx, config?.settingsPath)),
     // Deferred notifications are re-dispatched by the core notification
     // dispatch workflow long after the originating send; the delivery policy
     // rebuilds the request context (model selection included) at delivery time
@@ -1254,7 +1264,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
       // judge model is configured, keeping the goal step a no-op. Bind the same
       // `settingsPath` used above so the judge model and `maxRuns` come from one
       // config (a custom settings file would otherwise diverge).
-      judge: ctx => getGoalJudgeModel(ctx, config?.settingsPath),
+      judge: ctx => withNativeOAuthRoute(ctx.requestContext, () => getGoalJudgeModel(ctx, config?.settingsPath)),
       maxRuns: globalSettings.models.goalMaxTurns ?? 50,
       maxSteps: 1000,
       prompt: DEFAULT_GOAL_JUDGE_PROMPT,
@@ -1429,7 +1439,16 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   }
   const builtinPacks = getAvailableModePacks(startupAccess);
   const builtinOmPacks = getAvailableOmPacks(startupAccess);
-  const effectiveDefaults = resolveModelDefaults(globalSettings, builtinPacks);
+  // Only unconfigured builtin modes inherit the native OAuth pack. Saved
+  // choices and caller-defined modes retain their existing precedence.
+  const oauthBuiltinDefaults =
+    !config?.modes && startupAccess.openai === 'oauth'
+      ? builtinPacks.find(pack => pack.id === 'openai')?.models
+      : undefined;
+  const effectiveDefaults = {
+    ...oauthBuiltinDefaults,
+    ...resolveModelDefaults(globalSettings, builtinPacks),
+  };
   const activeProviderId = effectiveDefaults.build?.split('/')[0];
   const preferredOmModel = hasExplicitOMConfiguration(globalSettings)
     ? undefined
@@ -1442,7 +1461,11 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   const effectiveObserveAttachments = globalSettings.models.omObserveAttachments ?? 'auto';
 
   const modes = addPluginToolsToModeAllowlists(
-    applyEffectiveDefaultsToModes(config?.modes ? config.modes : defaultModes, effectiveDefaults),
+    applyEffectiveDefaultsToModes(
+      config?.modes ? config.modes : defaultModes,
+      effectiveDefaults,
+      Boolean(config?.modes),
+    ),
     Object.keys(pluginTools),
   );
   const defaultModeId =
@@ -1538,6 +1561,9 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     // request-scoped custom providers come from the calling run's context.
     // Ids the model router would hand to another registered gateway (by
     // prefix or `handlesModel`) stay strings so that gateway resolves them.
+    // Core resolves this callback synchronously. The parent model callback
+    // hydrates durable route authority before tools run; core preserves its
+    // controller getState in the subagent request context.
     resolveSubagentModel: (modelId, { requestContext }) =>
       routesToOtherGateway(
         modelId,
@@ -1588,6 +1614,28 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
           release: releaseThreadLock,
         },
   });
+
+  // This is the MC-local inventory boundary, not the general core registry.
+  // Recheck on every read, even while core's generic catalog cache is fresh.
+  if (!hasCredentialStoreProvider()) {
+    const listAvailableModels = controller.listAvailableModels.bind(controller);
+    controller.listAvailableModels = async () => {
+      const models = await listAvailableModels();
+      authStorage.reload();
+      if (authStorage.get('openai-codex')?.type !== 'oauth') return models;
+      const catalog = readCodexCatalog(getAppDataDir({ create: false }));
+      return [
+        ...models.filter(model => !model.id.startsWith('openai/')),
+        ...catalog.models.map(id => ({
+          id,
+          provider: 'openai',
+          modelName: id.slice('openai/'.length),
+          hasApiKey: true,
+          useCount: models.find(model => model.id === id)?.useCount ?? 0,
+        })),
+      ];
+    };
+  }
 
   controller.onSessionCreated(session => {
     liveSessions.add(session);

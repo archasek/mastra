@@ -11,7 +11,7 @@ import { loadSettings } from '../onboarding/settings.js';
 import { ANTHROPIC_PROMPT_CACHE_TTL } from '../providers/anthropic-prompt-cache.js';
 import type { MastraCodeState } from '../schema.js';
 import { getOmScope } from '../utils/project.js';
-import { resolveModel, resolvePackMemoryModelChain } from './model.js';
+import { resolveModel, resolvePackMemoryModelChain, withNativeOAuthRoute } from './model.js';
 import type { PackMemoryModelChainEntry } from './model.js';
 
 /**
@@ -156,9 +156,9 @@ export function getDynamicMemory(storage: MastraCompositeStore, vector?: MastraV
   // Bound here so the configured settings path reaches role overrides and pack
   // memory-model resolution.
   const getObserverModel = ({ requestContext }: { requestContext: RequestContext }) =>
-    resolveOmRoleModelForRequest('observer', requestContext, settingsPath);
+    withNativeOAuthRoute(requestContext, () => resolveOmRoleModelForRequest('observer', requestContext, settingsPath));
   const getReflectorModel = ({ requestContext }: { requestContext: RequestContext }) =>
-    resolveOmRoleModelForRequest('reflector', requestContext, settingsPath);
+    withNativeOAuthRoute(requestContext, () => resolveOmRoleModelForRequest('reflector', requestContext, settingsPath));
 
   return ({ requestContext }: { requestContext: RequestContext }) => {
     const controller = requestContext.get('controller') as AgentControllerRequestContext<MastraCodeState> | undefined;
@@ -220,8 +220,8 @@ export function getDynamicMemory(storage: MastraCompositeStore, vector?: MastraV
         // generation takes the primary OM model only — its model field does not
         // accept fallback arrays.
         generateTitle: {
-          model: ({ requestContext }) => {
-            const resolved = getObserverModel({ requestContext });
+          model: async ({ requestContext }) => {
+            const resolved = await getObserverModel({ requestContext });
             return Array.isArray(resolved) ? resolved[0]!.model : resolved;
           },
         },

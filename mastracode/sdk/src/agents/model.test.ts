@@ -11,8 +11,11 @@ const { appDataDir, previousEnv } = vi.hoisted(() => {
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { Agent } from '@mastra/core/agent';
+import { AgentController } from '@mastra/core/agent-controller';
 import { MastraGateway } from '@mastra/core/llm';
 import { RequestContext } from '@mastra/core/request-context';
+import { InMemoryStore } from '@mastra/core/storage';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { setRequestAccountSelection, markRequestAccountRoutingExhausted } from '../auth/account-routing-context.js';
 import type { CredentialStore } from '../auth/types.js';
@@ -22,6 +25,7 @@ import {
   CODEX_CATALOG_ENDPOINT,
   CODEX_CATALOG_FILENAME,
   CODEX_CATALOG_TTL_MS,
+  codexCatalogPath,
 } from '../providers/openai-codex-catalog.js';
 import * as codexProvider from '../providers/openai-codex.js';
 import { setCredentialStoreProvider } from './credential-resolver.js';
@@ -32,9 +36,199 @@ import {
   resolveModel,
   resolvePackMemoryModelChain,
   requestPackAccess,
+  withNativeOAuthRoute,
 } from './model.js';
 
 describe('native OAuth model admission', () => {
+  it('persists first non-ACP OAuth admission and rejects a restored key fallback', async () => {
+    mkdirSync(appDataDir, { recursive: true });
+    const now = Date.now();
+    const credential = {
+      type: 'oauth',
+      access: 'synthetic',
+      refresh: 'synthetic',
+      expires: now + 60_000,
+      accountId: 'a',
+    };
+    const id = 'openai-codex:registered-a';
+    writeFileSync(
+      join(appDataDir, 'auth.json'),
+      JSON.stringify({
+        'openai-codex': credential,
+        [`accounts:${id}`]: {
+          ...credential,
+          type: 'oauth-account',
+          id,
+          label: 'A',
+          active: true,
+          addedAt: '2026-10-07T00:00:00Z',
+        },
+      }),
+    );
+    const scope = { kind: 'registered' as const, accountInstanceId: id, accountId: 'a' };
+    writeFileSync(
+      codexCatalogPath(appDataDir, scope),
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: 'openai-codex',
+        scope,
+        endpoint: CODEX_CATALOG_ENDPOINT,
+        clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+        fetchedAt: now,
+        expiresAt: now + CODEX_CATALOG_TTL_MS,
+        slugs: ['gpt-6-luna'],
+      }),
+    );
+    const nativeStorage = new InMemoryStore();
+    const makeController = () =>
+      new AgentController({
+        id: 'route-proof',
+        storage: nativeStorage,
+        modes: [
+          {
+            id: 'build',
+            name: 'Build',
+            default: true,
+            agent: new Agent({
+              id: 'route-agent',
+              name: 'Route',
+              instructions: 'Never invoked.',
+              model: 'openai/gpt-6-luna',
+            }),
+          },
+        ],
+      });
+    const first = makeController();
+    await first.init();
+    const session = await first.createSession({ id: 'first', ownerId: 'owner' });
+    const thread = await session.thread.create();
+    const context = new RequestContext();
+    context.set('controller', {
+      getThreadSetting: (key: string) => session.thread.getSetting({ key }),
+      setThreadSetting: (setting: { key: string; value: unknown }) => session.thread.setSetting(setting),
+      getState: () => session.state.get(),
+      setState: (state: { openaiAuthRoute: 'oauth' }) => session.state.set(state),
+    });
+    vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+    vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({} as never);
+    const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockReturnValue({ apiKey: 'synthetic' });
+    await withNativeOAuthRoute(context, () => resolveModel('openai/gpt-6-luna', { requestContext: context }));
+    const memory = await nativeStorage.getStore('memory');
+    expect((await memory!.getThreadById({ threadId: thread.id }))?.metadata?.openaiAuthRoute).toBe('oauth');
+    await session.thread.detachFromCurrent();
+    writeFileSync(
+      join(appDataDir, 'auth.json'),
+      JSON.stringify({ 'apikey:openai-codex': { type: 'api_key', key: 'synthetic-key' } }),
+    );
+    const restarted = makeController();
+    await restarted.init();
+    const restored = await restarted.createSession({ id: 'restored', ownerId: 'owner' });
+    await restored.thread.switch({ threadId: thread.id });
+    const restoredContext = new RequestContext();
+    restoredContext.set('controller', {
+      getThreadSetting: (key: string) => restored.thread.getSetting({ key }),
+      setThreadSetting: (setting: { key: string; value: unknown }) => restored.thread.setSetting(setting),
+      getState: () => restored.state.get(),
+      setState: (state: { openaiAuthRoute: 'oauth' }) => restored.state.set(state),
+    });
+    auth.mockClear();
+    await expect(
+      withNativeOAuthRoute(restoredContext, () =>
+        resolveModel('openai/gpt-6-luna', { requestContext: restoredContext }),
+      ),
+    ).rejects.toThrow('OAuth is required');
+    expect(auth).not.toHaveBeenCalled();
+    await restored.thread.detachFromCurrent();
+  });
+
+  it('admits a real native provisional legacy identity without writing auth or cache', async () => {
+    mkdirSync(appDataDir, { recursive: true });
+    const now = Date.now();
+    const credential = {
+      type: 'oauth',
+      access: 'legacy',
+      refresh: 'legacy',
+      expires: now + 60_000,
+      accountId: 'legacy-a',
+    };
+    const authPath = join(appDataDir, 'auth.json');
+    const cachePath = join(appDataDir, CODEX_CATALOG_FILENAME);
+    writeFileSync(authPath, JSON.stringify({ 'openai-codex': credential }));
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: 'openai-codex',
+        scope: { kind: 'legacy', accountId: 'legacy-a' },
+        endpoint: CODEX_CATALOG_ENDPOINT,
+        clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+        fetchedAt: now,
+        expiresAt: now + CODEX_CATALOG_TTL_MS,
+        slugs: ['gpt-6-luna'],
+      }),
+    );
+    const before = [readFileSync(authPath, 'utf8'), readFileSync(cachePath, 'utf8')];
+    const owner = getGlobalAuthStorage();
+    owner.reload();
+    expect(owner.getActiveAccount('openai-codex')?.id).toBeDefined();
+    vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+    vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockReturnValue({ apiKey: 'synthetic' });
+    const native = vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({} as never);
+    resolveModel('openai/gpt-6-luna');
+    await expect(native.mock.calls[0]![1]!.authStorage!.getOAuthCredential!('openai-codex')).resolves.toMatchObject({
+      accountId: 'legacy-a',
+    });
+    expect([readFileSync(authPath, 'utf8'), readFileSync(cachePath, 'utf8')]).toEqual(before);
+    const selected = new RequestContext();
+    setRequestAccountSelection(selected, 'openai-codex', 'openai-codex:deleted');
+    expect(() => resolveModel('openai/gpt-6-luna', { requestContext: selected })).toThrow('OAuth is required');
+  });
+  it('hydrates durable OAuth authority before resolving a restored background request', async () => {
+    const storage = getGlobalAuthStorage();
+    vi.spyOn(storage, 'reload').mockImplementation(() => {});
+    vi.spyOn(storage, 'get').mockReturnValue(undefined);
+    vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+    const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth');
+    const state: { openaiAuthRoute?: string } = {};
+    const context = new RequestContext();
+    const setState = vi.fn(async (update: typeof state) => {
+      Object.assign(state, update);
+    });
+    context.set('controller', {
+      getThreadSetting: async (key: string) => (key === 'openaiAuthRoute' ? 'oauth' : undefined),
+      getState: () => state,
+      setState,
+    });
+    await expect(
+      withNativeOAuthRoute(context, () =>
+        resolveModel('openai/gpt-6-luna', {
+          requestContext: context,
+        }),
+      ),
+    ).rejects.toThrow('OAuth is required');
+    expect(setState).toHaveBeenCalledWith({ openaiAuthRoute: 'oauth' });
+    expect(auth).not.toHaveBeenCalled();
+  });
+
+  it('keeps restored OAuth background requests from falling through to an environment key', () => {
+    const oldKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'synthetic-never-used';
+    try {
+      const storage = getGlobalAuthStorage();
+      vi.spyOn(storage, 'reload').mockImplementation(() => {});
+      vi.spyOn(storage, 'get').mockReturnValue(undefined);
+      vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+      const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth');
+      const context = new RequestContext();
+      context.set('controller', { getState: () => ({ openaiAuthRoute: 'oauth' }) });
+      expect(() => resolveModel('openai/gpt-6-luna', { requestContext: context })).toThrow('OAuth is required');
+      expect(auth).not.toHaveBeenCalled();
+    } finally {
+      if (oldKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = oldKey;
+    }
+  });
+
   it('rejects a deleted selected OAuth account before constructing an environment-key provider', () => {
     const oldKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = 'synthetic-never-used';

@@ -35,6 +35,7 @@ vi.mock('../utils/project.js', () => ({
 }));
 
 vi.mock('./model.js', () => ({
+  withNativeOAuthRoute: (_context: unknown, resolve: () => unknown) => resolve(),
   resolveModel: resolveModelMock,
   resolvePackMemoryModelChain: resolvePackMemoryModelChainMock,
 }));
@@ -151,7 +152,7 @@ describe('getDynamicMemory', () => {
     expect(config.vector).toBe(false);
     expect(config.embedder).toBeUndefined();
 
-    expect(config.options.generateTitle.model({ requestContext })).toEqual({
+    expect(await config.options.generateTitle.model({ requestContext })).toEqual({
       modelId: 'google/gemini-3.5-flash',
     });
 
@@ -594,6 +595,6 @@ describe('pack-driven OM models (A11)', () => {
       activeModelPackId: 'custom:Work',
     });
 
-    expect(config.options.generateTitle.model({ requestContext })).toEqual({ modelId: 'claude-haiku-4-5' });
+    expect(await config.options.generateTitle.model({ requestContext })).toEqual({ modelId: 'claude-haiku-4-5' });
   });
 });

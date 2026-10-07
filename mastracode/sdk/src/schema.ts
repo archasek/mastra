@@ -75,6 +75,8 @@ export interface MastraCodeState {
     fromPackId: string;
     toPackId: string;
     toModelId: string;
+    openaiAccess?: 'oauth' | 'apikey';
+    modeId?: string;
     threadId?: string;
     reason: 'pool-exhausted' | 'persistent-outage';
     at: string;
@@ -214,6 +216,8 @@ export const stateSchema = z.object({
       fromPackId: z.string(),
       toPackId: z.string(),
       toModelId: z.string(),
+      openaiAccess: z.enum(['oauth', 'apikey']).optional(),
+      modeId: z.string().optional(),
       threadId: z.string().optional(),
       reason: z.enum(['pool-exhausted', 'persistent-outage']),
       at: z.string(),

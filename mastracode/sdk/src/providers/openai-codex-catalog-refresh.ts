@@ -13,8 +13,8 @@ import {
   CODEX_CATALOG_MAX_BYTES,
   CODEX_CATALOG_TTL_MS,
   codexCatalogCacheSchema,
+  codexCatalogPath,
   decodeCodexCatalogResponse,
-  readCodexCatalog,
   sameCodexCatalogScope,
 } from './openai-codex-catalog.js';
 import type { CodexCatalogCache } from './openai-codex-catalog.js';
@@ -93,23 +93,26 @@ export async function refreshCodexCatalog(options: {
     });
     acquisitionSignal.throwIfAborted();
     if (!credential) throw new CodexCatalogRefreshError('AUTH_REQUIRED');
+    const requestScope = scopeForCredential(join(options.appDataDir, 'auth.json'), credential);
     let cache: CodexCatalogCache;
     try {
       cache = await fetchCodexCatalogSnapshot({ appDataDir: options.appDataDir, credential, signal });
     } catch (error) {
-      if (
-        error instanceof CodexCatalogRefreshError &&
-        error.code === 'CREDENTIAL_REJECTED' &&
-        readCodexCatalog(options.appDataDir).status === 'ready'
-      ) {
+      if (error instanceof CodexCatalogRefreshError && error.code === 'CREDENTIAL_REJECTED') {
         // Never let a delayed rejection remove a different account's cache.
-        const current = readOpenAICodexCatalogScope(join(options.appDataDir, 'auth.json'));
-        if (
-          current &&
-          current.accountId === credential.accountId &&
-          (current.kind === 'legacy' || current.accountInstanceId === credential.accountInstanceId)
-        ) {
-          rmSync(join(options.appDataDir, CODEX_CATALOG_FILENAME), { force: true });
+        const current = readOpenAICodexCatalogScope(
+          join(options.appDataDir, 'auth.json'),
+          requestScope.kind === 'registered' ? requestScope.accountInstanceId : undefined,
+          credential,
+        );
+        if (current && sameCodexCatalogScope(current, requestScope)) {
+          // Keep an invalid scoped marker so compatibility fallback cannot
+          // resurrect older single-file inventory after definite rejection.
+          const path = codexCatalogPath(options.appDataDir, current);
+          tempPath = `${path}.${randomUUID()}.tmp`;
+          writeFileSync(tempPath, JSON.stringify({ invalidated: true }), { flag: 'wx', mode: 0o600 });
+          renameSync(tempPath, path);
+          tempPath = undefined;
         }
       }
       throw error;
@@ -121,10 +124,11 @@ export async function refreshCodexCatalog(options: {
         throw new CodexCatalogRefreshError('ACCOUNT_CHANGED');
     };
     assertPublishable();
-    tempPath = join(options.appDataDir, `${CODEX_CATALOG_FILENAME}.${randomUUID()}.tmp`);
+    const path = codexCatalogPath(options.appDataDir, cache.scope);
+    tempPath = `${path}.${randomUUID()}.tmp`;
     writeFileSync(tempPath, JSON.stringify(cache), { flag: 'wx', mode: 0o600 });
     assertPublishable();
-    renameSync(tempPath, join(options.appDataDir, CODEX_CATALOG_FILENAME));
+    renameSync(tempPath, path);
     tempPath = undefined;
     assertPublishable();
     return cache;
@@ -173,7 +177,11 @@ async function readResponse(response: Response, signal: AbortSignal): Promise<un
       if (size > CODEX_CATALOG_MAX_BYTES) throw new CodexCatalogRefreshError('CATALOG_INVALID');
       chunks.push(value);
     }
-    return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+    try {
+      return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+    } catch {
+      throw new CodexCatalogRefreshError('CATALOG_INVALID');
+    }
   } finally {
     signal.removeEventListener('abort', cancel);
     await reader.cancel().catch(() => {});
@@ -212,7 +220,13 @@ export async function fetchCodexCatalogSnapshot(options: {
         response.status === 401 || response.status === 403 ? 'CREDENTIAL_REJECTED' : 'CATALOG_REQUEST_FAILED',
       );
     }
-    const slugs = decodeCodexCatalogResponse(await readResponse(response, signal));
+    const body = await readResponse(response, signal);
+    let slugs: string[];
+    try {
+      slugs = decodeCodexCatalogResponse(body);
+    } catch {
+      throw new CodexCatalogRefreshError('CATALOG_INVALID');
+    }
     signal.throwIfAborted();
     assertScope();
     const fetchedAt = Date.now();

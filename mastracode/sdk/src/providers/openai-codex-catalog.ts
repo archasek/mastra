@@ -1,4 +1,5 @@
-import { closeSync, openSync, readSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, openSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { readOpenAICodexCatalogScope } from '../auth/read-only.js';
@@ -50,6 +51,15 @@ export function sameCodexCatalogScope(a: OpenAICodexCatalogScope, b: OpenAICodex
   return a.kind === b.kind && a.accountId === b.accountId && a.accountInstanceId === b.accountInstanceId;
 }
 
+/** Stable account identity, never token bytes, names each registered account cache. */
+export function codexCatalogPath(appDataDir: string, scope: OpenAICodexCatalogScope): string {
+  if (scope.kind === 'legacy') return join(appDataDir, CODEX_CATALOG_FILENAME);
+  const identity = createHash('sha256')
+    .update(JSON.stringify([scope.kind, scope.accountInstanceId, scope.accountId]))
+    .digest('hex');
+  return join(appDataDir, `openai-codex-model-catalog.${identity}.json`);
+}
+
 /** Backend order is authoritative. Ignore hidden records, never invent model aliases. */
 export function decodeCodexCatalogResponse(value: unknown): string[] {
   const response = z
@@ -80,17 +90,21 @@ function readBoundedCache(path: string): unknown {
   }
 }
 
-export function readCodexCatalog(appDataDir: string, now = Date.now()): CodexCatalogRead {
+export function readCodexCatalog(appDataDir: string, now = Date.now(), accountInstanceId?: string): CodexCatalogRead {
   const authPath = join(appDataDir, 'auth.json');
-  const scope = readOpenAICodexCatalogScope(authPath);
+  const scope = readOpenAICodexCatalogScope(authPath, accountInstanceId);
   if (!scope) return { status: 'unbound', models: [] };
   let cache: CodexCatalogCache;
   try {
-    cache = codexCatalogCacheSchema.parse(readBoundedCache(join(appDataDir, CODEX_CATALOG_FILENAME)));
+    const scopedPath = codexCatalogPath(appDataDir, scope);
+    // Read old single-file evidence only when no scoped cache exists; scope
+    // checks below still forbid using another account's inventory.
+    const path = existsSync(scopedPath) ? scopedPath : join(appDataDir, CODEX_CATALOG_FILENAME);
+    cache = codexCatalogCacheSchema.parse(readBoundedCache(path));
   } catch (error) {
     return { status: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'invalid', models: [] };
   }
-  const currentScope = readOpenAICodexCatalogScope(authPath);
+  const currentScope = readOpenAICodexCatalogScope(authPath, accountInstanceId);
   if (!currentScope || !sameCodexCatalogScope(scope, currentScope) || !sameCodexCatalogScope(scope, cache.scope)) {
     return { status: 'foreign', models: [] };
   }

@@ -129,6 +129,17 @@ export async function createAcpSession(
   try {
     // SDK-owned metadata is not among core's automatically persisted state
     // preferences. Hydrate it before any catalog authorization or replay.
+    if (isResume) {
+      const savedModeModel = await result.session.thread.getSetting({
+        key: `modeModelId_${result.session.mode.get()}`,
+      });
+      if (typeof savedModeModel !== 'string' || !savedModeModel.trim()) {
+        const legacyModel = await result.session.thread.getSetting({ key: 'currentModelId' });
+        if (typeof legacyModel === 'string' && legacyModel.trim()) {
+          result.session.model.set({ modelId: legacyModel });
+        }
+      }
+    }
     const savedRoute = await result.session.thread.getSetting({ key: 'openaiAuthRoute' });
     oauthOwned ||= savedRoute === 'oauth';
     if (isOAuthModel(result.session.model.get() ?? '') && result.session.state.get().openaiAuthRoute !== 'oauth') {

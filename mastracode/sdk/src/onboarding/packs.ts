@@ -103,15 +103,18 @@ const BUILTIN_MODE_PACKS: BuiltinModePack[] = [
   },
 ];
 
-export function getBuiltinModePack(packId: string): (ModePack & { providerId: string }) | undefined {
+export function getBuiltinModePack(
+  packId: string,
+  access: Partial<ProviderAccess> = {},
+): (ModePack & { providerId: string }) | undefined {
   const pack = BUILTIN_MODE_PACKS.find(item => item.id === packId);
   if (!pack) return undefined;
   return {
     id: pack.id,
     providerId: pack.providerId,
     name: pack.name,
-    description: pack.description('apikey'),
-    models: { ...pack.models },
+    description: pack.description(access[pack.providerId] || 'apikey'),
+    models: modePackModels(pack, access[pack.providerId] || 'apikey'),
   };
 }
 

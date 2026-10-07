@@ -40,6 +40,7 @@ the same package name or an upstream version does not establish compatibility.
 
 ```bash
 mastracode info --json
+mastracode catalog refresh --provider openai-codex --json
 mastracode auth status --provider openai-codex --json
 mastracode auth login --provider openai-codex --device --jsonl
 mastracode auth logout --provider openai-codex --json
@@ -55,6 +56,28 @@ version, capabilities, models, and `auth.provider` / `auth.status`. It does not
 start an agent or create storage. Auth status is `authenticated`,
 `unauthenticated`, or `unknown`; unknown storage status returns exit code 1.
 Model discovery is not proof that a subsequent inference request will succeed.
+
+For OpenAI Codex OAuth, `info` reports only the current account's dated model
+catalog. It is offline and read-only. An authenticated account can have no
+usable catalog: a missing, invalid, expired, or other-account cache returns no
+OAuth models. Refresh it explicitly with `catalog refresh`; ordinary status
+queries never make network requests or refresh credentials.
+
+`catalog refresh --provider openai-codex --json` uses the native credential
+owner and one catalog GET. The operation has a 30-second deadline, including
+credential acquisition; the GET and response body have a 10-second deadline.
+It does not log in or run inference. A successful response exits 0 and emits
+`type: "success"`, `provider`, `modelCount`, and `catalog` with `status: "ready"`,
+`source: "account-cache"`, `clientVersion`, `fetchedAt`, and `expiresAt`.
+Timestamps are milliseconds since the Unix epoch. The catalog expires one
+hour after retrieval; reads and restarts do not extend it.
+
+A failed refresh exits 1 and emits `type: "error"` with a sanitized `code`,
+such as `CATALOG_INVALID`, `CATALOG_REQUEST_FAILED`, `CATALOG_CANCELLED`, or
+`CREDENTIAL_REJECTED`. Invalid arguments exit 2. No token data is returned.
+An unavailable saved model is rejected, not replaced with a different model.
+Fresh builtin OAuth modes use the declared OpenAI pack defaults, but only
+when those models belong to the account's valid catalog.
 
 `auth status` reads storage without creating it and emits a `status` event.
 Unauthenticated status is a successful query (exit code 0). Unreadable or malformed

@@ -8,6 +8,7 @@ import {
   CODEX_CATALOG_FILENAME,
   CODEX_CATALOG_MAX_BYTES,
   CODEX_CATALOG_TTL_MS,
+  codexCatalogPath,
   decodeCodexCatalogResponse,
   readCodexCatalog,
 } from '../openai-codex-catalog.js';
@@ -36,6 +37,11 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 describe('native OAuth account catalog', () => {
+  it('names an account cache independently of object property insertion order', () => {
+    const first = { kind: 'registered' as const, accountId: 'account-a', accountInstanceId: 'openai-codex:a' };
+    const second = { accountInstanceId: first.accountInstanceId, accountId: first.accountId, kind: first.kind };
+    expect(codexCatalogPath('/fixture', first)).toBe(codexCatalogPath('/fixture', second));
+  });
   it('keeps visible backend order and deduplicates without version filtering', () => {
     expect(
       decodeCodexCatalogResponse({
