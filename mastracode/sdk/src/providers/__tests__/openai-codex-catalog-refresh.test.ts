@@ -35,6 +35,65 @@ afterEach(() => {
 });
 
 describe('native catalog publication', () => {
+  it.each(['during-get', 'before-get'] as const)(
+    'compares rejection with the real same-refresh active-slot grant: %s',
+    async timing => {
+      const { dir, credential } = fixture();
+      const owner = new AuthStorage(join(dir, 'auth.json'));
+      await owner.addAccount('openai-codex', credential);
+      const account = owner.getActiveAccount('openai-codex')!;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          Response.json({
+            models: [{ slug: 'gpt-6-luna', visibility: 'list' }],
+          }),
+        ),
+      );
+      await refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+      const path = codexCatalogPath(dir, {
+        kind: 'registered',
+        accountInstanceId: account.id,
+        accountId: credential.accountId,
+      });
+      const before = readFileSync(path, 'utf8');
+      const updated = { ...credential, access: 'synthetic-newer-slot', expires: Date.now() + 120_000 };
+      if (timing === 'before-get') await owner.set('openai-codex', updated);
+      let answer!: (response: Response) => void;
+      let started!: () => void;
+      const dispatched = new Promise<void>(resolve => {
+        started = resolve;
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((request: Request) => {
+          expect(request.headers.get('authorization')).toBe(
+            `Bearer ${timing === 'before-get' ? updated.access : credential.access}`,
+          );
+          return new Promise<Response>(resolve => {
+            answer = resolve;
+            started();
+          });
+        }),
+      );
+      const pending = refreshCodexCatalog({ appDataDir: dir, authStorage: owner });
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'CREDENTIAL_REJECTED' });
+      await dispatched;
+      if (timing === 'during-get') await owner.set('openai-codex', updated);
+      const disk = JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'));
+      expect(disk[`accounts:${account.id}`].access).toBe(credential.access);
+      expect(disk['openai-codex'].access).toBe(updated.access);
+      answer(new Response('rejected', { status: 401 }));
+      await rejected;
+      await expect(owner.getOAuthCredential('openai-codex')).resolves.toMatchObject({ access: updated.access });
+      if (timing === 'during-get') {
+        expect(readFileSync(path, 'utf8')).toBe(before);
+        expect(readCodexCatalog(dir, Date.now(), account.id).status).toBe('ready');
+      } else {
+        expect(readCodexCatalog(dir, Date.now(), account.id).status).toBe('invalid');
+      }
+    },
+  );
   it('invalidates rejected pinned A after activating B without changing B evidence', async () => {
     const { dir, credential } = fixture();
     const record = (suffix: string, active: boolean) => ({

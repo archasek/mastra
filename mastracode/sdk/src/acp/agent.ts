@@ -304,30 +304,18 @@ export class MastraCodeAcpAgent implements Agent {
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
       const discovered = await runtime.controller.listAvailableModels();
       const available = runtime.modelCatalog?.filterModels(discovered) ?? discovered;
-      if (runtime.modelCatalog && !runtime.session.model.get()) {
-        const modeId = runtime.session.mode.get();
-        const configured = await runtime.session.model.resolveForMode({
-          modeId,
-          defaultModelId: runtime.modes.find(mode => mode.id === modeId)?.defaultModelId,
-        });
-        if (!configured && runtime.modelCatalog.isOAuthModel('openai/')) {
-          throw RequestError.invalidParams(
-            undefined,
-            'No configured OpenAI Codex default is available. Refresh the Mastra Code model catalog.',
-          );
-        }
-        if (configured && runtime.modelCatalog.isOAuthModel(configured)) {
-          await runtime.modelCatalog.admitModel?.(configured);
-          runtime.modelCatalog.assertModel(configured);
-          await runtime.session.model.switch({ modelId: configured });
-        }
+      if (runtime.modelCatalog?.isOAuthModel('openai/') && !runtime.session.model.get()) {
+        throw RequestError.invalidParams(
+          undefined,
+          'No configured OpenAI Codex default is available. Refresh the Mastra Code model catalog.',
+        );
       }
       runtime.modelCatalog?.assertModel(runtime.session.model.get() ?? '');
       if (!hasUsableModel(available, runtime.session.model.get() ?? '')) {
         throw RequestError.authRequired(undefined, 'Sign in to a model provider or add an API key to use Mastra Code');
       }
       const defaultModelId = credentialedDefaultModel(available, runtime.session.model.get() ?? '');
-      if (defaultModelId) await runtime.session.model.switch({ modelId: defaultModelId });
+      if (defaultModelId) await runtime.session.model.switch(defaultModelId);
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
       sessionId = runtime.session.thread.getId() ?? undefined;
       if (!sessionId) {
@@ -720,9 +708,9 @@ export class MastraCodeAcpAgent implements Agent {
     return options;
   }
 
-  private thinkingLevel(entry: SessionEntry): ThinkingLevelSetting {
+  private thinkingLevel(entry: SessionEntry, modelId = entry.session.model.get() ?? ''): ThinkingLevelSetting {
     const level = entry.getThinkingLevel?.() ?? 'off';
-    return normalizeThinkingLevelForModel(level, entry.session.model.get() ?? '');
+    return normalizeThinkingLevelForModel(level, modelId);
   }
 
   private catalogModels(entry: SessionEntry): SessionEntry['models'] {
@@ -735,12 +723,10 @@ export class MastraCodeAcpAgent implements Agent {
     return includeCurrentModel(models, entry.modelCatalog?.isOAuthModel(modelId) ? '' : modelId);
   }
 
-  private async authorizeMode(entry: SessionEntry, modeId: string): Promise<void> {
+  private async authorizeMode(entry: SessionEntry, _modeId: string): Promise<void> {
     if (!entry.modelCatalog) return;
-    const modelId = await entry.session.model.resolveForMode({
-      modeId,
-      defaultModelId: entry.modes.find(mode => mode.id === modeId)?.defaultModelId,
-    });
+    // Native controller modes now retain one session-wide selected model.
+    const modelId = entry.session.model.get();
     await entry.modelCatalog.admitModel?.(modelId ?? '');
     entry.modelCatalog.assertModel(modelId ?? '');
   }
@@ -758,9 +744,12 @@ export class MastraCodeAcpAgent implements Agent {
         throw RequestError.invalidParams(undefined, 'Unknown session configuration selection');
       }
       if (params.configId === 'model') {
-        await entry.modelCatalog?.admitModel?.(String(params.value));
-        entry.modelCatalog?.assertModel(String(params.value));
-        await entry.session.model.switch({ modelId: String(params.value) });
+        const modelId = String(params.value);
+        await entry.modelCatalog?.admitModel?.(modelId);
+        entry.modelCatalog?.assertModel(modelId);
+        await entry.session.model.switch(modelId, {
+          ...(entry.getThinkingLevel ? { thinkingLevel: this.thinkingLevel(entry, modelId) } : {}),
+        });
       } else if (params.configId === 'mode') {
         await this.authorizeMode(entry, String(params.value));
         await entry.session.mode.switch({ modeId: String(params.value) });
@@ -894,7 +883,7 @@ export class MastraCodeAcpAgent implements Agent {
       }
       await entry.modelCatalog?.admitModel?.(params.modelId);
       entry.modelCatalog?.assertModel(params.modelId);
-      await entry.session.model.switch({ modelId: params.modelId });
+      await entry.session.model.switch(params.modelId);
     });
   }
 }

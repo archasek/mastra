@@ -110,6 +110,12 @@ export async function createAcpSession(
       },
       assertModel: modelId => {
         if (!isOAuthModel(modelId)) return;
+        if (result.authStorage.get('openai-codex')?.type !== 'oauth') {
+          throw RequestError.authRequired(
+            undefined,
+            'Sign in to OpenAI Codex to restore this OAuth-owned conversation.',
+          );
+        }
         const catalog = readCodexCatalog(appDataDir);
         const nativeId = stripMastraGatewayPrefix(remapOpenAIModelForCodexOAuth(modelId));
         if (catalog.status !== 'ready' || !new Set<string>(catalog.models).has(nativeId)) {
@@ -129,17 +135,8 @@ export async function createAcpSession(
   try {
     // SDK-owned metadata is not among core's automatically persisted state
     // preferences. Hydrate it before any catalog authorization or replay.
-    if (isResume) {
-      const savedModeModel = await result.session.thread.getSetting({
-        key: `modeModelId_${result.session.mode.get()}`,
-      });
-      if (typeof savedModeModel !== 'string' || !savedModeModel.trim()) {
-        const legacyModel = await result.session.thread.getSetting({ key: 'currentModelId' });
-        if (typeof legacyModel === 'string' && legacyModel.trim()) {
-          result.session.model.set({ modelId: legacyModel });
-        }
-      }
-    }
+    // Core's native model-persistence migration owns legacy selection restore.
+    // Do not overwrite its single-model result with a second ACP hydration rule.
     const savedRoute = await result.session.thread.getSetting({ key: 'openaiAuthRoute' });
     oauthOwned ||= savedRoute === 'oauth';
     if (isOAuthModel(result.session.model.get() ?? '') && result.session.state.get().openaiAuthRoute !== 'oauth') {

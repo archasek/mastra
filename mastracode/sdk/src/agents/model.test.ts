@@ -17,8 +17,10 @@ import { MastraGateway } from '@mastra/core/llm';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { AccountRotationProcessor, AccountStartNoticeProcessor } from '../auth/account-rotation-processor.js';
 import { setRequestAccountSelection, markRequestAccountRoutingExhausted } from '../auth/account-routing-context.js';
 import type { CredentialStore } from '../auth/types.js';
+import { MODEL_ROUTE_MAX_ENTRIES } from '../constants.js';
 import { loadSettings } from '../onboarding/settings.js';
 import {
   CODEX_CATALOG_CLIENT_VERSION,
@@ -30,116 +32,288 @@ import {
 import * as codexProvider from '../providers/openai-codex.js';
 import { setCredentialStoreProvider } from './credential-resolver.js';
 import { getGlobalAuthStorage, MastraCodeGateway } from './mastracode-gateway.js';
-import {
-  createRequestScopedCredentialStore,
-  getDynamicModel,
-  resolveModel,
-  resolvePackMemoryModelChain,
-  requestPackAccess,
-  withNativeOAuthRoute,
-} from './model.js';
+import { createRequestScopedCredentialStore, getDynamicModel, resolveModel, withNativeOAuthRoute } from './model.js';
 
 describe('native OAuth model admission', () => {
-  it('persists first non-ACP OAuth admission and rejects a restored key fallback', async () => {
+  it('constructs a pinned B model before input routing and probes B fallbacks independently of A', async () => {
     mkdirSync(appDataDir, { recursive: true });
     const now = Date.now();
-    const credential = {
-      type: 'oauth',
-      access: 'synthetic',
-      refresh: 'synthetic',
+    const accounts = ['a', 'b'].map((accountId, index) => ({
+      type: 'oauth-account',
+      id: `openai-codex:${accountId}`,
+      label: accountId,
+      active: index === 0,
+      addedAt: '2026-10-07T00:00:00Z',
+      access: `token-${accountId}`,
+      refresh: `refresh-${accountId}`,
       expires: now + 60_000,
-      accountId: 'a',
-    };
-    const id = 'openai-codex:registered-a';
+      accountId,
+    }));
     writeFileSync(
       join(appDataDir, 'auth.json'),
       JSON.stringify({
-        'openai-codex': credential,
-        [`accounts:${id}`]: {
-          ...credential,
-          type: 'oauth-account',
-          id,
-          label: 'A',
-          active: true,
-          addedAt: '2026-10-07T00:00:00Z',
-        },
+        'openai-codex': { ...accounts[0], type: 'oauth' },
+        ...Object.fromEntries(accounts.map(account => [`accounts:${account.id}`, account])),
       }),
     );
-    const scope = { kind: 'registered' as const, accountInstanceId: id, accountId: 'a' };
-    writeFileSync(
-      codexCatalogPath(appDataDir, scope),
-      JSON.stringify({
-        schemaVersion: 1,
-        provider: 'openai-codex',
-        scope,
-        endpoint: CODEX_CATALOG_ENDPOINT,
-        clientVersion: CODEX_CATALOG_CLIENT_VERSION,
-        fetchedAt: now,
-        expiresAt: now + CODEX_CATALOG_TTL_MS,
-        slugs: ['gpt-6-luna'],
-      }),
-    );
-    const nativeStorage = new InMemoryStore();
-    const makeController = () =>
-      new AgentController({
-        id: 'route-proof',
-        storage: nativeStorage,
-        modes: [
-          {
-            id: 'build',
-            name: 'Build',
-            default: true,
-            agent: new Agent({
-              id: 'route-agent',
-              name: 'Route',
-              instructions: 'Never invoked.',
-              model: 'openai/gpt-6-luna',
-            }),
-          },
-        ],
-      });
-    const first = makeController();
-    await first.init();
-    const session = await first.createSession({ id: 'first', ownerId: 'owner' });
-    const thread = await session.thread.create();
-    const context = new RequestContext();
-    context.set('controller', {
-      getThreadSetting: (key: string) => session.thread.getSetting({ key }),
-      setThreadSetting: (setting: { key: string; value: unknown }) => session.thread.setSetting(setting),
-      getState: () => session.state.get(),
-      setState: (state: { openaiAuthRoute: 'oauth' }) => session.state.set(state),
-    });
+    for (const account of accounts) {
+      const scope = { kind: 'registered' as const, accountInstanceId: account.id, accountId: account.accountId };
+      writeFileSync(
+        codexCatalogPath(appDataDir, scope),
+        JSON.stringify({
+          schemaVersion: 1,
+          provider: 'openai-codex',
+          scope,
+          endpoint: CODEX_CATALOG_ENDPOINT,
+          clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+          fetchedAt: now,
+          expiresAt: now + CODEX_CATALOG_TTL_MS,
+          slugs: account.accountId === 'a' ? ['gpt-5.6-sol'] : ['gpt-6-luna'],
+        }),
+      );
+    }
     vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
-    vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({} as never);
-    const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockReturnValue({ apiKey: 'synthetic' });
-    await withNativeOAuthRoute(context, () => resolveModel('openai/gpt-6-luna', { requestContext: context }));
-    const memory = await nativeStorage.getStore('memory');
-    expect((await memory!.getThreadById({ threadId: thread.id }))?.metadata?.openaiAuthRoute).toBe('oauth');
-    await session.thread.detachFromCurrent();
-    writeFileSync(
-      join(appDataDir, 'auth.json'),
-      JSON.stringify({ 'apikey:openai-codex': { type: 'api_key', key: 'synthetic-key' } }),
-    );
-    const restarted = makeController();
-    await restarted.init();
-    const restored = await restarted.createSession({ id: 'restored', ownerId: 'owner' });
-    await restored.thread.switch({ threadId: thread.id });
-    const restoredContext = new RequestContext();
-    restoredContext.set('controller', {
-      getThreadSetting: (key: string) => restored.thread.getSetting({ key }),
-      setThreadSetting: (setting: { key: string; value: unknown }) => restored.thread.setSetting(setting),
-      getState: () => restored.state.get(),
-      setState: (state: { openaiAuthRoute: 'oauth' }) => restored.state.set(state),
+    vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockReturnValue({ apiKey: 'synthetic' });
+    const native = vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({} as never);
+    const context = new RequestContext();
+    const state = {
+      modelRoute: { entries: [{ id: 'b', label: 'B', modelId: 'openai/gpt-6-luna', accountId: accounts[1]!.id }] },
+    };
+    const metadata: Record<string, unknown> = {};
+    context.set('controller', {
+      session: { modelId: 'openai/gpt-6-luna', modeId: 'fast' },
+      getState: () => state,
+      setState: async () => {},
+      getThreadSetting: async (key: string) => metadata[key],
+      setThreadSetting: async ({ key, value }: { key: string; value: unknown }) => {
+        metadata[key] = value;
+      },
     });
-    auth.mockClear();
+    // Real Agent construction precedes AccountStartNoticeProcessor.processInput.
+    expect(() => getDynamicModel({ requestContext: context })).not.toThrow();
+    await expect(native.mock.calls.at(-1)![1]!.authStorage!.getOAuthCredential!('openai-codex')).resolves.toMatchObject(
+      {
+        accountInstanceId: accounts[1]!.id,
+        access: 'token-b',
+      },
+    );
+    expect(getGlobalAuthStorage().getActiveAccount('openai-codex')?.id).toBe(accounts[0]!.id);
+    setRequestAccountSelection(context, 'openai-codex', accounts[0]!.id);
+    state.modelRoute.entries.unshift({
+      id: 'a',
+      label: 'A',
+      modelId: 'openai/gpt-5.6-sol',
+      accountId: accounts[0]!.id,
+    });
+    const controller = context.get('controller') as { session: { modelId: string } };
+    controller.session.modelId = 'openai/gpt-5.6-sol';
+    const cascade = getDynamicModel({ requestContext: context });
+    expect(Array.isArray(cascade)).toBe(true);
+    expect((cascade as Array<{ id: string }>).map(entry => entry.id)).toEqual(['a', 'b']);
+    expect(() =>
+      resolveModel('openai/gpt-6-luna', { requestContext: context, accountId: accounts[1]!.id }),
+    ).not.toThrow();
+    await expect(native.mock.calls.at(-1)![1]!.authStorage!.getOAuthCredential!('openai-codex')).resolves.toMatchObject(
+      { accountInstanceId: accounts[1]!.id },
+    );
+    expect(() =>
+      resolveModel('openai/gpt-6-luna', { requestContext: context, accountId: 'openai-codex:deleted' }),
+    ).toThrow('OAuth is required');
+    const aScope = { kind: 'registered' as const, accountInstanceId: accounts[0]!.id, accountId: 'a' };
+    const aCachePath = codexCatalogPath(appDataDir, aScope);
+    const aCache = JSON.parse(readFileSync(aCachePath, 'utf8'));
+    aCache.slugs.push('gpt-6-luna');
+    writeFileSync(aCachePath, JSON.stringify(aCache));
+    const automatic = new RequestContext();
+    automatic.set('controller', {
+      ...(context.get('controller') as object),
+      session: { modelId: 'openai/gpt-6-luna', modeId: 'fast' },
+      getState: () => ({
+        modelRoute: { entries: [{ id: 'automatic', label: 'Automatic', modelId: 'openai/gpt-6-luna' }] },
+      }),
+    });
+    setRequestAccountSelection(automatic, 'openai-codex', accounts[0]!.id);
+    resolveModel('openai/gpt-6-luna', { requestContext: automatic });
+    const automaticFacade = native.mock.calls.at(-1)![1]!.authStorage!;
+    await expect(automaticFacade.getOAuthCredential!('openai-codex')).resolves.toMatchObject({ access: 'token-a' });
+    const owner = getGlobalAuthStorage();
+    const rotation = new AccountRotationProcessor({ credentialStore: owner });
     await expect(
-      withNativeOAuthRoute(restoredContext, () =>
-        resolveModel('openai/gpt-6-luna', { requestContext: restoredContext }),
-      ),
-    ).rejects.toThrow('OAuth is required');
-    expect(auth).not.toHaveBeenCalled();
-    await restored.thread.detachFromCurrent();
+      rotation.processAPIError({
+        error: Object.assign(new Error('synthetic rate limit'), {
+          statusCode: 429,
+          url: 'https://chatgpt.com/backend-api/codex/responses',
+        }),
+        state: {},
+        retryCount: 0,
+        stepNumber: 0,
+        steps: [],
+        requestContext: automatic,
+        writer: { custom: vi.fn(async () => {}) },
+      } as never),
+    ).resolves.toEqual({ retry: true });
+    // Reuse the same prepared provider facade, as core's retry does.
+    await expect(automaticFacade.getOAuthCredential!('openai-codex')).resolves.toMatchObject({
+      accountInstanceId: accounts[1]!.id,
+      access: 'token-b',
+    });
   });
+  it.each(['main', 'non-forked-subagent'] as const)(
+    'persists first non-ACP %s OAuth admission and rejects a restored key fallback',
+    async entrypoint => {
+      mkdirSync(appDataDir, { recursive: true });
+      const now = Date.now();
+      const credential = {
+        type: 'oauth',
+        access: 'synthetic',
+        refresh: 'synthetic',
+        expires: now + 60_000,
+        accountId: 'a',
+      };
+      const id = 'openai-codex:registered-a';
+      writeFileSync(
+        join(appDataDir, 'auth.json'),
+        JSON.stringify({
+          'openai-codex': credential,
+          [`accounts:${id}`]: {
+            ...credential,
+            type: 'oauth-account',
+            id,
+            label: 'A',
+            active: true,
+            addedAt: '2026-10-07T00:00:00Z',
+          },
+        }),
+      );
+      const scope = { kind: 'registered' as const, accountInstanceId: id, accountId: 'a' };
+      writeFileSync(
+        codexCatalogPath(appDataDir, scope),
+        JSON.stringify({
+          schemaVersion: 1,
+          provider: 'openai-codex',
+          scope,
+          endpoint: CODEX_CATALOG_ENDPOINT,
+          clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+          fetchedAt: now,
+          expiresAt: now + CODEX_CATALOG_TTL_MS,
+          slugs: ['gpt-6-luna'],
+        }),
+      );
+      const nativeStorage = new InMemoryStore();
+      const makeController = () =>
+        new AgentController({
+          id: 'route-proof',
+          storage: nativeStorage,
+          subagents: [
+            {
+              id: 'explore',
+              name: 'Explore',
+              description: 'Fixture',
+              instructions: 'Never infer.',
+              defaultModelId: 'openai/gpt-6-luna',
+              tools: {},
+            },
+          ],
+          resolveSubagentModel: (modelId, options) => resolveModel(modelId, options),
+          modes: [
+            {
+              id: 'build',
+              name: 'Build',
+              default: true,
+              agent: new Agent({
+                id: 'route-agent',
+                name: 'Route',
+                instructions: 'Never invoked.',
+                model: 'anthropic/claude-haiku-4-5',
+              }),
+            },
+          ],
+        });
+      const first = makeController();
+      await first.init();
+      const session = await first.createSession({ id: 'first', ownerId: 'owner' });
+      const thread = await session.thread.create();
+      const context = new RequestContext();
+      context.set('controller', {
+        getThreadSetting: (key: string) => session.thread.getSetting({ key }),
+        setThreadSetting: (setting: { key: string; value: unknown }) => session.thread.setSetting(setting),
+        getState: () => session.state.get(),
+        setState: (state: { openaiAuthRoute: 'oauth' }) => session.state.set(state),
+      });
+      vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
+      const nativeProvider = vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({
+        specificationVersion: 'v2',
+        provider: 'synthetic-codex',
+        modelId: 'gpt-6-luna',
+        supportedUrls: {},
+        doGenerate: vi.fn(() => {
+          throw new Error('External inference forbidden');
+        }),
+        doStream: vi.fn(() => {
+          throw new Error('External inference forbidden');
+        }),
+      } as never);
+      const auth = vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockReturnValue({ apiKey: 'synthetic' });
+      if (entrypoint === 'main') {
+        await withNativeOAuthRoute(context, () => resolveModel('openai/gpt-6-luna', { requestContext: context }));
+      } else {
+        const stream = vi.spyOn(Agent.prototype, 'stream').mockImplementation(async () => {
+          const facade = nativeProvider.mock.calls.at(-1)![1]!.authStorage!;
+          await facade.getOAuthCredential!('openai-codex');
+          expect(await session.thread.getSetting({ key: 'openaiAuthRoute' })).toBe('oauth');
+          return {
+            fullStream: (async function* () {})(),
+            getFullOutput: async () => ({ text: 'synthetic child result' }),
+          } as never;
+        });
+        const toolsets = await (first as any).buildToolsets(session, context);
+        const result = await toolsets.controllerBuiltIn.subagent.execute(
+          { agentType: 'explore', task: 'Fixture', forked: false },
+          { requestContext: context },
+        );
+        expect(result).toMatchObject({ isError: false, content: 'synthetic child result' });
+        expect(stream).toHaveBeenCalledOnce();
+        stream.mockRestore();
+      }
+      const memory = await nativeStorage.getStore('memory');
+      expect((await memory!.getThreadById({ threadId: thread.id }))?.metadata?.openaiAuthRoute).toBe('oauth');
+      await session.thread.detachFromCurrent();
+      writeFileSync(
+        join(appDataDir, 'auth.json'),
+        JSON.stringify({ 'apikey:openai-codex': { type: 'api_key', key: 'synthetic-key' } }),
+      );
+      const restarted = makeController();
+      await restarted.init();
+      const restored = await restarted.createSession({ id: 'restored', ownerId: 'owner' });
+      await restored.thread.switch({ threadId: thread.id });
+      const restoredContext = new RequestContext();
+      restoredContext.set('controller', {
+        getThreadSetting: (key: string) => restored.thread.getSetting({ key }),
+        setThreadSetting: (setting: { key: string; value: unknown }) => restored.thread.setSetting(setting),
+        getState: () => restored.state.get(),
+        setState: (state: { openaiAuthRoute: 'oauth' }) => restored.state.set(state),
+      });
+      auth.mockClear();
+      await expect(
+        withNativeOAuthRoute(restoredContext, () =>
+          resolveModel('openai/gpt-6-luna', { requestContext: restoredContext }),
+        ),
+      ).rejects.toThrow('OAuth is required');
+      expect(auth).not.toHaveBeenCalled();
+      if (entrypoint === 'non-forked-subagent') {
+        const stream = vi.spyOn(Agent.prototype, 'stream');
+        const toolsets = await (restarted as any).buildToolsets(restored, restoredContext);
+        const result = await toolsets.controllerBuiltIn.subagent.execute(
+          { agentType: 'explore', task: 'Fixture', forked: false },
+          { requestContext: restoredContext },
+        );
+        expect(result.isError).toBe(true);
+        expect(stream).not.toHaveBeenCalled();
+        expect(auth).not.toHaveBeenCalled();
+      }
+      await restored.thread.detachFromCurrent();
+    },
+  );
 
   it('admits a real native provisional legacy identity without writing auth or cache', async () => {
     mkdirSync(appDataDir, { recursive: true });
@@ -174,7 +348,28 @@ describe('native OAuth model admission', () => {
     vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
     vi.spyOn(MastraCodeGateway.prototype, 'resolveAuth').mockReturnValue({ apiKey: 'synthetic' });
     const native = vi.spyOn(codexProvider, 'openaiCodexProvider').mockReturnValue({} as never);
-    resolveModel('openai/gpt-6-luna');
+    const automatic = new RequestContext();
+    const routeState: Record<string, unknown> = {
+      modelRoute: { entries: [{ id: 'openai', label: 'OpenAI', modelId: 'openai/gpt-6-luna' }] },
+    };
+    const metadata: Record<string, unknown> = {};
+    automatic.set('controller', {
+      session: { modelId: 'openai/gpt-6-luna', modeId: 'fast' },
+      getState: () => routeState,
+      setState: async (updates: Record<string, unknown>) => Object.assign(routeState, updates),
+      getThreadSetting: async (key: string) => metadata[key],
+      setThreadSetting: async ({ key, value }: { key: string; value: unknown }) => {
+        metadata[key] = value;
+      },
+    });
+    await new AccountStartNoticeProcessor({ credentialStore: owner }).processInput({
+      state: {},
+      messageList: [],
+      systemMessages: [],
+      writer: { custom: vi.fn(async () => {}) },
+      requestContext: automatic,
+    } as never);
+    resolveModel('openai/gpt-6-luna', { requestContext: automatic });
     await expect(native.mock.calls[0]![1]!.authStorage!.getOAuthCredential!('openai-codex')).resolves.toMatchObject({
       accountId: 'legacy-a',
     });
@@ -289,7 +484,6 @@ describe('native OAuth model admission', () => {
     });
     expect(() => resolveModel('openai/gpt-5.4-mini')).toThrow('unavailable');
     expect(auth).not.toHaveBeenCalled();
-    expect(requestPackAccess().openai).toBe('oauth');
     expect(() => resolveModel('openai/gpt-6-luna')).not.toThrow();
     const facade = native.mock.calls[0]![1]!.authStorage!;
     await expect(facade.getOAuthCredential!('openai-codex')).resolves.toMatchObject({ accountId: 'account-a' });
@@ -480,104 +674,77 @@ describe('getDynamicModel error branches', () => {
   });
 });
 
-describe('getDynamicModel fallback chain', () => {
-  function seedSettings(packFallbacks: Record<string, string>) {
-    mkdirSync(appDataDir, { recursive: true });
-    writeFileSync(
-      join(appDataDir, 'settings.json'),
-      JSON.stringify({
-        onboarding: { completedAt: '2026-01-01T00:00:00.000Z', skippedAt: null, version: 1 },
-        models: { packFallbacks },
-      }),
-      'utf-8',
-    );
-  }
+describe('getDynamicModel model route', () => {
+  const route = [
+    { id: 'anthropic', label: 'Anthropic', modelId: 'anthropic/claude-fable-5' },
+    { id: 'openai', label: 'OpenAI', modelId: 'openai/gpt-5.6-sol' },
+    { id: 'github-copilot', label: 'GitHub Copilot', modelId: 'github-copilot/gpt-4.1' },
+  ];
 
-  function requestWithSession(modelId: string, modeId = 'build', activeModelPackId = modelId.split('/')[0]) {
+  function requestWithSession(
+    modelId: string,
+    options?: {
+      threadId?: string;
+      route?: typeof route;
+      pending?: {
+        fromEntryId: string;
+        toEntryId: string;
+        toModelId: string;
+        threadId?: string;
+        reason: 'pool-exhausted' | 'persistent-outage';
+        at: string;
+      };
+    },
+  ) {
     const requestContext = new RequestContext();
     requestContext.set('controller', {
-      session: { modelId, modeId },
-      getState: () => ({ activeModelPackId }),
+      session: { modelId, modeId: 'build' },
+      threadId: options?.threadId,
+      getState: () => ({
+        modelRoute: options?.route ? { entries: options.route } : undefined,
+        mastracodePendingModelFallback: options?.pending,
+      }),
     });
     return { requestContext };
   }
 
-  it('returns a bare model when no fallback is configured — identical to before', () => {
-    seedSettings({});
-
+  it('returns a bare model when no route is configured', () => {
     const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5'));
 
     expect(Array.isArray(model)).toBe(false);
     expect((model as { modelId?: string }).modelId).toBe('claude-fable-5');
   });
 
-  it('returns a bare model for a manual /model selection that matches no pack', () => {
-    seedSettings({ anthropic: 'openai' });
-
-    const model = getDynamicModel(requestWithSession('openai/gpt-5.4-mini'));
+  it('returns a bare model when the route does not start with the selected model', () => {
+    const model = getDynamicModel(requestWithSession('openai/gpt-5.4-mini', { route }));
 
     expect(Array.isArray(model)).toBe(false);
+    expect((model as { modelId?: string }).modelId).toBe('gpt-5.4-mini');
   });
 
-  it('does not infer another pack when a manual override happens to match its model', () => {
-    seedSettings({ openai: 'github-copilot' });
-
-    const model = getDynamicModel(requestWithSession('openai/gpt-5.6-sol', 'build', 'anthropic'));
-
-    expect(Array.isArray(model)).toBe(false);
-    expect((model as { modelId?: string }).modelId).toBe('gpt-5.6-sol');
-  });
-
-  it('builds the fallback array from the active pack chain, resolving each pack for the same mode', () => {
-    seedSettings({ anthropic: 'openai', openai: 'github-copilot' });
-
-    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5'));
-
-    expect(Array.isArray(model)).toBe(true);
+  it('builds a fallback array from the host-supplied route', () => {
+    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5', { route }));
     const entries = model as Array<{ id?: string; model: { modelId?: string } }>;
+
     expect(entries.map(entry => entry.id)).toEqual(['anthropic', 'openai', 'github-copilot']);
     expect(entries.map(entry => entry.model.modelId)).toEqual(['claude-fable-5', 'gpt-5.6-sol', 'gpt-4.1']);
   });
 
-  it('uses the explicit active pack when another pack has the same mode model', () => {
-    seedSettings({ 'custom:Shared Model': 'openai' });
-    const raw = JSON.parse(readFileSync(join(appDataDir, 'settings.json'), 'utf-8'));
-    // Simulate another TUI instance changing the global pack while this
-    // request's thread still explicitly owns the custom pack.
-    raw.models.activeModelPackId = 'anthropic';
-    raw.customModelPacks = [
-      {
-        name: 'Shared Model',
-        models: { build: 'anthropic/claude-fable-5' },
-        createdAt: '2026-01-01T00:00:00.000Z',
-      },
-    ];
-    writeFileSync(join(appDataDir, 'settings.json'), JSON.stringify(raw), 'utf-8');
-
-    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5', 'build', 'custom:Shared Model'));
-    const entries = model as Array<{ id?: string }>;
-
-    expect(entries.map(entry => entry.id)).toEqual(['custom:Shared Model', 'openai']);
-  });
-
-  it('starts a new request on the pending landed pack before the TUI finishes persisting stickiness', () => {
-    seedSettings({ anthropic: 'openai', openai: 'github-copilot' });
-    const requestContext = new RequestContext();
-    requestContext.set('controller', {
-      session: { modelId: 'anthropic/claude-fable-5', modeId: 'build' },
-      threadId: 'thread-1',
-      getState: () => ({
-        activeModelPackId: 'anthropic',
-        mastracodePendingPackFallback: {
-          fromPackId: 'anthropic',
-          toPackId: 'openai',
+  it('starts at a same-thread pending route hop', () => {
+    const model = getDynamicModel(
+      requestWithSession('anthropic/claude-fable-5', {
+        threadId: 'thread-1',
+        route,
+        pending: {
+          fromEntryId: 'anthropic',
+          toEntryId: 'openai',
           toModelId: 'openai/gpt-5.6-sol',
           threadId: 'thread-1',
+          reason: 'pool-exhausted',
+          at: '2026-10-05T00:00:00.000Z',
         },
       }),
-    });
-
-    const model = getDynamicModel({ requestContext });
+    );
     const entries = model as Array<{ id?: string; model: { modelId?: string } }>;
 
     expect(entries.map(entry => entry.id)).toEqual(['openai', 'github-copilot']);
@@ -585,216 +752,72 @@ describe('getDynamicModel fallback chain', () => {
   });
 
   it('ignores pending fallback state captured for another thread', () => {
-    seedSettings({ anthropic: 'openai', openai: 'github-copilot' });
-    const requestContext = new RequestContext();
-    requestContext.set('controller', {
-      session: { modelId: 'anthropic/claude-fable-5', modeId: 'build' },
-      threadId: 'thread-2',
-      getState: () => ({
-        activeModelPackId: 'anthropic',
-        mastracodePendingPackFallback: {
-          fromPackId: 'anthropic',
-          toPackId: 'openai',
+    const model = getDynamicModel(
+      requestWithSession('anthropic/claude-fable-5', {
+        threadId: 'thread-2',
+        route,
+        pending: {
+          fromEntryId: 'anthropic',
+          toEntryId: 'openai',
           toModelId: 'openai/gpt-5.6-sol',
           threadId: 'thread-1',
+          reason: 'pool-exhausted',
+          at: '2026-10-05T00:00:00.000Z',
         },
       }),
-    });
-
-    const model = getDynamicModel({ requestContext });
+    );
     const entries = model as Array<{ id?: string }>;
 
     expect(entries.map(entry => entry.id)).toEqual(['anthropic', 'openai', 'github-copilot']);
   });
 
-  it('truncates the chain at a fallback pack that lacks the session mode model', () => {
-    seedSettings({ anthropic: 'custom:empty' });
-    const raw = JSON.parse(readFileSync(join(appDataDir, 'settings.json'), 'utf-8'));
-    raw.customModelPacks = [{ name: 'empty', models: {} }];
-    writeFileSync(join(appDataDir, 'settings.json'), JSON.stringify(raw), 'utf-8');
-
-    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5'));
-
-    // The fallback pack cannot serve mode 'build', so the chain collapses to
-    // the primary alone — a bare model, not a one-entry fallback array.
-    expect(Array.isArray(model)).toBe(false);
-    expect((model as { modelId?: string }).modelId).toBe('claude-fable-5');
-  });
-
-  it('truncates the chain at a fallback entry whose model fails to resolve (deployed fail-closed)', async () => {
-    seedSettings({ anthropic: 'openai' });
-    // Deployed-style tenant store: anthropic connected, openai not, and no
-    // environment fallback — openai model resolution throws.
-    setCredentialStoreProvider(() => ({
-      allowEnvironmentFallback: false,
-      reload: () => {},
-      get: provider => (provider === 'anthropic' ? { type: 'api_key' as const, key: 'sk-ant-tenant' } : undefined),
-      getStoredApiKey: provider => (provider === 'anthropic' ? 'sk-ant-tenant' : undefined),
-      getApiKey: async provider => (provider === 'anthropic' ? 'sk-ant-tenant' : undefined),
-    }));
-    const requestContext = new RequestContext();
-    requestContext.set('user', { workosId: 'user_1', id: 'prov_1', organizationId: 'org_1' });
-    requestContext.set('controller', { session: { modelId: 'anthropic/claude-fable-5', modeId: 'build' } });
-
-    const model = getDynamicModel({ requestContext });
-
-    expect(Array.isArray(model)).toBe(false);
-    expect((model as { modelId?: string }).modelId).toBe('claude-fable-5');
-  });
-
-  it('gives a revisited pack a unique per-occurrence id (A→B→A chain)', () => {
-    seedSettings({ anthropic: 'openai', openai: 'anthropic' });
-
-    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5'));
-    const entries = model as Array<{ id?: string }>;
-
-    // One revisit total per cascade (Q15: full circle, one revisit, surface).
-    expect(entries.map(entry => entry.id)).toEqual(['anthropic', 'openai', 'anthropic#2']);
-  });
-
-  it('identifies the pack through builtin overrides applied to the session model', () => {
-    seedSettings({ anthropic: 'openai' });
-    const raw = JSON.parse(readFileSync(join(appDataDir, 'settings.json'), 'utf-8'));
-    raw.models.modePackOverrides = { anthropic: { build: 'anthropic/claude-haiku-4-5' } };
-    writeFileSync(join(appDataDir, 'settings.json'), JSON.stringify(raw), 'utf-8');
-
-    const model = getDynamicModel(requestWithSession('anthropic/claude-haiku-4-5'));
-
-    expect(Array.isArray(model)).toBe(true);
-    expect((model as Array<{ id?: string }>).map(entry => entry.id)).toEqual(['anthropic', 'openai']);
-  });
-});
-
-describe('resolvePackMemoryModelChain', () => {
-  function seedOmSettings({
-    packFallbacks = {},
-    customModelPacks = [],
-    modePackOverrides = {},
-  }: {
-    packFallbacks?: Record<string, string>;
-    customModelPacks?: Array<{ name: string; models: Record<string, string>; createdAt?: string }>;
-    modePackOverrides?: Record<string, Record<string, string>>;
-  }) {
-    mkdirSync(appDataDir, { recursive: true });
-    writeFileSync(
-      join(appDataDir, 'settings.json'),
-      JSON.stringify({
-        onboarding: { completedAt: '2026-01-01T00:00:00.000Z', skippedAt: null, version: 1 },
-        models: { packFallbacks, modePackOverrides },
-        customModelPacks: customModelPacks.map(pack => ({ createdAt: '2026-01-01T00:00:00.000Z', ...pack })),
-      }),
-      'utf-8',
-    );
-    return loadSettings();
-  }
-
-  it('returns undefined when no pack in the chain defines an OM model', () => {
-    const settings = seedOmSettings({ packFallbacks: { anthropic: 'openai' } });
-
-    expect(resolvePackMemoryModelChain(settings, 'anthropic', undefined)).toBeUndefined();
-  });
-
-  it('returns undefined for an unknown start pack', () => {
-    const settings = seedOmSettings({});
-
-    expect(resolvePackMemoryModelChain(settings, 'custom:missing', undefined)).toBeUndefined();
-  });
-
-  it('returns a bare model for a single pack OM entry', () => {
-    const settings = seedOmSettings({
-      customModelPacks: [
-        {
-          name: 'Work',
-          models: { build: 'anthropic/claude-fable-5', memory: 'anthropic/claude-haiku-4-5' },
+  it('returns the pending model as a bare model when the pending entry is absent from the route', () => {
+    const model = getDynamicModel(
+      requestWithSession('anthropic/claude-fable-5', {
+        threadId: 'thread-1',
+        route,
+        pending: {
+          fromEntryId: 'anthropic',
+          toEntryId: 'removed',
+          toModelId: 'openai/gpt-5.4-mini',
+          threadId: 'thread-1',
+          reason: 'pool-exhausted',
+          at: '2026-10-05T00:00:00.000Z',
         },
-      ],
-    });
-
-    const model = resolvePackMemoryModelChain(settings, 'custom:Work', undefined);
+      }),
+    );
 
     expect(Array.isArray(model)).toBe(false);
-    expect((model as { modelId?: string }).modelId).toBe('claude-haiku-4-5');
+    expect((model as { modelId?: string }).modelId).toBe('gpt-5.4-mini');
   });
 
-  it('collects OM models along the fallback chain, skipping packs without one', () => {
-    const settings = seedOmSettings({
-      packFallbacks: { 'custom:A': 'custom:B', 'custom:B': 'custom:C' },
-      customModelPacks: [
-        { name: 'A', models: { build: 'anthropic/claude-fable-5', memory: 'anthropic/claude-haiku-4-5' } },
-        { name: 'B', models: { build: 'openai/gpt-5.6-sol' } },
-        { name: 'C', models: { build: 'openai/gpt-5.6-sol', memory: 'openai/gpt-5.4-mini' } },
-      ],
-    });
+  it('caps route resolution for persisted state that bypassed schema validation', () => {
+    const oversizedRoute = Array.from({ length: MODEL_ROUTE_MAX_ENTRIES + 1 }, (_, index) => ({
+      id: `route-${index}`,
+      label: `Route ${index}`,
+      modelId: 'anthropic/claude-fable-5',
+    }));
+    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5', { route: oversizedRoute }));
 
-    const model = resolvePackMemoryModelChain(settings, 'custom:A', undefined);
-    const entries = model as Array<{ id: string; model: { modelId?: string } }>;
-
-    expect(entries.map(entry => entry.id)).toEqual(['custom:A:memory', 'custom:C:memory']);
-    expect(entries.map(entry => entry.model.modelId)).toEqual(['claude-haiku-4-5', 'gpt-5.4-mini']);
+    expect((model as Array<{ id?: string }>).map(entry => entry.id)).toHaveLength(MODEL_ROUTE_MAX_ENTRIES);
+    expect((model as Array<{ id?: string }>).at(-1)?.id).toBe(`route-${MODEL_ROUTE_MAX_ENTRIES - 1}`);
   });
 
-  it('collapses duplicate OM models so a cycle never retries an identical model', () => {
-    const settings = seedOmSettings({
-      packFallbacks: { 'custom:A': 'custom:B', 'custom:B': 'custom:A' },
-      customModelPacks: [
-        { name: 'A', models: { build: 'anthropic/claude-fable-5', memory: 'anthropic/claude-haiku-4-5' } },
-        { name: 'B', models: { build: 'openai/gpt-5.6-sol', memory: 'anthropic/claude-haiku-4-5' } },
-      ],
-    });
-
-    const model = resolvePackMemoryModelChain(settings, 'custom:A', undefined);
+  it('truncates the route at an entry whose model cannot resolve', () => {
+    const model = getDynamicModel(
+      requestWithSession('anthropic/claude-fable-5', {
+        route: [route[0]!, { id: 'invalid', label: 'Invalid', modelId: 'not-a-model-id' }, route[1]!],
+      }),
+    );
 
     expect(Array.isArray(model)).toBe(false);
-    expect((model as { modelId?: string }).modelId).toBe('claude-haiku-4-5');
+    expect((model as { modelId?: string }).modelId).toBe('claude-fable-5');
   });
 
-  it('reads a builtin pack OM model from modePackOverrides', () => {
-    const settings = seedOmSettings({
-      packFallbacks: { anthropic: 'openai' },
-      modePackOverrides: {
-        anthropic: { memory: 'anthropic/claude-haiku-4-5' },
-        openai: { memory: 'openai/gpt-5.4-mini' },
-      },
-    });
+  it('gives a revisited entry id a unique occurrence suffix', () => {
+    const repeatedRoute = [route[0]!, route[1]!, { ...route[0]! }];
+    const model = getDynamicModel(requestWithSession('anthropic/claude-fable-5', { route: repeatedRoute }));
 
-    const model = resolvePackMemoryModelChain(settings, 'anthropic', undefined);
-    const entries = model as Array<{ id: string; model: { modelId?: string } }>;
-
-    expect(entries.map(entry => entry.id)).toEqual(['anthropic:memory', 'openai:memory']);
-    expect(entries.map(entry => entry.model.modelId)).toEqual(['claude-haiku-4-5', 'gpt-5.4-mini']);
-  });
-});
-
-describe('resolveModel Kimi For Coding authentication', () => {
-  it('delegates an explicit Mastra Gateway model without selecting the direct Kimi transport', () => {
-    process.env.MASTRA_GATEWAY_API_KEY = 'msk-gateway-key';
-    const delegatedModel = { provider: 'mastra-gateway' };
-    const gatewaySpy = vi
-      .spyOn(MastraGateway.prototype, 'resolveLanguageModel')
-      .mockReturnValue(delegatedModel as ReturnType<MastraGateway['resolveLanguageModel']>);
-
-    const model = resolveModel('mastra/kimi-for-coding/k3');
-
-    expect(model).toBe(delegatedModel);
-    expect(gatewaySpy).toHaveBeenCalledWith({
-      providerId: 'kimi-for-coding',
-      modelId: 'k3',
-      apiKey: 'msk-gateway-key',
-      headers: undefined,
-    });
-  });
-
-  it('passes KIMI_API_KEY into direct Kimi model resolution', () => {
-    process.env.KIMI_API_KEY = 'kimi-env-key';
-    const resolveSpy = vi.spyOn(MastraCodeGateway.prototype, 'resolveLanguageModel');
-
-    resolveModel('kimi-for-coding/k3');
-
-    expect(resolveSpy).toHaveBeenCalledWith({
-      providerId: 'kimi-for-coding',
-      modelId: 'k3',
-      apiKey: 'kimi-env-key',
-      headers: undefined,
-    });
+    expect((model as Array<{ id?: string }>).map(entry => entry.id)).toEqual(['anthropic', 'openai', 'anthropic#2']);
   });
 });

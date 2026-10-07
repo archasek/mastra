@@ -81,19 +81,19 @@ function newRequest(mcpServers: McpServer[] = []): NewSessionRequest {
 }
 
 describe('ACP native OAuth catalog ownership', () => {
-  it('hydrates legacy model metadata without rewriting the saved selection', async () => {
+  it('does not override the model already migrated by native boot', async () => {
     const boot = bootResult();
     boot.session.thread.getSetting.mockImplementation(async ({ key }: { key: string }) =>
       key === 'currentModelId' ? 'openai/gpt-5.5' : undefined,
     );
     vi.mocked(bootLocalAgentController).mockResolvedValueOnce(boot as never);
     const runtime = await createAcpSession({ ...newRequest(), sessionId: 'legacy-thread' });
-    expect(boot.session.model.set).toHaveBeenCalledWith({ modelId: 'openai/gpt-5.5' });
+    expect(boot.session.model.set).not.toHaveBeenCalled();
     expect(boot.session.thread.setSetting).not.toHaveBeenCalled();
     await runtime.cleanup?.();
   });
 
-  it('preserves modern per-mode metadata over legacy model metadata', async () => {
+  it('leaves native modern-versus-legacy metadata precedence to core boot', async () => {
     const boot = bootResult();
     boot.session.thread.getSetting.mockImplementation(async ({ key }: { key: string }) =>
       key === 'modeModelId_build' ? 'openai/gpt-6-luna' : key === 'currentModelId' ? 'openai/gpt-5.5' : undefined,
@@ -191,14 +191,14 @@ describe('ACP native OAuth catalog ownership', () => {
       const gatewayKey = vi.spyOn(MastraCodeGateway, 'getMastraGatewayApiKey').mockReturnValue(undefined);
       try {
         expect(restored.modelCatalog!.isOAuthModel('mastra/openai/gpt-6-luna')).toBe(true);
-        expect(() => restored.modelCatalog!.assertModel('mastra/openai/gpt-6-luna')).toThrow('Refresh');
+        expect(() => restored.modelCatalog!.assertModel('mastra/openai/gpt-6-luna')).toThrow('Sign in to OpenAI Codex');
         gatewayKey.mockReturnValue('synthetic-gateway-key');
         expect(restored.modelCatalog!.isOAuthModel('mastra/openai/gpt-6-luna')).toBe(false);
         expect(() => restored.modelCatalog!.assertModel('mastra/openai/gpt-6-luna')).not.toThrow();
       } finally {
         gatewayKey.mockRestore();
       }
-      expect(() => restored.modelCatalog!.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      await expect(restored.modelCatalog!.admitModel!('openai/gpt-6-luna')).rejects.toMatchObject({ code: -32000 });
       await restored.cleanup?.();
     } finally {
       if (oldDir === undefined) delete process.env.MASTRA_APP_DATA_DIR;
@@ -265,7 +265,7 @@ describe('ACP native OAuth catalog ownership', () => {
       expect(catalog.filterModels(generic)).toEqual([{ id: 'other/model', hasApiKey: true }]);
       writeFileSync(join(dir, 'auth.json'), '{}');
       expect(catalog.isOAuthModel('openai/gpt-6-luna')).toBe(true);
-      expect(() => catalog.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      expect(() => catalog.assertModel('openai/gpt-6-luna')).toThrow('Sign in to OpenAI Codex');
       expect(() => catalog.assertModel('other/model')).not.toThrow();
       await runtime.cleanup?.();
       // A fresh controller must hydrate persisted ownership, not decide its
@@ -277,7 +277,9 @@ describe('ACP native OAuth catalog ownership', () => {
       );
       vi.mocked(bootLocalAgentController).mockResolvedValueOnce(restored as never);
       const restoredRuntime = await createAcpSession({ ...newRequest(), sessionId: 'boot-thread' });
-      expect(() => restoredRuntime.modelCatalog!.assertModel('openai/gpt-6-luna')).toThrow('Refresh');
+      await expect(restoredRuntime.modelCatalog!.admitModel!('openai/gpt-6-luna')).rejects.toMatchObject({
+        code: -32000,
+      });
       expect(restored.session.state.set).toHaveBeenCalledWith({ openaiAuthRoute: 'oauth' });
       await restoredRuntime.cleanup?.();
     } finally {

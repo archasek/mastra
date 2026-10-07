@@ -1377,7 +1377,7 @@ describe('ACP Agent - Provider authentication', () => {
     const createThread = vi.fn(async () => ({ id: 'thread-1' }));
     const cleanup = vi.fn().mockResolvedValue(undefined);
     let modelId = currentModelId;
-    const switchModel = vi.fn(async ({ modelId: next }: { modelId: string }) => {
+    const switchModel = vi.fn(async (next: string) => {
       modelId = next;
     });
     const subscribe = vi.fn(() => () => {});
@@ -1456,7 +1456,7 @@ describe('ACP Agent - Provider authentication', () => {
       'openai/gpt-5.5',
     );
     await expect(created).resolves.toMatchObject({ models: { currentModelId: 'xai/grok-4.5' } });
-    expect(switchModel).toHaveBeenCalledWith({ modelId: 'xai/grok-4.5' });
+    expect(switchModel).toHaveBeenCalledWith('xai/grok-4.5');
   });
 
   it.each([
@@ -1465,7 +1465,7 @@ describe('ACP Agent - Provider authentication', () => {
   ])('selects a credentialed %s when the new session has no model', async (_case, models, expected) => {
     const { created, switchModel } = newSession(models, '');
     await expect(created).resolves.toMatchObject({ models: { currentModelId: expected } });
-    expect(switchModel).toHaveBeenCalledExactlyOnceWith({ modelId: expected });
+    expect(switchModel).toHaveBeenCalledExactlyOnceWith(expected);
   });
 
   it.each([
@@ -1498,7 +1498,7 @@ describe('ACP Agent - Provider authentication', () => {
       'openai/gpt-5.5',
     );
     await expect(created).resolves.toMatchObject({ models: { currentModelId: 'groq/llama' } });
-    expect(switchModel).toHaveBeenCalledExactlyOnceWith({ modelId: 'groq/llama' });
+    expect(switchModel).toHaveBeenCalledExactlyOnceWith('groq/llama');
   });
 
   it.each([false, true])('keeps a fallback switch private until it settles (reject: %s)', async reject => {

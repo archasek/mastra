@@ -5,13 +5,10 @@ import type { RequestContext } from '@mastra/core/request-context';
 import { getRequestAccountSelection, isRequestAccountRoutingExhausted } from '../auth/account-routing-context.js';
 import { ProviderAuthRequiredError } from '../auth/provider-auth-error.js';
 import type { CredentialStore, OAuthAccountRecord } from '../auth/types.js';
-import { listBuiltinModePacks, resolveModePackFallbackChain } from '../onboarding/packs.js';
-import type { ProviderAccess } from '../onboarding/packs.js';
+import { MODEL_ROUTE_MAX_ENTRIES } from '../constants.js';
 import {
-  findModePackForModel,
   loadSettings,
   resolveDefaultThinkingLevel,
-  resolveModePackModels,
   stripMastraCodeCustomProviderPrefix,
 } from '../onboarding/settings.js';
 import { AMAZON_BEDROCK_GATEWAY_ID, createAmazonBedrockGateway } from '../providers/amazon-bedrock-gateway.js';
@@ -59,6 +56,18 @@ type ResolvedModel = GatewayLanguageModel;
 type ModelRequestHeaders = Record<string, string>;
 const admittedNativeOAuth = new WeakSet<RequestContext>();
 
+/** Commit route ownership before native OAuth credentials can reach a request. */
+async function persistNativeOAuthRoute(requestContext?: RequestContext): Promise<void> {
+  const controller = requestContext?.get('controller') as AgentControllerRequestContext<any> | undefined;
+  if (!controller) return;
+  if (!controller.getThreadSetting || !controller.setThreadSetting)
+    throw new ProviderAuthRequiredError('Native OAuth requires durable thread ownership.');
+  if ((await controller.getThreadSetting('openaiAuthRoute')) !== 'oauth') {
+    await controller.setThreadSetting({ key: 'openaiAuthRoute', value: 'oauth' });
+  }
+  await controller.setState({ openaiAuthRoute: 'oauth' });
+}
+
 /** Restore native route authority for every request, including background wakes. */
 export function withNativeOAuthRoute<T>(requestContext: RequestContext, resolve: () => T): T | Promise<T> {
   const controller = requestContext.get('controller') as AgentControllerRequestContext<any> | undefined;
@@ -80,10 +89,7 @@ export function withNativeOAuthRoute<T>(requestContext: RequestContext, resolve:
     // resolveModel records only successful local OAuth admission, not merely
     // global login presence or a gateway/tenant model selection.
     if (admitted && savedRoute !== 'oauth') {
-      if (!controller.setThreadSetting)
-        throw new ProviderAuthRequiredError('Native OAuth requires durable thread ownership.');
-      await controller.setThreadSetting({ key: 'openaiAuthRoute', value: 'oauth' });
-      await controller.setState({ openaiAuthRoute: 'oauth' });
+      await persistNativeOAuthRoute(requestContext);
     }
     return result;
   })();
@@ -107,8 +113,12 @@ function accountCredential(account: OAuthAccountRecord) {
 export function createRequestScopedCredentialStore(
   base: CredentialStore,
   requestContext?: RequestContext,
+  routeAccount?: { providerId: string; accountId: string },
 ): CredentialStore {
-  const selectedId = (providerId: string) => getRequestAccountSelection(requestContext, providerId);
+  const selectedId = (providerId: string) =>
+    routeAccount?.providerId === providerId
+      ? routeAccount.accountId
+      : getRequestAccountSelection(requestContext, providerId);
   const selectedAccount = (providerId: string) => {
     const accountInstanceId = selectedId(providerId);
     return accountInstanceId
@@ -197,6 +207,8 @@ export function resolveModel(
     remapForCodexOAuth?: boolean;
     requestContext?: RequestContext;
     anthropicPromptCacheScope?: AnthropicPromptCacheScope;
+    /** The native route entry being constructed or probed, not a global activation. */
+    accountId?: string;
   },
 ): GatewayLanguageModel {
   reloadAuthStorage();
@@ -256,12 +268,29 @@ export function resolveModel(
   // caller's own store (user > org > env). Undefined = global AuthStorage.
   const tenantCredentialStore = resolveCredentialStore(options?.requestContext);
   const baseCredentialStore = tenantCredentialStore ?? getGlobalAuthStorage();
-  let credentialStore = createRequestScopedCredentialStore(baseCredentialStore, options?.requestContext);
   const controllerContext = options?.requestContext?.get('controller') as
     | AgentControllerRequestContext<any>
     | undefined;
+  const routeState = controllerContext?.getState?.();
+  const pending = routeState?.mastracodePendingModelFallback;
+  const pendingMatches =
+    pending && (pending.threadId === undefined || pending.threadId === controllerContext?.threadId);
+  const matchingEntry = routeState?.modelRoute?.entries?.find(
+    (entry: { id: string; modelId: string; accountId?: string }) =>
+      entry.modelId === modelId && (!pendingMatches || entry.id === pending.toEntryId),
+  );
+  // Only a declared targeted route/probe is stable. Automatic selection must
+  // remain live so an already-constructed model follows native A -> B retries.
+  const declaredAccountId = options?.accountId ?? matchingEntry?.accountId;
+  const selectedAccountId = declaredAccountId ?? getRequestAccountSelection(options?.requestContext, 'openai-codex');
+  const routeAccount =
+    !tenantCredentialStore && providerId === 'openai' && declaredAccountId
+      ? { providerId: 'openai-codex', accountId: declaredAccountId }
+      : undefined;
+  let credentialStore = createRequestScopedCredentialStore(baseCredentialStore, options?.requestContext, routeAccount);
   const ownsOAuthRoute =
     controllerContext?.getState?.().openaiAuthRoute === 'oauth' ||
+    routeAccount !== undefined ||
     getRequestAccountSelection(options?.requestContext, 'openai-codex') !== undefined ||
     isRequestAccountRoutingExhausted(options?.requestContext, 'openai-codex');
   if (
@@ -287,11 +316,11 @@ export function resolveModel(
       const appDataDir = getAppDataDir({ create: false });
       let catalog = readCodexCatalog(appDataDir, Date.now(), accountInstanceId);
       // Native storage adopts legacy auth in memory without persisting its
-      // provisional ID. Only an unrouted active legacy request may use that
-      // verified legacy scope; a deleted explicit selection never falls back.
+      // provisional ID. Automatic routing can select that same native active
+      // identity. Only that verified identity may use the strict legacy scope;
+      // a deleted or foreign explicit selection never falls back.
       if (
         catalog.status !== 'ready' &&
-        getRequestAccountSelection(options?.requestContext, 'openai-codex') === undefined &&
         baseCredentialStore.getActiveAccount?.('openai-codex')?.id === accountInstanceId
       ) {
         const legacy = readCodexCatalog(appDataDir, Date.now());
@@ -309,9 +338,7 @@ export function resolveModel(
         );
       }
     };
-    const selected =
-      getRequestAccountSelection(options?.requestContext, 'openai-codex') ??
-      baseCredentialStore.getActiveAccount?.('openai-codex')?.id;
+    const selected = selectedAccountId ?? baseCredentialStore.getActiveAccount?.('openai-codex')?.id;
     const credential = scoped.get('openai-codex');
     if (credential?.type === 'oauth') assertAdmission(credential.accountId, selected);
     if (options?.requestContext) admittedNativeOAuth.add(options.requestContext);
@@ -322,6 +349,10 @@ export function resolveModel(
         if (provider === 'openai-codex') {
           if (!snapshot) throw new ProviderAuthRequiredError('OpenAI Codex OAuth is required for this request.');
           assertAdmission(snapshot.accountId, snapshot.accountInstanceId);
+          // Subagent model resolution is synchronous, but native fetch awaits
+          // this facade before dispatch. Persist the parent's thread authority
+          // here as well as in the main/background dynamic-model wrapper.
+          await persistNativeOAuthRoute(options?.requestContext);
         }
         return snapshot;
       },
@@ -386,87 +417,39 @@ export function resolveRequestThinkingLevel(
   return resolveDefaultThinkingLevel(loadSettings(settingsPath), modeId).level;
 }
 
-/** Structural pack shape for fallback resolution (custom pack models are partial by nature). */
-export interface ResolvableModePack {
-  id: string;
-  name: string;
-  models: Record<string, string>;
-}
-
-/** All packs a fallback chain may reference: every builtin plus saved customs. */
-export function listResolvableModePacks(
-  settings: ReturnType<typeof loadSettings>,
-  access: Partial<ProviderAccess> = {},
-): ResolvableModePack[] {
-  return [
-    ...listBuiltinModePacks(access),
-    ...settings.customModelPacks.map(pack => ({
-      id: `custom:${pack.name}`,
-      name: pack.name,
-      models: { ...pack.models },
-    })),
-  ];
-}
-
-export function requestPackAccess(
-  requestContext?: RequestContext,
-  fallbackStore?: CredentialStore,
-): Partial<ProviderAccess> {
-  const base = resolveCredentialStore(requestContext) ?? fallbackStore ?? getGlobalAuthStorage();
-  base.reload();
-  const credentials = createRequestScopedCredentialStore(base, requestContext);
-  // Exhaustion/removal denies credentials, not the request's declared route.
-  // Otherwise a fallback built after exhaustion could switch back to API-key
-  // pack defaults even though this request still belongs to OAuth.
-  const routedOAuth =
-    getRequestAccountSelection(requestContext, 'openai-codex') !== undefined ||
-    isRequestAccountRoutingExhausted(requestContext, 'openai-codex');
-  return { openai: routedOAuth || credentials.get('openai-codex')?.type === 'oauth' ? 'oauth' : 'apikey' };
-}
-
 /**
- * Dynamic model function that reads the current model from controller state.
- * This allows runtime model switching via the /models picker.
- *
- * When the session's model came from a pack with a fallback chain configured
- * (`settings.models.packFallbacks`), returns core's `ModelWithRetries[]`
- * fallback array instead of a bare model: the active pack's model first, then
- * each fallback pack's model for the same mode. Core advances the array when
- * the error processors decline to retry (pool exhausted / persistent outage —
- * see AccountRotationProcessor). Entry ids are unique per occurrence — the
- * one allowed revisit of a pack gets `<packId>#2` — because core re-resolves
- * the active fallback index by id across agentic steps.
+ * Dynamic model function that reads the current model and optional ordered
+ * fallback route from controller state. Route entry ids are opaque host-owned
+ * identifiers; repeated ids receive occurrence suffixes because core tracks the
+ * active fallback index by id across agentic steps.
  */
 export function getDynamicModel(
   { requestContext }: { requestContext: RequestContext },
   settingsPath?: string,
 ): ResolvedModel | ModelWithRetries[] {
-  const agentControllerContext = requestContext.get('controller') as AgentControllerRequestContext<any> | undefined;
-
-  const controllerState = agentControllerContext?.getState?.() as
+  const controller = requestContext.get('controller') as AgentControllerRequestContext<any> | undefined;
+  const state = controller?.getState?.() as
     | {
-        activeModelPackId?: unknown;
-        mastracodePendingPackFallback?: { toPackId?: unknown; toModelId?: unknown; threadId?: unknown } | null;
+        modelRoute?: {
+          entries?: Array<{ id?: unknown; modelId?: unknown; accountId?: string }>;
+        };
+        mastracodePendingModelFallback?: { toEntryId?: unknown; toModelId?: unknown; threadId?: unknown } | null;
       }
     | undefined;
-  const pendingState = controllerState?.mastracodePendingPackFallback;
+  const pendingState = state?.mastracodePendingModelFallback;
   const pendingFallback =
     pendingState &&
     (pendingState.threadId === undefined ||
-      (typeof pendingState.threadId === 'string' && pendingState.threadId === agentControllerContext?.threadId))
+      (typeof pendingState.threadId === 'string' && pendingState.threadId === controller?.threadId))
       ? pendingState
       : undefined;
   const pendingModelId =
     pendingFallback && typeof pendingFallback.toModelId === 'string' && pendingFallback.toModelId.length > 0
       ? pendingFallback.toModelId
       : undefined;
-  const modelId = pendingModelId ?? agentControllerContext?.session?.modelId;
+  const modelId = pendingModelId ?? controller?.session?.modelId;
   if (!modelId) {
-    // A missing controller context means the run was started without session
-    // request context at all (e.g. a signal delivered to an idle thread) —
-    // "use /models" would mislead there, the user's selection was never the
-    // problem.
-    if (!agentControllerContext) {
+    if (!controller) {
       throw new Error(
         'No model available: this run started without a controller session context, so no model selection could be resolved.',
       );
@@ -474,115 +457,46 @@ export function getDynamicModel(
     throw new Error('No model selected. Use /models to select a model first.');
   }
 
-  const thinkingLevel = resolveRequestThinkingLevel(agentControllerContext, settingsPath);
+  const thinkingLevel = resolveRequestThinkingLevel(controller, settingsPath);
   const resolveOptions = { thinkingLevel, remapForCodexOAuth: true, requestContext } as const;
   const primary = resolveModel(modelId, resolveOptions);
+  const route = state?.modelRoute?.entries?.slice(0, MODEL_ROUTE_MAX_ENTRIES);
+  const pendingEntryId =
+    pendingFallback && typeof pendingFallback.toEntryId === 'string' ? pendingFallback.toEntryId : undefined;
+  const startIndex = pendingEntryId ? route?.findIndex(entry => entry.id === pendingEntryId) : 0;
+  const activeRoute = route && startIndex !== undefined && startIndex >= 0 ? route.slice(startIndex) : undefined;
+  if (!activeRoute || activeRoute.length < 2 || activeRoute[0]?.modelId !== modelId) return primary;
 
-  const settings = loadSettings(settingsPath);
-  // `models?` tolerates partial settings mocks; loaded settings always carry it.
-  const fallbacks = settings.models?.packFallbacks ?? {};
-  if (Object.keys(fallbacks).length === 0) return primary;
+  const firstId =
+    typeof activeRoute[0]?.id === 'string' && activeRoute[0].id.length > 0 ? activeRoute[0].id : undefined;
+  if (!firstId) return primary;
 
-  const modeId = agentControllerContext?.session?.modeId ?? 'build';
-  const packs = listResolvableModePacks(settings, requestPackAccess(requestContext));
-  const pendingPackId =
-    pendingFallback && typeof pendingFallback.toPackId === 'string' && pendingFallback.toPackId.length > 0
-      ? pendingFallback.toPackId
-      : undefined;
-  const statePackId = pendingPackId ?? controllerState?.activeModelPackId ?? settings.models.activeModelPackId;
-  const activePack = findModePackForModel(
-    settings,
-    packs,
-    modelId,
-    modeId,
-    typeof statePackId === 'string' ? statePackId : undefined,
-  );
-  if (!activePack) return primary;
-
-  const chain = resolveModePackFallbackChain(fallbacks, activePack.id, settings.customModelPacks);
-  if (chain.length < 2) return primary;
-
-  const entries: ModelWithRetries[] = [{ id: activePack.id, model: primary }];
-  const appearances = new Map<string, number>([[activePack.id, 1]]);
-  for (const packId of chain.slice(1)) {
-    const pack = packs.find(candidate => candidate.id === packId);
-    if (!pack) break;
-    const entryModelId = resolveModePackModels(settings, pack)[modeId];
-    if (!entryModelId) break;
-    // Best-effort resolution: an unresolvable fallback (e.g. unconnected
-    // provider in deployed fail-closed mode) truncates the chain here rather
-    // than failing the request before the primary is ever tried.
+  const entries: ModelWithRetries[] = [{ id: firstId, model: primary }];
+  const appearances = new Map<string, number>([[firstId, 1]]);
+  for (const routeEntry of activeRoute.slice(1)) {
+    if (
+      typeof routeEntry.id !== 'string' ||
+      routeEntry.id.length === 0 ||
+      typeof routeEntry.modelId !== 'string' ||
+      routeEntry.modelId.length === 0
+    ) {
+      break;
+    }
     let entryModel: ResolvedModel;
     try {
-      entryModel = resolveModel(entryModelId, resolveOptions);
+      entryModel = resolveModel(routeEntry.modelId, { ...resolveOptions, accountId: routeEntry.accountId });
     } catch {
       break;
     }
-    const occurrence = (appearances.get(packId) ?? 0) + 1;
-    appearances.set(packId, occurrence);
+    const occurrence = (appearances.get(routeEntry.id) ?? 0) + 1;
+    appearances.set(routeEntry.id, occurrence);
     entries.push({
-      id: occurrence === 1 ? packId : `${packId}#${occurrence}`,
+      id: occurrence === 1 ? routeEntry.id : `${routeEntry.id}#${occurrence}`,
       model: entryModel,
     });
   }
-  // A chain that truncated to the primary alone is indistinguishable from no
-  // chain — return the bare model so core never sees a one-entry array.
-  if (entries.length < 2) return primary;
-  return entries;
-}
 
-/** OM fallback-chain entry: a pack's OM model resolved through the gateway. Assignable to `ModelWithRetries`. */
-export type PackMemoryModelChainEntry = { id: string; model: GatewayLanguageModel };
-
-/**
- * Resolve the observational-memory model for the active mode pack, walking the
- * pack's fallback chain (`settings.models.packFallbacks`) and collecting each
- * pack's optional `models.memory` entry. Packs without an OM model are skipped
- * (the field is optional, so absence must not truncate the chain); duplicate
- * model ids collapse so an A⇄B cycle never retries an identical OM model.
- *
- * Returns a bare model for a single entry, a fallback array for multiple
- * entries (OM's internal agents run the same agentic loop, so the array gives
- * OM its own cross-pack failover), or `undefined` when no pack in the chain
- * defines an OM model — callers then fall back to the standalone OM
- * configuration.
- */
-export function resolvePackMemoryModelChain(
-  settings: ReturnType<typeof loadSettings>,
-  startPackId: string,
-  resolveOptions: Parameters<typeof resolveModel>[1],
-): GatewayLanguageModel | PackMemoryModelChainEntry[] | undefined {
-  const packs = listResolvableModePacks(settings, requestPackAccess(resolveOptions?.requestContext));
-  if (!packs.some(pack => pack.id === startPackId)) return undefined;
-
-  const chain = resolveModePackFallbackChain(
-    settings.models?.packFallbacks ?? {},
-    startPackId,
-    settings.customModelPacks,
-  );
-  const seenModelIds = new Set<string>();
-  const entries: PackMemoryModelChainEntry[] = [];
-  for (const packId of chain) {
-    const pack = packs.find(candidate => candidate.id === packId);
-    if (!pack) break;
-    const memoryModelId = resolveModePackModels(settings, pack).memory;
-    if (!memoryModelId || seenModelIds.has(memoryModelId)) continue;
-    seenModelIds.add(memoryModelId);
-    // Best-effort resolution: an unresolvable OM entry (e.g. unconnected
-    // provider in deployed fail-closed mode) truncates the chain here rather
-    // than failing observation before the pack's own OM model is tried.
-    let entryModel: ResolvedModel;
-    try {
-      entryModel = resolveModel(memoryModelId, resolveOptions);
-    } catch {
-      break;
-    }
-    entries.push({ id: `${packId}:memory`, model: entryModel });
-  }
-
-  if (entries.length === 0) return undefined;
-  if (entries.length === 1) return entries[0]!.model;
-  return entries;
+  return entries.length < 2 ? primary : entries;
 }
 
 /**

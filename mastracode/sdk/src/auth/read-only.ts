@@ -99,9 +99,20 @@ export function readOpenAICodexCatalogScope(
     ) {
       return undefined;
     }
+    const slot = data['openai-codex'];
+    // Native acquisition prefers same-refresh active-slot updates over stale
+    // registry access/expiry fields. Rejection guards must compare that grant.
+    const grant =
+      record.active &&
+      hasOAuthCredentialFields(slot) &&
+      (slot as { type?: unknown }).type === 'oauth' &&
+      slot.refresh === record.refresh
+        ? slot
+        : record;
+    if (grant.accountId !== record.accountId) return undefined;
     if (
       expectedCredential &&
-      (record.refresh !== expectedCredential.refresh || record.access !== expectedCredential.access)
+      (grant.refresh !== expectedCredential.refresh || grant.access !== expectedCredential.access)
     )
       return undefined;
     return { kind: 'registered', accountInstanceId, accountId: record.accountId };
