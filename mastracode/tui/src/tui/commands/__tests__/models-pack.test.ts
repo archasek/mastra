@@ -481,6 +481,17 @@ describe('fallback chain highlighting', () => {
 });
 
 describe('resetBuiltinPackOverrides', () => {
+  it('keeps OAuth fast account binding when resetting the OAuth builtin pack', () => {
+    const settings = createSettings();
+    settings.models.modePackOverrides = { openai: { fast: 'openai/custom-saved' } };
+    settings.models.packAccountPreferences = {
+      openai: { 'openai/gpt-6-luna': 'account-b', 'openai/custom-saved': 'custom' },
+    };
+    resetBuiltinPackOverrides(settings, 'openai', { openai: 'oauth' });
+    expect(settings.models.modePackOverrides.openai).toBeUndefined();
+    expect(settings.models.packAccountPreferences.openai).toEqual({ 'openai/gpt-6-luna': 'account-b' });
+  });
+
   it('removes the selected pack overrides and clears stale active mode defaults', () => {
     const settings = createSettings({
       models: {

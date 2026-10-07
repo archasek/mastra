@@ -4,11 +4,14 @@ import { isAbsolute, resolve } from 'node:path';
 
 import { RequestError } from '@agentclientprotocol/sdk';
 import type { LoadSessionRequest, McpServer, NewSessionRequest } from '@agentclientprotocol/sdk';
+import { MastraCodeGateway } from '../agents/mastracode-gateway.js';
 import { bootLocalAgentController } from '../index.js';
 import type { MastraCodeConfig } from '../index.js';
 import type { McpHttpServerConfig } from '../mcp/types.js';
 import { loadSettings, resolveDefaultThinkingLevel } from '../onboarding/settings.js';
-import { detectProject } from '../utils/project.js';
+import { remapOpenAIModelForCodexOAuth, stripMastraGatewayPrefix } from '../providers/model-ids.js';
+import { readCodexCatalog } from '../providers/openai-codex-catalog.js';
+import { detectProject, getAppDataDir } from '../utils/project.js';
 import type { AcpSessionRuntime } from './agent.js';
 import { withCleanupFailure } from './errors.js';
 
@@ -73,10 +76,56 @@ export async function createAcpSession(
   }
 
   let cleanupPromise: Promise<void> | undefined;
+  const appDataDir = getAppDataDir({ create: false });
+  // OAuth ownership is sticky for this conversation; sign-out cannot silently
+  // turn its OpenAI model into an API-key request.
+  let oauthOwned =
+    result.session.state.get().openaiAuthRoute === 'oauth' || result.authStorage.get('openai-codex')?.type === 'oauth';
+  const isOAuthModel = (modelId: string) => {
+    result.authStorage.reload();
+    oauthOwned ||= result.authStorage.get('openai-codex')?.type === 'oauth';
+    const explicitGateway = modelId.startsWith('mastra/') && Boolean(MastraCodeGateway.getMastraGatewayApiKey());
+    return oauthOwned && !explicitGateway && stripMastraGatewayPrefix(modelId).startsWith('openai/');
+  };
   const runtime: AcpSessionRuntime = {
     controller: result.controller,
     session: result.session,
     modes: result.controller.listModes(),
+    modelCatalog: {
+      isOAuthModel,
+      admitModel: async modelId => {
+        if (!isOAuthModel(modelId)) return;
+        runtime.modelCatalog!.assertModel(modelId);
+        await result.session.thread.setSetting({ key: 'openaiAuthRoute', value: 'oauth' });
+        await result.session.state.set({ openaiAuthRoute: 'oauth' });
+      },
+      filterModels: models => {
+        isOAuthModel('openai/');
+        if (!oauthOwned) return models;
+        const catalog = readCodexCatalog(appDataDir);
+        return [
+          ...models.filter(model => !isOAuthModel(model.id)),
+          ...catalog.models.map(id => ({ id, hasApiKey: true })),
+        ];
+      },
+      assertModel: modelId => {
+        if (!isOAuthModel(modelId)) return;
+        if (result.authStorage.get('openai-codex')?.type !== 'oauth') {
+          throw RequestError.authRequired(
+            undefined,
+            'Sign in to OpenAI Codex to restore this OAuth-owned conversation.',
+          );
+        }
+        const catalog = readCodexCatalog(appDataDir);
+        const nativeId = stripMastraGatewayPrefix(remapOpenAIModelForCodexOAuth(modelId));
+        if (catalog.status !== 'ready' || !new Set<string>(catalog.models).has(nativeId)) {
+          throw RequestError.invalidParams(
+            undefined,
+            'OpenAI Codex model is unavailable for this account. Refresh the Mastra Code model catalog.',
+          );
+        }
+      },
+    },
     getSkills: async () => (await result.controller.resolveWorkspace({ session: result.session }))?.skills,
     getThinkingLevel: () =>
       result.session.state.get().thinkingLevel ??
@@ -84,6 +133,16 @@ export async function createAcpSession(
     cleanup: () => (cleanupPromise ??= cleanupRuntime(result)),
   };
   try {
+    // SDK-owned metadata is not among core's automatically persisted state
+    // preferences. Hydrate it before any catalog authorization or replay.
+    // Core's native model-persistence migration owns legacy selection restore.
+    // Do not overwrite its single-model result with a second ACP hydration rule.
+    const savedRoute = await result.session.thread.getSetting({ key: 'openaiAuthRoute' });
+    oauthOwned ||= savedRoute === 'oauth';
+    if (isOAuthModel(result.session.model.get() ?? '') && result.session.state.get().openaiAuthRoute !== 'oauth') {
+      await result.session.thread.setSetting({ key: 'openaiAuthRoute', value: 'oauth' });
+      await result.session.state.set({ openaiAuthRoute: 'oauth' });
+    }
     const status = await result.mcpManager?.initInBackground();
     const failed = status?.failed.some(server => requestedMcpNames.has(server.name)) ?? false;
     const disabled = result.mcpManager?.getDisabledServers?.().some(name => requestedMcpNames.has(name)) ?? false;

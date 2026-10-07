@@ -5,7 +5,7 @@ import { homedir, hostname } from 'node:os';
 import path from 'node:path';
 
 import type { Agent } from '@mastra/core/agent';
-import { AgentController } from '@mastra/core/agent-controller';
+import { AgentController, migratePersistedModelSelection } from '@mastra/core/agent-controller';
 import type {
   IntervalHandler,
   AgentControllerConfig,
@@ -57,7 +57,13 @@ import { createBackgroundCompletionCallbacks } from './agents/background-complet
 import { hasCredentialStoreProvider } from './agents/credential-resolver.js';
 import { getDynamicInstructions } from './agents/instructions.js';
 import { getDynamicMemory, hasSubconsciousTools } from './agents/memory.js';
-import { createMastraCodeGateway, getDynamicModel, getGoalJudgeModel, resolveModel } from './agents/model.js';
+import {
+  createMastraCodeGateway,
+  getDynamicModel,
+  getGoalJudgeModel,
+  resolveModel,
+  withNativeOAuthRoute,
+} from './agents/model.js';
 import { buildMode } from './agents/modes/build.js';
 import { fastMode } from './agents/modes/explore.js';
 import { planMode } from './agents/modes/plan.js';
@@ -77,7 +83,7 @@ import { getDynamicWorkspace, getGoalJudgeTools } from './agents/workspace.js';
 import {
   AccountRotationProcessor,
   AccountStartNoticeProcessor,
-  PACK_FALLBACK_STATE_KEY,
+  MODEL_FALLBACK_STATE_KEY,
 } from './auth/account-rotation-processor.js';
 import { isKimiCodingDeviceId } from './auth/providers/kimi-coding.js';
 import { AuthStorage } from './auth/storage.js';
@@ -95,10 +101,8 @@ import {
   loadSettings,
   MASTRA_GATEWAY_PROVIDER,
   OBSERVABILITY_AUTH_PREFIX,
-  resolveModelDefaults,
   resolveOmRoleModel,
   saveSettings,
-  THREAD_ACTIVE_MODEL_PACK_ID_KEY,
 } from './onboarding/settings.js';
 import { getToolCategory } from './permissions.js';
 import { PluginManager } from './plugins/manager.js';
@@ -109,6 +113,7 @@ import { createAmazonBedrockGateway } from './providers/amazon-bedrock-gateway.j
 import { setAuthStorage } from './providers/claude-max.js';
 import { setAuthStorage as setGitHubCopilotAuthStorage } from './providers/github-copilot.js';
 import { setAuthStorage as setKimiCodingAuthStorage } from './providers/kimi-coding.js';
+import { readCodexCatalog } from './providers/openai-codex-catalog.js';
 import { setAuthStorage as setOpenAIAuthStorage } from './providers/openai-codex.js';
 import { setAuthStorage as setXAIAuthStorage } from './providers/xai.js';
 
@@ -130,6 +135,7 @@ import { registerSessionAndWaitForMaintenance, UNKNOWN_OWNER, unregisterSession 
 import { createResourceNotificationDispatcher, shouldHoldNotificationDelivery } from './utils/notification-dispatch.js';
 import {
   detectProject,
+  getAppDataDir,
   getObservabilityDatabasePath,
   getStorageConfig,
   getResourceIdOverride,
@@ -242,11 +248,13 @@ function shortHash(input: string): string {
   return createHash('sha256').update(input).digest('hex').slice(0, 12);
 }
 
-function applyEffectiveDefaultsToModes(
+function applyModeDefaultsToModes(
   modes: AgentControllerMode[],
   effectiveDefaults: Record<string, string>,
+  preserveModeDefaults = false,
 ): AgentControllerMode[] {
   return modes.map(mode => {
+    if (preserveModeDefaults && mode.defaultModelId) return mode;
     const savedModel = effectiveDefaults[mode.id];
     if (!savedModel) {
       return mode;
@@ -796,7 +804,12 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   });
 
   const memory =
-    config?.memory === false ? undefined : (config?.memory ?? getDynamicMemory(storage, vector, config?.settingsPath));
+    config?.memory === false
+      ? undefined
+      : (config?.memory ??
+        getDynamicMemory(storage, vector, config?.settingsPath, {
+          disableSettingsOmSeed: config?.disableSettingsOmSeed,
+        }));
   // Only the default memory wiring registers the subconscious tools; a
   // caller-supplied memory is opaque here, so its prompt must not advertise them.
   const hasSubconscious =
@@ -898,10 +911,9 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     // No session here owns the resource. Return undefined so the dispatcher
     // sends a bare wake instead of throwing mid-delivery.
     if (!session) return undefined;
-    // A long-running system must be able to drive work unattended, so a
-    // target thread without an explicit model selection falls back to a
-    // real model rather than failing the run: the mode's default, then the
-    // session's live selection.
+    // A long-running system must be able to drive work unattended, so migrate
+    // and restore the thread's persisted model before falling back to a real
+    // mode or live-session default rather than failing the run.
     const targetThread = await session.thread.getById({ threadId });
     const metadata =
       targetThread?.resourceId === resourceId
@@ -914,29 +926,27 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
       typeof savedModeId === 'string' && modes.some(mode => mode.id === savedModeId)
         ? savedModeId
         : (defaultMode?.id ?? session.mode.get());
-    const savedModeModelId = metadata?.[`modeModelId_${modeId}`];
-    const legacyModelId = metadata?.currentModelId;
+    const persistedModelId = metadata
+      ? await migratePersistedModelSelection({
+          getMetadata: async () =>
+            ((await session.thread.getById({ threadId }))?.metadata as Record<string, unknown> | undefined) ?? {},
+          modeId,
+          set: (key: string, value: unknown) => session.thread.setSettingOn({ threadId, key, value }),
+          threadId,
+          validModeIds: modes.map(mode => mode.id),
+        })
+      : undefined;
     const defaultModeModelId = modes.find(mode => mode.id === modeId)?.defaultModelId;
-    const modelId =
-      (typeof savedModeModelId === 'string' ? savedModeModelId : undefined) ??
-      (typeof legacyModelId === 'string' ? legacyModelId : undefined) ??
-      defaultModeModelId ??
-      session.model.get() ??
-      '';
+    const modelId = persistedModelId ?? defaultModeModelId ?? session.model.get() ?? '';
     const baseState = { ...session.state.get() } as MastraCodeState;
-    delete baseState.activeModelPackId;
-    delete baseState.mastracodePendingPackFallback;
+    delete baseState.modelRoute;
+    delete baseState.mastracodePendingModelFallback;
     const persistedSandboxPaths = metadata?.sandboxAllowedPaths;
     baseState.sandboxAllowedPaths =
       Array.isArray(persistedSandboxPaths) && persistedSandboxPaths.every(path => typeof path === 'string')
         ? persistedSandboxPaths
         : [];
-    const persistedStateKeys = [
-      'thinkingLevel',
-      'notifications',
-      THREAD_ACTIVE_MODEL_PACK_ID_KEY,
-      PACK_FALLBACK_STATE_KEY,
-    ] as const;
+    const persistedStateKeys = ['thinkingLevel', 'notifications', 'modelRoute', MODEL_FALLBACK_STATE_KEY] as const;
     for (const key of persistedStateKeys) {
       const value = metadata?.[key];
       if (value !== undefined) (baseState as Record<string, unknown>)[key] = value;
@@ -1182,7 +1192,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     },
     // `settingsPath` matches the source `createMastraCode()` reads from so the
     // per-mode thinking defaults resolve against the same config file.
-    model: ctx => getDynamicModel(ctx, config?.settingsPath),
+    model: ctx => withNativeOAuthRoute(ctx.requestContext, () => getDynamicModel(ctx, config?.settingsPath)),
     // Deferred notifications are re-dispatched by the core notification
     // dispatch workflow long after the originating send; the delivery policy
     // rebuilds the request context (model selection included) at delivery time
@@ -1254,7 +1264,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
       // judge model is configured, keeping the goal step a no-op. Bind the same
       // `settingsPath` used above so the judge model and `maxRuns` come from one
       // config (a custom settings file would otherwise diverge).
-      judge: ctx => getGoalJudgeModel(ctx, config?.settingsPath),
+      judge: ctx => withNativeOAuthRoute(ctx.requestContext, () => getGoalJudgeModel(ctx, config?.settingsPath)),
       maxRuns: globalSettings.models.goalMaxTurns ?? 50,
       maxSteps: 1000,
       prompt: DEFAULT_GOAL_JUDGE_PROMPT,
@@ -1270,7 +1280,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
       // Input-lane notice ONLY (no processAPIError — see the class doc): the
       // runner walks input processors first in runProcessAPIError, so an
       // input-lane processAPIError would rotate before transient retries run.
-      new AccountStartNoticeProcessor({ credentialStore: authStorage, settingsPath: config?.settingsPath }),
+      new AccountStartNoticeProcessor({ credentialStore: authStorage }),
       ...readPluginProcessors().input.map(entry => entry.value),
       ...(pluginSignalLane?.getInputProcessors() ?? []),
     ],
@@ -1327,8 +1337,6 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
         // Same budget core enforces (maxProcessorRetries below): past it, core
         // discards retry:true, so the processor no-ops instead of rotating.
         maxProcessorRetries: MASTRACODE_MAX_PROCESSOR_RETRIES,
-        // Same settings file getDynamicModel reads (model: above) so the pack
-        // cascade the processor announces matches the chain core will walk.
         settingsPath: config?.settingsPath,
       }),
     ],
@@ -1407,7 +1415,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
           ? 'apikey'
           : false,
   };
-  // Gateway covers all providers — ensure Anthropic/OpenAI packs are visible
+  // Gateway covers all providers — include Anthropic/OpenAI in OM default selection.
   if (mgApiKey) {
     if (!startupAccess.anthropic) startupAccess.anthropic = 'apikey';
     if (!startupAccess.openai) startupAccess.openai = 'apikey';
@@ -1427,10 +1435,18 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   } catch {
     // Registry may not be loaded yet; the 5 hardcoded providers are sufficient fallback
   }
-  const builtinPacks = getAvailableModePacks(startupAccess);
   const builtinOmPacks = getAvailableOmPacks(startupAccess);
-  const effectiveDefaults = resolveModelDefaults(globalSettings, builtinPacks);
-  const activeProviderId = effectiveDefaults.build?.split('/')[0];
+  // Only unconfigured builtin modes inherit the native OAuth pack. Saved
+  // choices and caller-defined modes retain their existing precedence.
+  const oauthBuiltinDefaults =
+    !config?.modes && startupAccess.openai === 'oauth'
+      ? getAvailableModePacks(startupAccess).find(pack => pack.id === 'openai')?.models
+      : undefined;
+  const effectiveDefaults = {
+    ...oauthBuiltinDefaults,
+    ...globalSettings.models.modeDefaults,
+  };
+  const activeProviderId = (effectiveDefaults.build ?? buildMode.defaultModelId)?.split('/')[0];
   const preferredOmModel = hasExplicitOMConfiguration(globalSettings)
     ? undefined
     : selectPreferredOMPack(startupAccess, activeProviderId)?.modelId;
@@ -1442,7 +1458,7 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
   const effectiveObserveAttachments = globalSettings.models.omObserveAttachments ?? 'auto';
 
   const modes = addPluginToolsToModeAllowlists(
-    applyEffectiveDefaultsToModes(config?.modes ? config.modes : defaultModes, effectiveDefaults),
+    applyModeDefaultsToModes(config?.modes ? config.modes : defaultModes, effectiveDefaults, Boolean(config?.modes)),
     Object.keys(pluginTools),
   );
   const defaultModeId =
@@ -1538,6 +1554,9 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     // request-scoped custom providers come from the calling run's context.
     // Ids the model router would hand to another registered gateway (by
     // prefix or `handlesModel`) stay strings so that gateway resolves them.
+    // Core resolves this callback synchronously. The parent model callback
+    // hydrates durable route authority before tools run; core preserves its
+    // controller getState in the subagent request context.
     resolveSubagentModel: (modelId, { requestContext }) =>
       routesToOtherGateway(
         modelId,
@@ -1588,6 +1607,28 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
           release: releaseThreadLock,
         },
   });
+
+  // This is the MC-local inventory boundary, not the general core registry.
+  // Recheck on every read, even while core's generic catalog cache is fresh.
+  if (!hasCredentialStoreProvider()) {
+    const listAvailableModels = controller.listAvailableModels.bind(controller);
+    controller.listAvailableModels = async () => {
+      const models = await listAvailableModels();
+      authStorage.reload();
+      if (authStorage.get('openai-codex')?.type !== 'oauth') return models;
+      const catalog = readCodexCatalog(getAppDataDir({ create: false }));
+      return [
+        ...models.filter(model => !model.id.startsWith('openai/')),
+        ...catalog.models.map(id => ({
+          id,
+          provider: 'openai',
+          modelName: id.slice('openai/'.length),
+          hasApiKey: true,
+          useCount: models.find(model => model.id === id)?.useCount ?? 0,
+        })),
+      ];
+    };
+  }
 
   controller.onSessionCreated(session => {
     liveSessions.add(session);
@@ -1678,7 +1719,6 @@ export async function createMastraCodeAgentController(config?: MastraCodeConfig)
     resolveModel,
     storageWarning,
     observabilityWarning,
-    builtinPacks,
     builtinOmPacks,
     effectiveDefaults,
     githubSignals,

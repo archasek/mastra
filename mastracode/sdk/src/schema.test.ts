@@ -1,8 +1,70 @@
+import { Agent } from '@mastra/core/agent';
+import { AgentController } from '@mastra/core/agent-controller';
+import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
+import { MODEL_ROUTE_MAX_ENTRIES, MODEL_ROUTE_MAX_FIELD_LENGTH } from './constants.js';
 import { stateSchema } from './schema.js';
 
 describe('stateSchema', () => {
+  it('retains the exact routed OAuth model through native Session state validation', async () => {
+    const controller = new AgentController({
+      id: 'fallback-state-fixture',
+      storage: new InMemoryStore(),
+      stateSchema,
+      modes: [
+        {
+          id: 'build',
+          name: 'Build',
+          default: true,
+          agent: new Agent({
+            id: 'fallback-state-agent',
+            name: 'State fixture',
+            instructions: 'Never invoked.',
+            model: 'openai/gpt-6-luna',
+          }),
+        },
+      ],
+    });
+    await controller.init();
+    try {
+      const session = await controller.createSession({ id: 'fallback-state-session', ownerId: 'fixture' });
+      await session.state.set({
+        mastracodePendingModelFallback: {
+          fromEntryId: 'anthropic',
+          toEntryId: 'openai',
+          toModelId: 'openai/gpt-6-luna',
+          reason: 'pool-exhausted',
+          at: '2026-10-06T00:00:00Z',
+        },
+      });
+      expect(session.state.get().mastracodePendingModelFallback).toMatchObject({
+        toModelId: 'openai/gpt-6-luna',
+      });
+    } finally {
+      await controller.getMastra()?.shutdown();
+    }
+  });
+
+  it('retains the native routed model across validated fallback state', () => {
+    const pending = {
+      fromEntryId: 'anthropic',
+      toEntryId: 'openai',
+      toModelId: 'openai/gpt-6-luna',
+      threadId: 'native-thread',
+      reason: 'pool-exhausted',
+      at: '2026-10-06T00:00:00Z',
+    };
+    expect(stateSchema.parse({ mastracodePendingModelFallback: pending }).mastracodePendingModelFallback).toEqual(
+      pending,
+    );
+    expect(
+      stateSchema.safeParse({
+        mastracodePendingModelFallback: { ...pending, toModelId: 42 },
+      }).success,
+    ).toBe(false);
+  });
+
   it('preserves task ids in controller state', () => {
     const parsed = stateSchema.parse({
       tasks: [
@@ -41,6 +103,34 @@ describe('stateSchema', () => {
     const parsed = stateSchema.parse({ modeId: 'build' });
 
     expect(parsed.modeId).toBe('build');
+  });
+
+  it('rejects model routes beyond the execution cap', () => {
+    const entry = { id: 'route', label: 'Route', modelId: 'openai/gpt-5.6-sol' };
+
+    expect(
+      stateSchema.safeParse({ modelRoute: { entries: Array.from({ length: MODEL_ROUTE_MAX_ENTRIES }, () => entry) } })
+        .success,
+    ).toBe(true);
+    expect(
+      stateSchema.safeParse({
+        modelRoute: { entries: Array.from({ length: MODEL_ROUTE_MAX_ENTRIES + 1 }, () => entry) },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects oversized model route fields', () => {
+    const oversized = 'x'.repeat(MODEL_ROUTE_MAX_FIELD_LENGTH + 1);
+
+    for (const field of ['id', 'label', 'modelId', 'accountId', 'memoryModelId'] as const) {
+      expect(
+        stateSchema.safeParse({
+          modelRoute: {
+            entries: [{ id: 'route', label: 'Route', modelId: 'openai/gpt-5.6-sol', [field]: oversized }],
+          },
+        }).success,
+      ).toBe(false);
+    }
   });
 
   it('normalizes the HTTP null sentinel to an absent thinking override', () => {

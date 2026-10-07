@@ -10,6 +10,7 @@ import type { AgentController, AgentControllerEvent, Session } from '@mastra/cor
 import { describe, it, expect, vi } from 'vitest';
 
 import { MastraCodeAcpAgent, extractTextFromContentBlocks, mapPromptContent, mapStopReason } from './agent.js';
+import type { AcpSessionRuntime } from './agent.js';
 import type { AcpSkills } from './skills.js';
 
 it('reports the CLI release version rather than the SDK package version', async () => {
@@ -137,6 +138,8 @@ describe('ACP Agent - Sessions and turns', () => {
       runtimeThreadId?: string;
       unsubscribe?: () => void;
       cleanup?: () => Promise<void>;
+      modelCatalog?: AcpSessionRuntime['modelCatalog'];
+      resolveForMode?: () => Promise<string | null>;
       currentMessage?: unknown;
       requestPermission?: AgentSideConnection['requestPermission'];
       pendingApprovals?: Map<string, { toolCallId: string; toolName: string; args: unknown }>;
@@ -167,6 +170,7 @@ describe('ACP Agent - Sessions and turns', () => {
       options.listAvailableModels ?? (async () => [{ id: 'test-model', name: 'Test model', hasApiKey: true }]),
     );
     const switchModel = vi.fn(async () => {});
+    const switchMode = vi.fn(async () => {});
     const session = {
       displayState: {
         get: () => ({
@@ -185,8 +189,12 @@ describe('ACP Agent - Sessions and turns', () => {
         switch: switchThread,
         listMessages,
       },
-      mode: { get: options.getMode ?? (() => 'default') },
-      model: { get: options.getModel ?? (() => 'test-model'), switch: switchModel },
+      mode: { get: options.getMode ?? (() => 'default'), switch: switchMode },
+      model: {
+        get: options.getModel ?? (() => 'test-model'),
+        switch: switchModel,
+        resolveForMode: options.resolveForMode ?? (async () => options.getModel?.() ?? 'test-model'),
+      },
       sendMessage,
       abort,
       resumeToolCall,
@@ -207,7 +215,8 @@ describe('ACP Agent - Sessions and turns', () => {
           listAvailableModels,
         } as unknown as AgentController,
         session,
-        modes: [],
+        modes: options.modelCatalog ? [{ id: 'default', defaultModelId: 'openai/gpt-6-luna' }] : [],
+        ...(options.modelCatalog ? { modelCatalog: options.modelCatalog } : {}),
         ...(options.getSkills ? { getSkills: options.getSkills } : {}),
         ...(options.cleanup ? { cleanup: options.cleanup } : {}),
       };
@@ -228,10 +237,81 @@ describe('ACP Agent - Sessions and turns', () => {
       listMessages,
       listAvailableModels,
       switchModel,
+      switchMode,
       getThreadId: () => currentThreadId,
       emit: (event: AgentControllerEvent) => listener(event),
     };
   }
+
+  it('rejects an unavailable saved OAuth model before history replay and cleans the runtime', async () => {
+    const cleanup = vi.fn(async () => {});
+    const catalog = {
+      filterModels: () => [{ id: 'openai/gpt-6-luna', hasApiKey: true }],
+      isOAuthModel: () => true,
+      assertModel: () => {
+        throw RequestError.invalidParams(undefined, 'Refresh catalog');
+      },
+    };
+    const harness = setup([], { getModel: () => 'openai/gpt-5.4-mini', modelCatalog: catalog, cleanup });
+    await expect(harness.agent.loadSession({ cwd: '/tmp', mcpServers: [], sessionId: 'saved' })).rejects.toThrow(
+      'Refresh catalog',
+    );
+    expect(harness.listMessages).not.toHaveBeenCalled();
+    expect(harness.connection.sessionUpdate).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(harness.switchModel).not.toHaveBeenCalled();
+  });
+
+  it('admits backend members absent from the generic registry without adding saved mini', async () => {
+    const modelId = 'openai/gpt-6-luna';
+    const harness = setup([], {
+      getModel: () => modelId,
+      modelCatalog: {
+        filterModels: () => [{ id: modelId, hasApiKey: true }],
+        isOAuthModel: () => true,
+        assertModel: id => {
+          if (id !== modelId) throw RequestError.invalidParams(undefined, 'Refresh catalog');
+        },
+      },
+    });
+    const response = await harness.agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    expect(response.models?.availableModels).toEqual([{ modelId, name: modelId }]);
+    await expect(
+      harness.agent.unstable_setSessionModel({ sessionId: response.sessionId, modelId: 'openai/gpt-5.4-mini' }),
+    ).rejects.toThrow();
+    expect(harness.switchModel).not.toHaveBeenCalled();
+  });
+
+  it('rechecks live catalog admission for both model and mode setters and prompt', async () => {
+    let fresh = true;
+    const modelId = 'openai/gpt-6-luna';
+    const harness = setup([], {
+      getModel: () => modelId,
+      modelCatalog: {
+        filterModels: () => (fresh ? [{ id: modelId, hasApiKey: true }] : []),
+        isOAuthModel: () => true,
+        assertModel: () => {
+          if (!fresh) throw RequestError.invalidParams(undefined, 'Refresh catalog');
+        },
+      },
+    });
+    const { sessionId } = await harness.agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    fresh = false;
+    await expect(harness.agent.unstable_setSessionModel({ sessionId, modelId })).rejects.toThrow();
+    await expect(
+      harness.agent.setSessionConfigOption({ sessionId, configId: 'model', value: modelId }),
+    ).rejects.toThrow();
+    await expect(harness.agent.setSessionMode({ sessionId, modeId: 'default' })).rejects.toThrow('Refresh catalog');
+    await expect(
+      harness.agent.setSessionConfigOption({ sessionId, configId: 'mode', value: 'default' }),
+    ).rejects.toThrow('Refresh catalog');
+    await expect(harness.agent.prompt({ sessionId, prompt: [{ type: 'text', text: 'No inference' }] })).rejects.toThrow(
+      'Refresh catalog',
+    );
+    expect(harness.switchModel).not.toHaveBeenCalled();
+    expect(harness.switchMode).not.toHaveBeenCalled();
+    expect(harness.sendMessage).not.toHaveBeenCalled();
+  });
 
   it('rejects a failed turn without returning provider details, then allows the next prompt', async () => {
     const { agent, emit, sendMessage } = setup();
@@ -1297,7 +1377,7 @@ describe('ACP Agent - Provider authentication', () => {
     const createThread = vi.fn(async () => ({ id: 'thread-1' }));
     const cleanup = vi.fn().mockResolvedValue(undefined);
     let modelId = currentModelId;
-    const switchModel = vi.fn(async ({ modelId: next }: { modelId: string }) => {
+    const switchModel = vi.fn(async (next: string) => {
       modelId = next;
     });
     const subscribe = vi.fn(() => () => {});
@@ -1376,7 +1456,7 @@ describe('ACP Agent - Provider authentication', () => {
       'openai/gpt-5.5',
     );
     await expect(created).resolves.toMatchObject({ models: { currentModelId: 'xai/grok-4.5' } });
-    expect(switchModel).toHaveBeenCalledWith({ modelId: 'xai/grok-4.5' });
+    expect(switchModel).toHaveBeenCalledWith('xai/grok-4.5');
   });
 
   it.each([
@@ -1385,7 +1465,7 @@ describe('ACP Agent - Provider authentication', () => {
   ])('selects a credentialed %s when the new session has no model', async (_case, models, expected) => {
     const { created, switchModel } = newSession(models, '');
     await expect(created).resolves.toMatchObject({ models: { currentModelId: expected } });
-    expect(switchModel).toHaveBeenCalledExactlyOnceWith({ modelId: expected });
+    expect(switchModel).toHaveBeenCalledExactlyOnceWith(expected);
   });
 
   it.each([
@@ -1418,7 +1498,7 @@ describe('ACP Agent - Provider authentication', () => {
       'openai/gpt-5.5',
     );
     await expect(created).resolves.toMatchObject({ models: { currentModelId: 'groq/llama' } });
-    expect(switchModel).toHaveBeenCalledExactlyOnceWith({ modelId: 'groq/llama' });
+    expect(switchModel).toHaveBeenCalledExactlyOnceWith('groq/llama');
   });
 
   it.each([false, true])('keeps a fallback switch private until it settles (reject: %s)', async reject => {

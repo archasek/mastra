@@ -1,10 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 
 import { ACP_PROTOCOL_VERSION } from '@mastra/code-sdk/acp/protocol';
-import { readOAuthStatusFile } from '@mastra/code-sdk/auth/storage';
+import { readOAuthStatusFile } from '@mastra/code-sdk/auth/read-only';
 import { getAvailableModePacks } from '@mastra/code-sdk/onboarding/packs';
+import { CODEX_CATALOG_CLIENT_VERSION, readCodexCatalog } from '@mastra/code-sdk/providers/openai-codex-catalog';
 import {
   getAvailableThinkingLevelsForModel,
   normalizeThinkingLevelForModel,
@@ -46,6 +46,7 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
     modeDefaults: parseModeThinkingDefaults(settings.models?.modeThinkingDefaults),
   };
   const auth = readOAuthStatusFile(join(appDataDir, 'auth.json'), 'openai-codex');
+  const catalog = readCodexCatalog(appDataDir);
   const openaiAccess = auth.status === 'authenticated' ? 'oauth' : false;
   const openaiPack = getAvailableModePacks({
     anthropic: false,
@@ -56,23 +57,14 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
     'github-copilot': false,
   }).find(pack => pack.id === 'openai');
   const modelModes = new Map<string, string[]>();
+  const catalogMembers = new Set<string>(catalog.models);
   for (const [mode, modelId] of Object.entries(openaiPack?.models ?? {})) {
-    if (!modelId) continue;
+    if (!modelId || !catalogMembers.has(modelId)) continue;
     modelModes.set(modelId, [...(modelModes.get(modelId) ?? []), mode]);
   }
-  // Mode packs choose defaults; they are not the native model inventory.
-  // Use the bundled registry without fetching, booting a harness or reading keys.
-  if (openaiAccess === 'oauth') {
-    // Do not import the runtime registry: its module can auto-start refresh.
-    const coreRoot = dirname(createRequire(import.meta.url).resolve('@mastra/core/package.json'));
-    const registry = JSON.parse(readFileSync(join(coreRoot, 'dist/provider-registry.json'), 'utf8')) as {
-      providers: { openai?: { models?: string[] } };
-    };
-    for (const name of registry.providers.openai?.models ?? []) {
-      if (!/^gpt-\d/.test(name) || /(?:image|audio|realtime)/i.test(name)) continue;
-      const id = `openai/${name}`;
-      if (!modelModes.has(id)) modelModes.set(id, ['build', 'plan', 'fast']);
-    }
+  // Defaults annotate members only. Backend membership and order remain authoritative.
+  for (const id of catalog.models) {
+    if (!modelModes.has(id)) modelModes.set(id, ['build', 'plan', 'fast']);
   }
 
   emit(options, {
@@ -86,7 +78,14 @@ export function runInfoCli(args: string[], options: InfoCliOptions = {}): number
       elicitation: true,
       images: true,
     },
-    models: [...modelModes].map(([id, modes]) => {
+    catalog: {
+      source: 'account-cache',
+      status: catalog.status,
+      clientVersion: CODEX_CATALOG_CLIENT_VERSION,
+      ...(catalog.status === 'ready' ? { fetchedAt: catalog.fetchedAt, expiresAt: catalog.expiresAt } : {}),
+    },
+    models: catalog.models.map(id => {
+      const modes = modelModes.get(id) ?? ['build', 'plan', 'fast'];
       const defaults = new Set(
         ['build', 'plan', 'fast'].map(mode =>
           normalizeThinkingLevelForModel(resolveDefaultThinkingLevel(thinkingDefaults, mode).level, id),

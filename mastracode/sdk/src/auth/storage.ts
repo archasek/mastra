@@ -7,18 +7,23 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { getAppDataDir } from '../utils/project.js';
 import { anthropicOAuthProvider } from './providers/anthropic.js';
 import { githubCopilotOAuthProvider } from './providers/github-copilot.js';
 import { kimiCodingOAuthProvider } from './providers/kimi-coding.js';
 import { openaiCodexOAuthProvider } from './providers/openai-codex.js';
 import { xaiOAuthProvider } from './providers/xai.js';
+import { hasOAuthCredentialFields, isOAuthAccountRecord } from './read-only.js';
+export { readOAuthStatusFile } from './read-only.js';
+export type { ReadonlyOAuthStatus } from './read-only.js';
 import type {
   AuthCredential,
   AuthStorageData,
   OAuthAccountRecord,
   OAuthCredential,
   OAuthCredentialSnapshot,
+  OAuthCredentialAcquisitionOptions,
   OAuthCredentials,
   OAuthLoginCallbacks,
   OAuthProviderId,
@@ -38,8 +43,19 @@ const require = createRequire(import.meta.url);
 const properLockfile = require('proper-lockfile') as ProperLockfile;
 const authFileQueues = new Map<string, Promise<void>>();
 
+/** Cancels this waiter, never the producer it may have joined. */
+function waitForAcquisition<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  signal.throwIfAborted();
+  return new Promise<T>((resolveWait, rejectWait) => {
+    const abort = () => rejectWait(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    pending.then(resolveWait, rejectWait).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
 /** Serialize same-process callers, then hold an OS-visible lock across refresh and save. */
-async function withAuthFileLock<T>(authPath: string, action: () => T | Promise<T>): Promise<T> {
+async function withAuthFileLock<T>(authPath: string, action: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
   const lockKey = resolve(authPath);
   const previous = authFileQueues.get(lockKey) ?? Promise.resolve();
   let releaseQueue!: () => void;
@@ -47,23 +63,43 @@ async function withAuthFileLock<T>(authPath: string, action: () => T | Promise<T
     releaseQueue = resolveQueue;
   });
   authFileQueues.set(lockKey, queued);
-  await previous;
+  let precedingFinished = false;
   try {
+    await waitForAcquisition(previous, signal);
+    precedingFinished = true;
+    signal?.throwIfAborted();
     mkdirSync(dirname(lockKey), { recursive: true, mode: 0o700 });
-    const releaseFileLock = await properLockfile.lock(lockKey, {
+    const lockOptions = {
       realpath: false,
       stale: 120_000,
       update: 30_000,
-      retries: { retries: 200, factor: 1, minTimeout: 50, maxTimeout: 250, randomize: true },
-    });
+      retries: signal ? 0 : { retries: 200, factor: 1, minTimeout: 50, maxTimeout: 250, randomize: true },
+    };
+    let releaseFileLock: () => Promise<void>;
+    for (;;) {
+      signal?.throwIfAborted();
+      try {
+        releaseFileLock = await properLockfile.lock(lockKey, lockOptions);
+        break;
+      } catch (error) {
+        if (!signal || (error as NodeJS.ErrnoException).code !== 'ELOCKED') throw error;
+        await delay(50, undefined, { signal });
+      }
+    }
     try {
+      signal?.throwIfAborted();
       return await action();
     } finally {
       await releaseFileLock();
     }
   } finally {
-    releaseQueue();
-    if (authFileQueues.get(lockKey) === queued) authFileQueues.delete(lockKey);
+    const finishQueue = () => {
+      releaseQueue();
+      if (authFileQueues.get(lockKey) === queued) authFileQueues.delete(lockKey);
+    };
+    // An abandoned waiter must not let a later writer bypass its predecessor.
+    if (precedingFinished) finishQueue();
+    else void previous.then(finishQueue);
   }
 }
 
@@ -150,32 +186,6 @@ function providerIdentity(provider: OAuthProviderInterface | undefined, creds: O
   }
 }
 
-function isOAuthAccountRecord(value: unknown): value is OAuthAccountRecord {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Partial<OAuthAccountRecord>;
-  return (
-    v.type === 'oauth-account' &&
-    typeof v.id === 'string' &&
-    typeof v.label === 'string' &&
-    typeof v.addedAt === 'string' &&
-    typeof v.active === 'boolean' &&
-    hasOAuthCredentialFields(value)
-  );
-}
-
-function hasOAuthCredentialFields(value: unknown): value is OAuthCredentials {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const credentials = value as Partial<OAuthCredentials>;
-  return (
-    typeof credentials.refresh === 'string' &&
-    credentials.refresh.trim().length > 0 &&
-    typeof credentials.access === 'string' &&
-    credentials.access.trim().length > 0 &&
-    typeof credentials.expires === 'number' &&
-    Number.isFinite(credentials.expires)
-  );
-}
-
 /** The credential fields of an account record — everything but registry identity. */
 function credentialFieldsOf(record: OAuthAccountRecord): OAuthCredentials {
   const {
@@ -190,63 +200,13 @@ function credentialFieldsOf(record: OAuthAccountRecord): OAuthCredentials {
   return creds;
 }
 
-export interface ReadonlyOAuthStatus {
-  provider: string;
-  status: 'authenticated' | 'unauthenticated' | 'unknown';
-  account?: { id: string; label: string };
-}
-
-/**
- * Read only the safe status fields for one OAuth provider without migrating,
- * refreshing, or rewriting auth.json. Used by machine-readable info/status
- * commands that must not mutate app data.
- */
-export function readOAuthStatusFile(authPath: string, providerId: string): ReadonlyOAuthStatus {
-  if (!existsSync(authPath)) return { provider: providerId, status: 'unauthenticated' };
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(authPath, 'utf-8'));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { provider: providerId, status: 'unauthenticated' };
-    }
-    return { provider: providerId, status: 'unknown' };
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { provider: providerId, status: 'unknown' };
-  }
-
-  const data = parsed as Record<string, unknown>;
-  const providerAccountEntries = Object.entries(data).filter(([key]) => key.startsWith(`accounts:${providerId}:`));
-  const activeAccount = providerAccountEntries
-    .map(([, value]) => value)
-    .find((value): value is OAuthAccountRecord => isOAuthAccountRecord(value) && value.active);
-  const hasMalformedAccountRecord = providerAccountEntries.some(([, value]) => !isOAuthAccountRecord(value));
-  const legacySlot = data[providerId];
-  const hasLegacyOAuthRecord =
-    !!legacySlot && typeof legacySlot === 'object' && (legacySlot as { type?: unknown }).type === 'oauth';
-  const hasOAuthSlot = hasLegacyOAuthRecord && hasOAuthCredentialFields(legacySlot);
-
-  if (!hasOAuthSlot && !activeAccount) {
-    return {
-      provider: providerId,
-      status: hasMalformedAccountRecord || hasLegacyOAuthRecord ? 'unknown' : 'unauthenticated',
-    };
-  }
-  return {
-    provider: providerId,
-    status: 'authenticated',
-    ...(activeAccount ? { account: { id: activeAccount.id, label: activeAccount.label } } : {}),
-  };
-}
-
 /**
  * Credential storage backed by a JSON file.
  */
 export class AuthStorage {
   private data: AuthStorageData = {};
   private refreshPromises = new Map<string, Promise<OAuthRefreshResult | undefined>>();
+  private refreshOwnerSignals = new WeakMap<Promise<OAuthRefreshResult | undefined>, AbortSignal>();
 
   constructor(private authPath: string = join(getAppDataDir(), 'auth.json')) {
     this.reload();
@@ -972,41 +932,74 @@ export class AuthStorage {
     return { credentials, accountInstanceId: entry.id };
   }
 
-  /** Hold per-account refresh exclusion across network I/O, not the auth-file write lock. */
+  /** Bounded owners reserve commit exclusion before spending a refresh token. */
   private async refreshCredential(
     providerId: string,
     instanceId?: string,
     forceBaseline?: OAuthCredentials,
+    signal?: AbortSignal,
   ): Promise<OAuthRefreshResult | undefined> {
     const provider = getOAuthProvider(providerId);
     if (!provider) return undefined;
     const lockId = createHash('sha256')
       .update(JSON.stringify([providerId, instanceId ?? null]))
       .digest('hex');
-    return withAuthFileLock(`${this.authPath}.refresh-${lockId}`, async () => {
-      const selected = await withAuthFileLock(this.authPath, () => {
-        this.reload();
-        return this.selectedCredential(providerId, instanceId);
-      });
-      if (!selected) return undefined;
-      if (
-        forceBaseline
-          ? !sameOAuthCredentials(selected.credentials, forceBaseline)
-          : Date.now() < selected.credentials.expires
-      )
-        return selected;
+    return withAuthFileLock(
+      `${this.authPath}.refresh-${lockId}`,
+      async () => {
+        const commit = (selected: OAuthRefreshResult, fresh: OAuthCredentials) => {
+          this.reload();
+          const current = this.selectedCredential(providerId, selected.accountInstanceId);
+          if (!current) return undefined;
+          if (!sameOAuthCredentials(current.credentials, selected.credentials)) return current;
+          this.persistRefreshedCredential(providerId, selected.accountInstanceId, fresh);
+          return { credentials: fresh, accountInstanceId: selected.accountInstanceId };
+        };
+        if (signal) {
+          return withAuthFileLock(
+            this.authPath,
+            async () => {
+              this.reload();
+              const selected = this.selectedCredential(providerId, instanceId);
+              if (!selected) return undefined;
+              if (
+                forceBaseline
+                  ? !sameOAuthCredentials(selected.credentials, forceBaseline)
+                  : Date.now() < selected.credentials.expires
+              )
+                return selected;
+              signal.throwIfAborted();
+              const fresh = await provider.refreshToken(selected.credentials, { signal });
+              // Once a single-use grant succeeds, commit under the reservation
+              // before observing cancellation or releasing either owned lock.
+              return commit(selected, fresh);
+            },
+            signal,
+          );
+        }
+        const selected = await withAuthFileLock(
+          this.authPath,
+          () => {
+            this.reload();
+            return this.selectedCredential(providerId, instanceId);
+          },
+          signal,
+        );
+        if (!selected) return undefined;
+        if (
+          forceBaseline
+            ? !sameOAuthCredentials(selected.credentials, forceBaseline)
+            : Date.now() < selected.credentials.expires
+        )
+          return selected;
 
-      const fresh = await provider.refreshToken(selected.credentials);
-      return withAuthFileLock(this.authPath, () => {
-        // Activation, removal or reauthorization can complete during network I/O.
-        this.reload();
-        const current = this.selectedCredential(providerId, selected.accountInstanceId);
-        if (!current) return undefined;
-        if (!sameOAuthCredentials(current.credentials, selected.credentials)) return current;
-        this.persistRefreshedCredential(providerId, selected.accountInstanceId, fresh);
-        return { credentials: fresh, accountInstanceId: selected.accountInstanceId };
-      });
-    });
+        const fresh = await provider.refreshToken(selected.credentials);
+        // A successful single-use token rotation must be persisted even if its
+        // requesting command was cancelled immediately after the HTTP response.
+        return withAuthFileLock(this.authPath, () => commit(selected, fresh));
+      },
+      signal,
+    );
   }
 
   /**
@@ -1016,25 +1009,45 @@ export class AuthStorage {
    * activated but before its refresh resolves) joins the same refresh
    * instead of double-spending a single-use refresh token.
    */
-  private async refreshInstance(providerId: string, instanceId: string): Promise<OAuthRefreshResult | undefined> {
+  private async refreshInstance(
+    providerId: string,
+    instanceId?: string,
+    signal?: AbortSignal,
+    retryCancelledOwner = true,
+  ): Promise<OAuthRefreshResult | undefined> {
     const provider = getOAuthProvider(providerId);
     if (!provider) return undefined;
-    const refreshKey = `${providerId}:${instanceId}`;
+    const refreshKey = instanceId ? `${providerId}:${instanceId}` : providerId;
     const pending = this.refreshPromises.get(refreshKey);
-    if (pending) return pending;
+    if (pending) {
+      const ownerSignal = this.refreshOwnerSignals.get(pending);
+      const result = await waitForAcquisition(pending, signal);
+      // A cancelled command is not this caller's failed inference refresh.
+      // After its producer releases both locks, retry once under our ownership.
+      if (!result && ownerSignal?.aborted && retryCancelledOwner) {
+        signal?.throwIfAborted();
+        return this.refreshInstance(providerId, instanceId, signal, false);
+      }
+      return result;
+    }
     const refresh = (async () => {
       try {
-        return await this.refreshCredential(providerId, instanceId);
+        return await this.refreshCredential(providerId, instanceId, undefined, signal);
       } catch {
+        // The shared producer keeps the native undefined-on-failure contract.
+        // Its owner observes cancellation only after settlement and unlock.
         return undefined;
       }
     })();
     this.refreshPromises.set(refreshKey, refresh);
-    try {
-      return await refresh;
-    } finally {
+    if (signal) this.refreshOwnerSignals.set(refresh, signal);
+    const cleanup = () => {
       this.refreshPromises.delete(refreshKey);
-    }
+    };
+    void refresh.then(cleanup, cleanup);
+    const result = await refresh;
+    signal?.throwIfAborted();
+    return result;
   }
 
   /**
@@ -1046,7 +1059,11 @@ export class AuthStorage {
   async getOAuthCredential(
     providerId: string,
     accountInstanceId?: string,
+    options?: OAuthCredentialAcquisitionOptions,
   ): Promise<OAuthCredentialSnapshot | undefined> {
+    // Only OpenAI's native refresh supports command-owned cancellation here.
+    const signal = providerId === 'openai-codex' ? options?.signal : undefined;
+    signal?.throwIfAborted();
     this.reload();
     const activeEntry = this.getActiveAccount(providerId);
     const selectedEntry = accountInstanceId
@@ -1093,30 +1110,8 @@ export class AuthStorage {
 
     if (Date.now() < credential.expires) return toSnapshot(credential);
 
-    if (selectedInstanceId) {
-      const refreshed = await this.refreshInstance(providerId, selectedInstanceId);
-      return refreshed ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId) : undefined;
-    }
-
-    const pendingRefresh = this.refreshPromises.get(providerId);
-    const refresh =
-      pendingRefresh ??
-      (async (): Promise<OAuthRefreshResult | undefined> => {
-        try {
-          return await this.refreshCredential(providerId);
-        } catch {
-          return undefined;
-        }
-      })();
-    if (!pendingRefresh) this.refreshPromises.set(providerId, refresh);
-    try {
-      const refreshed = await refresh;
-      return refreshed
-        ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId ?? selectedInstanceId)
-        : undefined;
-    } finally {
-      if (!pendingRefresh) this.refreshPromises.delete(providerId);
-    }
+    const refreshed = await this.refreshInstance(providerId, selectedInstanceId, signal);
+    return refreshed ? toSnapshot(refreshed.credentials, refreshed.accountInstanceId ?? selectedInstanceId) : undefined;
   }
 
   /** Get API key for a provider, refreshing OAuth tokens if needed. */

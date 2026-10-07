@@ -67,7 +67,7 @@ export interface OAuthProviderInterface {
   login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
 
   /** Refresh expired credentials, return updated credentials to persist */
-  refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+  refreshToken(credentials: OAuthCredentials, options?: { signal?: AbortSignal }): Promise<OAuthCredentials>;
 
   /** Convert credentials to API key string for the provider */
   getApiKey(credentials: OAuthCredentials): string;
@@ -104,6 +104,11 @@ export type OAuthCredentialSnapshot = OAuthCredential & {
   /** Non-secret registry identity for credential-scoped in-process caches. */
   accountInstanceId?: string;
 };
+
+/** Optional bounded acquisition for explicit machine commands; ordinary callers are unchanged. */
+export interface OAuthCredentialAcquisitionOptions {
+  signal?: AbortSignal;
+}
 
 export type AuthCredential = ApiKeyCredential | OAuthCredential;
 
@@ -159,7 +164,11 @@ export interface CredentialStore {
    * have no local account registry. Local wrappers use this to keep the access
    * token and account-specific metadata from the same account.
    */
-  getOAuthCredential?(provider: string, accountInstanceId?: string): Promise<OAuthCredentialSnapshot | undefined>;
+  getOAuthCredential?(
+    provider: string,
+    accountInstanceId?: string,
+    options?: OAuthCredentialAcquisitionOptions,
+  ): Promise<OAuthCredentialSnapshot | undefined>;
 
   /**
    * Registered OAuth accounts for a provider, in insertion order. Optional so

@@ -33,13 +33,27 @@ async function runCli(): Promise<void> {
     return;
   }
 
+  if (command === 'catalog') {
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(signal, cancel);
+    try {
+      const { runCatalogCli } = await import('./catalog-cli.js');
+      const exitCode = await runCatalogCli(args, { signal: controller.signal });
+      if (exitCode !== 0) process.exitCode = exitCode;
+    } finally {
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.removeListener(signal, cancel);
+    }
+    return;
+  }
+
   // Keep the existing TUI and plugin routes in their original entrypoint.
   await import('./main.js');
 }
 
 runCli().catch(() => {
   const command = process.argv[2];
-  if (command === 'auth' || command === 'info') {
+  if (command === 'auth' || command === 'info' || command === 'catalog') {
     process.stdout.write(`${JSON.stringify({ type: 'error', code: 'COMMAND_FAILED' })}\n`);
   } else {
     process.stderr.write('Mastra Code CLI failed to start.\n');

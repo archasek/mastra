@@ -52,6 +52,12 @@ export interface AcpSessionRuntime {
   getThinkingLevel?: () => ThinkingLevelSetting;
   getSkills?: () => Promise<AcpSkills | undefined>;
   cleanup?: () => Promise<void>;
+  modelCatalog?: {
+    filterModels: (models: { id: string; hasApiKey: boolean }[]) => { id: string; hasApiKey: boolean }[];
+    isOAuthModel: (modelId: string) => boolean;
+    assertModel: (modelId: string) => void;
+    admitModel?: (modelId: string) => Promise<void>;
+  };
 }
 
 export type AcpSessionFactory = (request: NewSessionRequest | LoadSessionRequest) => Promise<AcpSessionRuntime>;
@@ -296,12 +302,20 @@ export class MastraCodeAcpAgent implements Agent {
     let entry: SessionEntry | undefined;
     try {
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
-      const available = await runtime.controller.listAvailableModels();
+      const discovered = await runtime.controller.listAvailableModels();
+      const available = runtime.modelCatalog?.filterModels(discovered) ?? discovered;
+      if (runtime.modelCatalog?.isOAuthModel('openai/') && !runtime.session.model.get()) {
+        throw RequestError.invalidParams(
+          undefined,
+          'No configured OpenAI Codex default is available. Refresh the Mastra Code model catalog.',
+        );
+      }
+      runtime.modelCatalog?.assertModel(runtime.session.model.get() ?? '');
       if (!hasUsableModel(available, runtime.session.model.get() ?? '')) {
         throw RequestError.authRequired(undefined, 'Sign in to a model provider or add an API key to use Mastra Code');
       }
       const defaultModelId = credentialedDefaultModel(available, runtime.session.model.get() ?? '');
-      if (defaultModelId) await runtime.session.model.switch({ modelId: defaultModelId });
+      if (defaultModelId) await runtime.session.model.switch(defaultModelId);
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
       sessionId = runtime.session.thread.getId() ?? undefined;
       if (!sessionId) {
@@ -370,14 +384,18 @@ export class MastraCodeAcpAgent implements Agent {
       ];
       // Keep capture and the initial snapshot ahead of asynchronous discovery,
       // but authorize the saved selection before any history or live publication.
-      const available = await runtime.controller.listAvailableModels();
+      const discovered = await runtime.controller.listAvailableModels();
+      const available = runtime.modelCatalog?.filterModels(discovered) ?? discovered;
       if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
       const currentModelId = runtime.session.model.get() ?? '';
+      await runtime.modelCatalog?.admitModel?.(currentModelId);
+      runtime.modelCatalog?.assertModel(currentModelId);
       const currentModel = available.find(model => model.id === currentModelId);
       if (currentModel?.hasApiKey === false || !hasUsableModel(available, currentModelId)) {
         throw RequestError.authRequired(undefined, 'Sign in to a model provider or add an API key to use Mastra Code');
       }
       const messages = await runtime.session.thread.listMessages({ threadId: request.sessionId });
+      runtime.modelCatalog?.assertModel(runtime.session.model.get() ?? '');
       const capturedIds = new Set(
         captured.flatMap(event => (event.type === 'message_start' ? [event.message.id] : [])),
       );
@@ -385,6 +403,7 @@ export class MastraCodeAcpAgent implements Agent {
       const replayedIds = new Set<string>();
       for (const message of messages) {
         if (capturedIds.has(message.id)) continue;
+        runtime.modelCatalog?.assertModel(runtime.session.model.get() ?? '');
         await this.replayHistory(request.sessionId, [message]);
         replayedIds.add(message.id);
       }
@@ -499,10 +518,13 @@ export class MastraCodeAcpAgent implements Agent {
 
   private async registerSession(sessionId: string, runtime: AcpSessionRuntime, publish = true): Promise<SessionEntry> {
     if (this.disposed) throw RequestError.internalError(undefined, 'ACP connection is closed');
+    await runtime.modelCatalog?.admitModel?.(runtime.session.model.get() ?? '');
+    runtime.modelCatalog?.assertModel(runtime.session.model.get() ?? '');
     let models: NewSessionResponse['models'];
     try {
       const currentModelId = runtime.session.model.get() ?? '';
-      const available = await runtime.controller.listAvailableModels();
+      const discovered = await runtime.controller.listAvailableModels();
+      const available = runtime.modelCatalog?.filterModels(discovered) ?? discovered;
       models = {
         currentModelId,
         availableModels: includeCurrentModel(
@@ -519,7 +541,7 @@ export class MastraCodeAcpAgent implements Agent {
                 ),
             ).values(),
           ],
-          currentModelId,
+          runtime.modelCatalog?.isOAuthModel(currentModelId) ? '' : currentModelId,
         ),
       };
     } catch {
@@ -608,14 +630,13 @@ export class MastraCodeAcpAgent implements Agent {
 
   private sessionInfo(entry: SessionEntry): Omit<NewSessionResponse, 'sessionId'> {
     const modelId = entry.session.model.get() ?? '';
+    const availableModels = this.catalogModels(entry);
     return {
       modes: {
         currentModeId: entry.session.mode.get(),
         availableModes: entry.modes.map(mode => ({ id: mode.id, name: mode.name ?? mode.id })),
       },
-      models: entry.models.length
-        ? { currentModelId: modelId, availableModels: includeCurrentModel(entry.models, modelId) }
-        : undefined,
+      models: availableModels.length ? { currentModelId: modelId, availableModels } : undefined,
       configOptions: this.configOptions(entry),
     };
   }
@@ -653,7 +674,7 @@ export class MastraCodeAcpAgent implements Agent {
   private configOptions(entry: SessionEntry): SessionConfigOption[] {
     const modelId = entry.session.model.get() ?? '';
     const options: SessionConfigOption[] = [];
-    const models = includeCurrentModel(entry.models, modelId);
+    const models = this.catalogModels(entry);
     if (models.length)
       options.push({
         id: 'model',
@@ -687,9 +708,27 @@ export class MastraCodeAcpAgent implements Agent {
     return options;
   }
 
-  private thinkingLevel(entry: SessionEntry): ThinkingLevelSetting {
+  private thinkingLevel(entry: SessionEntry, modelId = entry.session.model.get() ?? ''): ThinkingLevelSetting {
     const level = entry.getThinkingLevel?.() ?? 'off';
-    return normalizeThinkingLevelForModel(level, entry.session.model.get() ?? '');
+    return normalizeThinkingLevelForModel(level, modelId);
+  }
+
+  private catalogModels(entry: SessionEntry): SessionEntry['models'] {
+    const modelId = entry.session.model.get() ?? '';
+    const models = entry.modelCatalog
+      ? entry.modelCatalog
+          .filterModels(entry.models.map(model => ({ id: model.modelId, hasApiKey: true })))
+          .map(model => ({ modelId: model.id, name: model.id }))
+      : entry.models;
+    return includeCurrentModel(models, entry.modelCatalog?.isOAuthModel(modelId) ? '' : modelId);
+  }
+
+  private async authorizeMode(entry: SessionEntry, _modeId: string): Promise<void> {
+    if (!entry.modelCatalog) return;
+    // Native controller modes now retain one session-wide selected model.
+    const modelId = entry.session.model.get();
+    await entry.modelCatalog.admitModel?.(modelId ?? '');
+    entry.modelCatalog.assertModel(modelId ?? '');
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
@@ -705,8 +744,14 @@ export class MastraCodeAcpAgent implements Agent {
         throw RequestError.invalidParams(undefined, 'Unknown session configuration selection');
       }
       if (params.configId === 'model') {
-        await entry.session.model.switch({ modelId: String(params.value) });
+        const modelId = String(params.value);
+        await entry.modelCatalog?.admitModel?.(modelId);
+        entry.modelCatalog?.assertModel(modelId);
+        await entry.session.model.switch(modelId, {
+          ...(entry.getThinkingLevel ? { thinkingLevel: this.thinkingLevel(entry, modelId) } : {}),
+        });
       } else if (params.configId === 'mode') {
+        await this.authorizeMode(entry, String(params.value));
         await entry.session.mode.switch({ modeId: String(params.value) });
       } else if (isThinkingLevelSetting(params.value)) {
         await entry.session.state.set({ thinkingLevel: params.value });
@@ -727,6 +772,8 @@ export class MastraCodeAcpAgent implements Agent {
     try {
       return await this.enqueue(entry, async () => {
         if (turn.cancelled || this.disposed) return { stopReason: 'cancelled' };
+        await this.authorizeMode(entry, entry.session.mode.get());
+        entry.modelCatalog?.assertModel(entry.session.model.get() ?? '');
         const usage: PromptState['usage'] = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
         let complete!: PromptState['resolve'];
         const completion = new Promise<Parameters<PromptState['resolve']>[0]>(resolve => {
@@ -747,6 +794,8 @@ export class MastraCodeAcpAgent implements Agent {
           const skills = await this.refreshCommands(request.sessionId, entry);
           const expanded = await expandSkillCommand(content, skills, entry.commands ?? []);
           if (turn.cancelled || this.disposed) return { stopReason: 'cancelled' };
+          await this.authorizeMode(entry, entry.session.mode.get());
+          entry.modelCatalog?.assertModel(entry.session.model.get() ?? '');
           await entry.session.sendMessage({
             content: expanded,
             ...(message.files.length ? { files: message.files } : {}),
@@ -817,6 +866,7 @@ export class MastraCodeAcpAgent implements Agent {
       throw RequestError.invalidParams(undefined, 'Unknown mode');
     await this.enqueue(entry, async () => {
       if (this.disposed) return;
+      await this.authorizeMode(entry, params.modeId);
       await entry.session.mode.switch({ modeId: params.modeId });
     });
   }
@@ -825,17 +875,15 @@ export class MastraCodeAcpAgent implements Agent {
     const entry = this.getSession(params.sessionId);
     await this.enqueue(entry, async () => {
       if (this.disposed) return;
-      if (
-        !includeCurrentModel(entry.models, entry.session.model.get() ?? '').some(
-          model => model.modelId === params.modelId,
-        )
-      ) {
+      if (!this.catalogModels(entry).some(model => model.modelId === params.modelId)) {
         throw RequestError.invalidParams(
           undefined,
           'Model is unavailable or its provider is not configured. Refresh the model list.',
         );
       }
-      await entry.session.model.switch({ modelId: params.modelId });
+      await entry.modelCatalog?.admitModel?.(params.modelId);
+      entry.modelCatalog?.assertModel(params.modelId);
+      await entry.session.model.switch(params.modelId);
     });
   }
 }

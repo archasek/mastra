@@ -82,11 +82,13 @@ function resolveOutputProcessors(): Array<{ id?: string }> {
 }
 
 const controllerConstructorMock = vi.fn();
+const controllerListAvailableModelsMock = vi.fn(async () => []);
 const controllerOnSessionCreatedMock = vi.fn();
 const controllerOnSessionDeletedMock = vi.fn();
 const claimThreadOwnershipMock = vi.fn();
 const updateThreadPeerAdvertisementMock = vi.fn();
 const loadSettingsMock = vi.fn();
+const authGetMock = vi.fn((_provider: string): unknown => undefined);
 const getAvailableModePacksMock = vi.fn(() => []);
 const getAvailableOmPacksMock = vi.fn(() => []);
 const controllerSubscribeMock = vi.fn();
@@ -126,7 +128,6 @@ function createMockSettings() {
       omPackId: null,
     },
     models: {
-      activeModelPackId: null,
       modeDefaults: {},
       activeOmPackId: null,
       omModelOverride: null,
@@ -188,12 +189,16 @@ const mastraStub = {
   addProcessorConfiguration: vi.fn(),
 };
 
-vi.mock('@mastra/core/agent-controller', () => ({
+vi.mock('@mastra/core/agent-controller', async importOriginal => ({
+  ...(await importOriginal<typeof import('@mastra/core/agent-controller')>()),
   AgentController: class {
     constructor(config: unknown) {
       controllerConstructorMock(config);
     }
     async init() {}
+    async listAvailableModels() {
+      return controllerListAvailableModelsMock();
+    }
     getMastra() {
       return mastraStub;
     }
@@ -315,6 +320,7 @@ vi.mock('../agents/memory.js', () => ({
 }));
 
 vi.mock('../agents/model.js', () => ({
+  withNativeOAuthRoute: (_context: unknown, resolve: () => unknown) => resolve(),
   createMastraCodeGateway: createMastraCodeGatewayMock,
   createMastraCodeModelCatalogProvider: createMastraCodeModelCatalogProviderMock,
   getDynamicModel: vi.fn(),
@@ -338,8 +344,9 @@ vi.mock('../workflows/register-primitives.js', () => ({
 
 vi.mock('../auth/storage.js', () => ({
   AuthStorage: class {
-    get() {
-      return undefined;
+    reload() {}
+    get(provider: string) {
+      return authGetMock(provider);
     }
     getStoredApiKey() {
       return undefined;
@@ -387,7 +394,6 @@ vi.mock('../onboarding/settings.js', async importOriginal => ({
   resolveOmModel: vi.fn(() => ''),
   resolveOmRoleModel: vi.fn(() => ''),
   saveSettings: vi.fn(),
-  THREAD_ACTIVE_MODEL_PACK_ID_KEY: 'activeModelPackId',
   toCustomProviderModelId: vi.fn(),
 }));
 
@@ -555,11 +561,14 @@ describe('createMastraCode', () => {
     controllerModeMock = 'build';
     controllerModelMock = 'anthropic/claude-opus-4-6';
     loadSettingsMock.mockReset();
+    authGetMock.mockReset();
     loadSettingsMock.mockReturnValue(createMockSettings());
     agentConstructorMock.mockReset();
     createDurableAgentMock.mockClear();
     createEventedAgentMock.mockClear();
     controllerConstructorMock.mockReset();
+    controllerListAvailableModelsMock.mockReset();
+    controllerListAvailableModelsMock.mockResolvedValue([]);
     controllerOnSessionCreatedMock.mockReset();
     controllerOnSessionDeletedMock.mockReset();
     claimThreadOwnershipMock.mockReset();
@@ -954,6 +963,76 @@ describe('createMastraCode', () => {
     expect(executeSubagent.allowedWorkspaceTools).toContain('execute_command');
   });
 
+  it.each(['blank', 'saved', 'caller', 'api-key'])(
+    'applies native OAuth pack defaults below explicit choices: %s',
+    async variant => {
+      authGetMock.mockImplementation(provider =>
+        provider === 'openai-codex'
+          ? variant === 'api-key'
+            ? { type: 'api_key', key: 'synthetic' }
+            : {
+                type: 'oauth',
+                access: 'synthetic',
+                refresh: 'synthetic',
+                expires: Date.now() + 60_000,
+              }
+          : undefined,
+      );
+      const packs = await vi.importActual<typeof import('../onboarding/packs.js')>('../onboarding/packs.js');
+      const settingsSource =
+        await vi.importActual<typeof import('../onboarding/settings.js')>('../onboarding/settings.js');
+      getAvailableModePacksMock.mockReturnValueOnce(packs.getAvailableModePacks({ openai: 'oauth' } as never) as never);
+      const settings = createMockSettings();
+      if (variant === 'saved') settings.models.modeDefaults = { build: 'openai/gpt-5.5' } as never;
+      if (variant === 'caller') settings.models.modeDefaults = { build: 'openai/gpt-6-luna' } as never;
+      loadSettingsMock.mockReturnValue(settings);
+      const settingsModule = await import('../onboarding/settings.js');
+      vi.mocked(settingsModule.resolveModelDefaults).mockImplementation(settingsSource.resolveModelDefaults);
+      const { createMastraCode } = await import('../index.js');
+      const { buildMode } = await import('../agents/modes/build.js');
+      await createMastraCode(
+        variant === 'caller' ? { modes: [{ ...buildMode, defaultModelId: 'openai/gpt-5.5' }] } : {},
+      );
+      const modes = controllerConstructorMock.mock.calls[0]![0].modes;
+      expect(modes.find((mode: { id: string }) => mode.id === 'build').defaultModelId).toBe(
+        variant === 'blank' ? 'openai/gpt-5.6-sol' : 'openai/gpt-5.5',
+      );
+      if (variant !== 'caller') {
+        expect(modes.find((mode: { id: string }) => mode.id === 'fast').defaultModelId).toBe(
+          variant === 'api-key' ? 'openai/gpt-5.4-mini' : 'openai/gpt-6-luna',
+        );
+      }
+    },
+  );
+
+  it('replaces local OAuth inventory without requiring account slugs in the generic registry', async () => {
+    authGetMock.mockImplementation(provider => (provider === 'openai-codex' ? { type: 'oauth' } : undefined));
+    controllerListAvailableModelsMock.mockResolvedValue([
+      { id: 'openai/gpt-5.4-mini', provider: 'openai', modelName: 'gpt-5.4-mini', hasApiKey: true, useCount: 1 },
+      { id: 'anthropic/control', provider: 'anthropic', modelName: 'control', hasApiKey: true, useCount: 0 },
+    ] as never);
+    const catalog = await import('../providers/openai-codex-catalog.js');
+    const read = vi.spyOn(catalog, 'readCodexCatalog').mockReturnValue({
+      status: 'ready',
+      models: ['openai/account-only-slug'],
+      scope: { kind: 'legacy', accountId: 'fixture' },
+      fetchedAt: 1,
+      expiresAt: 3_600_001,
+    });
+    try {
+      const { createMastraCode } = await import('../index.js');
+      const runtime = await createMastraCode();
+      expect((await runtime.controller.listAvailableModels()).map(model => model.id)).toEqual([
+        'anthropic/control',
+        'openai/account-only-slug',
+      ]);
+      read.mockReturnValue({ status: 'expired', models: [] });
+      expect((await runtime.controller.listAvailableModels()).map(model => model.id)).toEqual(['anthropic/control']);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it('uses configured mastra gateway settings when creating the MastraCode gateway', async () => {
     const settings = createMockSettings();
     settings.memoryGateway = { baseUrl: 'https://gateway.example.com/v1' };
@@ -979,7 +1058,7 @@ describe('createMastraCode', () => {
 
     await createMastraCode();
 
-    expect(getAvailableModePacksMock).toHaveBeenCalledWith(expect.objectContaining({ 'multi-env-provider': 'apikey' }));
+    expect(getAvailableModePacksMock).not.toHaveBeenCalled();
     expect(getAvailableOmPacksMock).toHaveBeenCalledWith(expect.objectContaining({ 'multi-env-provider': 'apikey' }));
   });
 
@@ -999,9 +1078,11 @@ describe('createMastraCode', () => {
 
     await createMastraCode({ vector: vector as any });
 
-    // Third argument is the settings path threaded through for pack-driven
-    // observational-memory resolution; no `settingsPath` was configured here.
-    expect(getDynamicMemoryMock).toHaveBeenCalledWith(expect.anything(), vector, undefined);
+    // The settings path and model-pack option are threaded through for
+    // observational-memory resolution; neither was configured here.
+    expect(getDynamicMemoryMock).toHaveBeenCalledWith(expect.anything(), vector, undefined, {
+      disableSettingsOmSeed: undefined,
+    });
     expect(createVectorStoreMock).not.toHaveBeenCalled();
   });
 
@@ -2018,10 +2099,20 @@ describe('createMastraCode', () => {
     controllerGetCurrentThreadIdMock.mockReturnValue('active-thread');
     controllerModeMock = 'plan';
     controllerModelMock = 'openai/gpt-5.6-sol';
-    controllerStateMock = { activeModelPackId: 'openai', yolo: false, sandboxAllowedPaths: ['/active-only'] };
+    controllerStateMock = {
+      modelRoute: { entries: [{ id: 'openai', label: 'OpenAI', modelId: 'openai/gpt-5.6-sol' }] },
+      yolo: false,
+      sandboxAllowedPaths: ['/active-only'],
+    };
     controllerThreadMetadataMock = {
+      currentModelId: 'openai/gpt-5.6-sol',
       modeModelId_build: 'anthropic/claude-fable-5-1',
-      activeModelPackId: 'anthropic',
+      modelRoute: {
+        entries: [
+          { id: 'anthropic', label: 'Anthropic', modelId: 'anthropic/claude-fable-5-1' },
+          { id: 'openai', label: 'OpenAI', modelId: 'openai/gpt-5.6-sol' },
+        ],
+      },
       subagentModelId_explore: 'openai/gpt-5.6-mini',
       yolo: true,
     };
@@ -2047,8 +2138,28 @@ describe('createMastraCode', () => {
 
     expect(controllerContext.session.modeId).toBe('build');
     expect(controllerContext.session.modelId).toBe('anthropic/claude-fable-5-1');
+    expect(controllerSetThreadSettingOnMock).toHaveBeenCalledWith({
+      threadId: 'notification-thread',
+      key: 'currentModelId',
+      value: 'anthropic/claude-fable-5-1',
+    });
+    expect(controllerSetThreadSettingOnMock).toHaveBeenCalledWith({
+      threadId: 'notification-thread',
+      key: 'modelPersistenceVersion',
+      value: 2,
+    });
+    expect(controllerSetThreadSettingOnMock).toHaveBeenCalledWith({
+      threadId: 'notification-thread',
+      key: 'modeModelId_build',
+      value: undefined,
+    });
     expect(controllerContext.getState()).toMatchObject({
-      activeModelPackId: 'anthropic',
+      modelRoute: {
+        entries: [
+          { id: 'anthropic', label: 'Anthropic', modelId: 'anthropic/claude-fable-5-1' },
+          { id: 'openai', label: 'OpenAI', modelId: 'openai/gpt-5.6-sol' },
+        ],
+      },
       yolo: false,
       sandboxAllowedPaths: [],
     });
@@ -2056,16 +2167,23 @@ describe('createMastraCode', () => {
     expect(decision.streamOptions.requireToolApproval).toBe(true);
     controllerSetStateMock.mockClear();
 
-    await controllerContext.setThreadSetting({ key: 'mastracodePendingPackFallback', value: { toPackId: 'openai' } });
-    await controllerContext.setState({ mastracodePendingPackFallback: { toPackId: 'openai' } });
-    controllerContext.emitEvent({ type: 'info', message: 'Switched model pack' });
+    const pendingFallback = {
+      fromEntryId: 'anthropic',
+      toEntryId: 'openai',
+      toModelId: 'openai/gpt-5.6-sol',
+      reason: 'pool-exhausted',
+      at: '2026-10-05T00:00:00.000Z',
+    };
+    await controllerContext.setThreadSetting({ key: 'mastracodePendingModelFallback', value: pendingFallback });
+    await controllerContext.setState({ mastracodePendingModelFallback: pendingFallback });
+    controllerContext.emitEvent({ type: 'info', message: 'Switched model route' });
 
     expect(controllerSetThreadSettingOnMock).toHaveBeenCalledWith({
       threadId: 'notification-thread',
-      key: 'mastracodePendingPackFallback',
-      value: { toPackId: 'openai' },
+      key: 'mastracodePendingModelFallback',
+      value: pendingFallback,
     });
-    expect(controllerContext.getState()).toMatchObject({ mastracodePendingPackFallback: { toPackId: 'openai' } });
+    expect(controllerContext.getState()).toMatchObject({ mastracodePendingModelFallback: pendingFallback });
     expect(controllerSetStateMock).not.toHaveBeenCalled();
     expect(controllerEmitMock).not.toHaveBeenCalled();
   });
