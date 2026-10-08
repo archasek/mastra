@@ -950,6 +950,74 @@ describe('GatewayRegistry Auto-Refresh', () => {
   });
 });
 
+describe('GatewayRegistry immutable runtime cache', () => {
+  it('refreshes and reloads from the user cache without writing installed files', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mastra-immutable-registry-'));
+    const env = { ...process.env };
+    const writes: string[] = [];
+    const writeFile = fs.promises.writeFile.bind(fs.promises);
+    const writeFileSync = fs.writeFileSync.bind(fs);
+    const remove = fs.promises.rm.bind(fs.promises);
+    try {
+      process.env.MASTRA_AUTO_REFRESH_PROVIDERS = 'false';
+      process.env.MASTRA_OFFLINE = 'false';
+      vi.spyOn(os, 'homedir').mockReturnValue(home);
+      vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (file, ...args) => {
+        writes.push(String(file));
+        return writeFile(file, ...args);
+      });
+      vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+        writes.push(String(file));
+        return writeFileSync(file, ...args);
+      });
+      vi.spyOn(fs.promises, 'rm').mockImplementation(async (file, ...args) => {
+        writes.push(String(file));
+        return remove(file, ...args);
+      });
+      vi.resetModules();
+      const { ModelsDevGateway: ModelsDev } = await import('./gateways/models-dev.js');
+      const { NetlifyGateway: Netlify } = await import('./gateways/netlify.js');
+      const { MastraGateway: Mastra } = await import('./gateways/mastra.js');
+      vi.spyOn(ModelsDev.prototype, 'fetchProviders').mockResolvedValue({
+        'runtime-fixture': {
+          name: 'Runtime Fixture',
+          models: ['fixture-model'],
+          apiKeyEnvVar: 'FIXTURE_KEY',
+          gateway: 'models.dev',
+        },
+      });
+      vi.spyOn(Netlify.prototype, 'fetchProviders').mockResolvedValue({});
+      vi.spyOn(Mastra.prototype, 'fetchProviders').mockResolvedValue({});
+      vi.spyOn(ModelsDev.prototype, 'getAttachmentCapabilities').mockReturnValue({
+        'runtime-fixture': ['fixture-model'],
+      });
+      const { GatewayRegistry: Registry, modelSupportsAttachments: supportsAttachments } =
+        await import('./provider-registry.js');
+      const registry = Registry.getInstance({ useDynamicLoading: true, cacheOnly: true });
+      await registry.syncGateways(true);
+      expect(registry.getModels()['runtime-fixture']).toEqual(['fixture-model']);
+      expect(supportsAttachments('runtime-fixture/fixture-model')).toBe(true);
+      expect(fs.existsSync(path.join(home, '.cache', 'mastra', 'capabilities', 'runtime-fixture.json'))).toBe(true);
+      expect(writes.length).toBeGreaterThan(0);
+      expect(writes.every(file => file.startsWith(path.join(home, '.cache', 'mastra') + path.sep))).toBe(true);
+
+      // A fresh module models restart: cache reads must not copy into dist/ either.
+      writes.length = 0;
+      vi.resetModules();
+      const { GatewayRegistry: Restarted } = await import('./provider-registry.js');
+      Restarted.getInstance();
+      expect(
+        Restarted.getInstance({ useDynamicLoading: true, cacheOnly: true }).getModels()['runtime-fixture'],
+      ).toEqual(['fixture-model']);
+      expect(writes).toEqual([]);
+    } finally {
+      process.env = env;
+      vi.restoreAllMocks();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Corrupted JSON recovery', () => {
   const originalReadFileSync = fs.readFileSync.bind(fs);
   const originalWriteFileSync = fs.writeFileSync.bind(fs);
