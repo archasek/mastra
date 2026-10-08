@@ -32,7 +32,7 @@ describe('gateway-sync wrapper', () => {
 
     await syncGateways(true);
 
-    expect(registryGetInstance).toHaveBeenCalledWith({ useDynamicLoading: true });
+    expect(registryGetInstance).toHaveBeenCalledWith({ useDynamicLoading: true, cacheOnly: true });
     expect(registrySyncGateways).toHaveBeenCalledWith(true);
   });
 

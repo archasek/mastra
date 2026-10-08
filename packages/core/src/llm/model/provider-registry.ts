@@ -244,7 +244,11 @@ function getPackageRoot(): string {
   }
 }
 
-function loadRegistry(useDynamicLoading: boolean, customGateways: MastraModelGatewayInterface[] = []): RegistryData {
+function loadRegistry(
+  useDynamicLoading: boolean,
+  customGateways: MastraModelGatewayInterface[] = [],
+  cacheOnly = false,
+): RegistryData {
   const enabledGatewayIds = getEnabledGatewayIds([
     new ModelsDevGateway({}),
     new NetlifyGateway(),
@@ -257,8 +261,8 @@ function loadRegistry(useDynamicLoading: boolean, customGateways: MastraModelGat
     return sanitizeRegistryDataForRuntime(staticRegistry, enabledGatewayIds);
   }
 
-  // Dynamic loading mode: sync global cache to local before loading
-  syncGlobalCacheToLocal();
+  // Immutable installations read the user cache directly instead of copying it into dist/.
+  if (!cacheOnly) syncGlobalCacheToLocal();
 
   // Dynamic loading mode: check in-memory cache first
   if (registryData) {
@@ -268,6 +272,7 @@ function loadRegistry(useDynamicLoading: boolean, customGateways: MastraModelGat
   // Dynamic loading mode: load from file system for live updates
   const packageRoot = getPackageRoot();
   const possiblePaths: string[] = [
+    ...(cacheOnly ? [GLOBAL_PROVIDER_REGISTRY_JSON()] : []),
     // Built: in dist/ relative to package root (first priority - what gets distributed)
     path.join(packageRoot, 'dist', 'provider-registry.json'),
     // Development: in src/ relative to package root
@@ -300,7 +305,7 @@ function loadRegistry(useDynamicLoading: boolean, customGateways: MastraModelGat
             `Deleting corrupted file and falling back to static registry.`,
         );
         try {
-          fs.unlinkSync(jsonPath);
+          if (!cacheOnly || jsonPath === GLOBAL_PROVIDER_REGISTRY_JSON()) fs.unlinkSync(jsonPath);
         } catch {
           // Ignore deletion errors
         }
@@ -729,6 +734,8 @@ export interface GatewayRegistryOptions {
    * Defaults to true when MASTRA_DEV=true, false otherwise.
    */
   useDynamicLoading?: boolean;
+  /** Keep runtime updates in the user cache without modifying the installed package. */
+  cacheOnly?: boolean;
 }
 
 /**
@@ -741,11 +748,13 @@ export class GatewayRegistry {
   private refreshInterval: NodeJS.Timeout | null = null;
   private isRefreshing = false;
   private useDynamicLoading: boolean;
+  private cacheOnly: boolean;
   private customGateways: MastraModelGatewayInterface[] = [];
 
   private constructor(options: GatewayRegistryOptions = {}) {
     const isDev = process.env.MASTRA_DEV === 'true' || process.env.MASTRA_DEV === '1';
     this.useDynamicLoading = options.useDynamicLoading ?? isDev;
+    this.cacheOnly = options.cacheOnly ?? false;
   }
 
   /**
@@ -759,6 +768,11 @@ export class GatewayRegistry {
 
     if (options?.useDynamicLoading === true) {
       GatewayRegistry.instance.useDynamicLoading = true;
+    }
+    if (options?.cacheOnly === true && !GatewayRegistry.instance.cacheOnly) {
+      GatewayRegistry.instance.cacheOnly = true;
+      registryData = null;
+      _resetCapabilityCaches();
     }
 
     return GatewayRegistry.instance;
@@ -866,15 +880,17 @@ export class GatewayRegistry {
       const distJsonPath = path.join(packageRoot, 'dist', 'provider-registry.json');
       const distTypesPath = path.join(packageRoot, 'dist', 'llm', 'model', 'provider-types.generated.d.ts');
 
-      await writeRegistryFiles(
-        distJsonPath,
-        distTypesPath,
-        providers,
-        models,
-        attachmentCapabilities,
-        temperatureCapabilities,
-        structuredOutputCapabilities,
-      );
+      if (!this.cacheOnly || writeToSrc) {
+        await writeRegistryFiles(
+          distJsonPath,
+          distTypesPath,
+          providers,
+          models,
+          attachmentCapabilities,
+          temperatureCapabilities,
+          structuredOutputCapabilities,
+        );
+      }
       // console.debug(`[GatewayRegistry] ✅ Updated registry files in dist/`);
 
       // Copy to src/ only when explicitly requested (e.g., running the generation script)
@@ -988,7 +1004,7 @@ export class GatewayRegistry {
    * Get provider configuration by ID
    */
   getProviderConfig(providerId: string): ProviderConfig | undefined {
-    const data = loadRegistry(this.useDynamicLoading, this.customGateways);
+    const data = loadRegistry(this.useDynamicLoading, this.customGateways, this.cacheOnly);
     return data.providers[providerId];
   }
 
@@ -996,7 +1012,7 @@ export class GatewayRegistry {
    * Check if a provider is registered
    */
   isProviderRegistered(providerId: string): boolean {
-    const data = loadRegistry(this.useDynamicLoading, this.customGateways);
+    const data = loadRegistry(this.useDynamicLoading, this.customGateways, this.cacheOnly);
     return providerId in data.providers;
   }
 
@@ -1004,7 +1020,7 @@ export class GatewayRegistry {
    * Get all registered providers
    */
   getProviders(): Record<string, ProviderConfig> {
-    const data = loadRegistry(this.useDynamicLoading, this.customGateways);
+    const data = loadRegistry(this.useDynamicLoading, this.customGateways, this.cacheOnly);
     return data.providers;
   }
 
@@ -1012,7 +1028,7 @@ export class GatewayRegistry {
    * Get all models
    */
   getModels(): Record<string, string[]> {
-    return loadRegistry(this.useDynamicLoading, this.customGateways).models;
+    return loadRegistry(this.useDynamicLoading, this.customGateways, this.cacheOnly).models;
   }
 }
 

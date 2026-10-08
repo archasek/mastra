@@ -15,8 +15,11 @@ let syncInterval: NodeJS.Timeout | null = null;
 let isSyncing = false;
 
 function getRegistry(): GatewayRegistry {
-  return GatewayRegistry.getInstance({ useDynamicLoading: true });
+  return GatewayRegistry.getInstance({ useDynamicLoading: true, cacheOnly: true });
 }
+
+// Configure reads before native startup resolves models, not only at the first refresh.
+getRegistry();
 
 /**
  * Sync gateways and update the global cache via `@mastra/core`'s registry.
